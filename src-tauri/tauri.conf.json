@@ -27,6 +27,15 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": []
+    "icon": [
+      "icons/icon.icns"
+    ],
+    "resources": {
+      "resources/bin/mihomo": "bin/mihomo",
+      "resources/geo/geoip.dat": "geo/geoip.dat",
+      "resources/geo/geosite.dat": "geo/geosite.dat",
+      "resources/geo/ASN.mmdb": "geo/ASN.mmdb",
+      "resources/geo/geoip.metadb": "geo/geoip.metadb"
+    }
   }
 }

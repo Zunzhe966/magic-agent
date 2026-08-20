@@ -6,7 +6,7 @@
         <p>代理引擎与应用分流状态</p>
       </div>
       <div class="head-actions">
-        <button v-if="!status?.proxyRunning" class="btn primary" @click="handleStart">启动代理</button>
+        <button v-if="!status?.proxyRunning" class="btn primary" @click="$emit('start')">启动代理</button>
         <button v-else class="btn danger" @click="$emit('stop')">停止代理</button>
       </div>
     </header>
@@ -14,7 +14,7 @@
       <div class="stat-card">
         <div class="stat-label">代理内核</div>
         <div class="stat-value" :class="{ good: status?.proxyRunning }">{{ status?.proxyRunning ? '运行中' : '已停止' }}</div>
-        <div class="stat-sub">mihomo v1.19.30</div>
+        <div class="stat-sub">mihomo v1.19.29</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">混合端口</div>
@@ -23,7 +23,7 @@
       </div>
       <div class="stat-card">
         <div class="stat-label">系统代理</div>
-        <div class="stat-value">{{ status?.systemProxy ? '已开启' : '未开启' }}</div>
+        <div class="stat-value" :class="{ good: status?.systemProxy }">{{ status?.systemProxy ? '已开启' : '未开启' }}</div>
         <div class="stat-sub">macOS networksetup</div>
       </div>
       <div class="stat-card">
@@ -55,10 +55,6 @@
   </div>
 </template>
 <script setup>
-import { ref } from 'vue';
 const props = defineProps({ status: Object, config: Object });
 const emit = defineEmits(['start', 'stop', 'toggle-system-proxy']);
-function handleStart() {
-  emit('start', [], ['/Applications/WeChat.app/', '/Applications/QQ.app/', '/Applications/Safari.app/'], ['/Applications/Google Chrome.app/', '/Applications/Telegram.app/', '/Applications/ChatGPT.app/', '/Applications/Doubao.app/']);
-}
 </script>

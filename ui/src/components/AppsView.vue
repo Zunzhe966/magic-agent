@@ -3,8 +3,8 @@
     <header class="page-head">
       <div><h1>软件分流</h1><p>按软件精确控制流量走向，Chrome 走代理、Safari 直连</p></div>
       <div class="head-actions">
-        <button class="btn" @click="refresh">重新扫描</button>
-        <button class="btn primary" @click="apply">应用规则</button>
+        <button class="btn" @click="$emit('refresh')">重新扫描</button>
+        <button class="btn primary" @click="save">保存并应用</button>
       </div>
     </header>
     <div class="toolbar">
@@ -32,9 +32,9 @@
   </div>
 </template>
 <script setup>
-import { ref, computed, onMounted } from 'vue';
-import { invoke } from '@tauri-apps/api/core';
+import { ref, computed } from 'vue';
 const props = defineProps({ apps: Array });
+const emit = defineEmits(['change', 'refresh']);
 const q = ref('');
 const filter = ref('all');
 const modes = [
@@ -44,13 +44,7 @@ const filtered = computed(() => {
   const query = q.value.toLowerCase();
   return props.apps.filter(a => (!query || a.name.toLowerCase().includes(query)) && (filter.value === 'all' || a.mode === filter.value));
 });
-async function refresh() {
-  const list = await invoke('scan_apps');
-  list.forEach(n => {});
-}
-async function apply() {
-  const proxy = props.apps.filter(a => a.mode === 'proxy').map(a => a.rulePath);
-  const direct = props.apps.filter(a => a.mode === 'direct').map(a => a.rulePath);
-  await invoke('start_proxy', { rules: [], directApps: direct, proxyApps: proxy });
+function save() {
+  emit('change', props.apps);
 }
 </script>

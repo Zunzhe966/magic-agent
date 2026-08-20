@@ -1,4 +1,6 @@
 node_modules/
 dist/
-app/core/bin/mihomo
-app/core/geo/*
+src-tauri/target/
+.DS_Store
+src-tauri/resources/runtime/
+.workbuddy/
