@@ -1,0 +1,4 @@
+node_modules/
+dist/
+app/core/bin/mihomo
+app/core/geo/*

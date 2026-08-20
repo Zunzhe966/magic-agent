@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src http://127.0.0.1:*">
+<title>魔法代理</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app" class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">魔</div>
+      <div>
+        <div class="brand-name">魔法代理</div>
+        <div class="brand-sub">Magic Agent</div>
+      </div>
+    </div>
+    <nav>
+      <button class="nav-item active" data-view="overview"><span class="nav-ico">◈</span>总览</button>
+      <button class="nav-item" data-view="apps"><span class="nav-ico">▤</span>软件分流</button>
+      <button class="nav-item" data-view="servers"><span class="nav-ico">⌁</span>云服务器</button>
+      <button class="nav-item" data-view="nodes"><span class="nav-ico">◎</span>代理节点</button>
+      <button class="nav-item" data-view="logs"><span class="nav-ico">≣</span>实时日志</button>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="status-pill" id="engine-pill">内核未启动</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="page-title" id="page-title">总览</div>
+      <div class="top-actions">
+        <button class="icon-btn" id="btn-scan" title="扫描软件">⟳</button>
+        <button class="icon-btn" id="btn-open-log" title="打开日志">📄</button>
+      </div>
+    </header>
+
+    <section class="view" id="view-overview">
+      <div class="hero-band">
+        <div class="hero-copy">
+          <h1>让网络自己分清方向</h1>
+          <p>按软件精确分流，本地直连与云端代理互不打扰。云服务器状态、终端与电源操作集中在一个控制台。</p>
+          <div class="hero-actions">
+            <button class="primary" id="btn-proxy-toggle">启动代理</button>
+            <button class="ghost" id="btn-open-connections">查看连接</button>
+          </div>
+        </div>
+        <div class="hero-panel">
+          <div class="metric"><span class="metric-value" id="metric-rx">0</span><span class="metric-label">接收 MB</span></div>
+          <div class="metric"><span class="metric-value" id="metric-tx">0</span><span class="metric-label">发送 MB</span></div>
+          <div class="metric"><span class="metric-value" id="metric-conn">0</span><span class="metric-label">活动连接</span></div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="panel">
+          <div class="panel-head"><h3>当前出口</h3><span class="tag" id="exit-tag">未选择</span></div>
+          <div class="exit-list" id="exit-list"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3>软件分流</h3><button class="small" data-go="apps">管理</button></div>
+          <div class="app-summary" id="app-summary"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="view hidden" id="view-apps">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>软件级分流规则</h3>
+          <div class="head-actions">
+            <input id="filter-apps" class="input" placeholder="搜索软件">
+            <button class="primary small" id="btn-add-app">新增软件</button>
+          </div>
+        </div>
+        <div class="app-table" id="app-table"></div>
+      </div>
+    </section>
+
+    <section class="view hidden" id="view-servers">
+      <div class="panel">
+        <div class="panel-head"><h3>云服务器</h3><button class="primary small" id="btn-add-server">添加服务器</button></div>
+        <div class="server-grid" id="server-grid"></div>
+      </div>
+      <div class="panel hidden" id="terminal-panel">
+        <div class="panel-head"><h3>云端终端</h3><div class="head-actions"><button class="small" id="btn-close-terminal">关闭</button></div></div>
+        <div class="terminal" id="terminal" tabindex="0"></div>
+        <div class="term-input-row">
+          <span class="term-prompt" id="term-prompt">$</span>
+          <input class="input term-input" id="term-input" placeholder="输入命令，回车执行">
+        </div>
+      </div>
+    </section>
+
+    <section class="view hidden" id="view-nodes">
+      <div class="panel">
+        <div class="panel-head"><h3>代理节点</h3><button class="primary small" id="btn-add-node">添加节点</button></div>
+        <div class="node-list" id="node-list"></div>
+      </div>
+    </section>
+
+    <section class="view hidden" id="view-logs">
+      <div class="panel">
+        <div class="panel-head"><h3>实时日志</h3><button class="small" id="btn-clear-log">清空</button></div>
+        <div class="log-box" id="log-box"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="modal hidden" id="modal">
+  <div class="modal-card">
+    <div class="modal-head"><h3 id="modal-title"></h3><button class="icon-btn" id="modal-close">✕</button></div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-foot">
+      <button class="ghost" id="modal-cancel">取消</button>
+      <button class="primary" id="modal-ok">保存</button>
+    </div>
+  </div>
+</div>
+
+<script src="renderer.js"></script>
+</body>
+</html>
