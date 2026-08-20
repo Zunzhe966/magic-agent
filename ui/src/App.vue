@@ -18,15 +18,15 @@
         <div class="dot" :class="{ on: status?.proxyRunning }"></div>
         <div>
           <div class="sidebar-status-title">{{ status?.proxyRunning ? '代理运行中' : '代理已停止' }}</div>
-          <div class="sidebar-status-sub">{{ status?.proxyRunning ? `端口 ${status?.proxyPort}` : '未启动' }}</div>
+          <div class="sidebar-status-sub">{{ status && status.proxyRunning ? `端口 ${status.proxyPort}` : '未启动' }}</div>
         </div>
       </div>
     </aside>
     <main class="main">
       <Dashboard v-if="view === 'dashboard'" :status="status" :config="config" @start="startProxy" @stop="stopProxy" @toggle-system-proxy="toggleSystemProxy" />
-      <AppsView v-else-if="view === 'apps'" :apps="apps" />
-      <ServersView v-else-if="view === 'servers'" :config="config" :status="status" />
-      <SshView v-else-if="view === 'ssh'" :config="config" />
+      <AppsView v-else-if="view === 'apps'" :apps="apps" @change="applyApps" @refresh="refresh" />
+      <ServersView v-else-if="view === 'servers'" :config="config" @nav="view = 'ssh'" />
+      <SshView v-else-if="view === 'ssh'" :config="config" @saved="onSshSaved" />
     </main>
   </div>
 </template>
@@ -50,12 +50,17 @@ const navs = [
 ];
 
 async function refresh() {
-  status.value = await invoke('get_status');
-  config.value = await invoke('get_config');
-  apps.value = await invoke('scan_apps');
+  try {
+    const [s, c, a] = await Promise.all([invoke('get_status'), invoke('get_config'), invoke('scan_apps')]);
+    status.value = s;
+    config.value = c;
+    apps.value = a;
+  } catch (e) {
+    console.error('refresh failed', e);
+  }
 }
-async function startProxy(rules, direct, proxy) {
-  await invoke('start_proxy', { rules, directApps: direct, proxyApps: proxy });
+async function startProxy() {
+  await invoke('start_proxy');
   await refresh();
 }
 async function stopProxy() {
@@ -65,6 +70,15 @@ async function stopProxy() {
 async function toggleSystemProxy(enabled) {
   await invoke('set_system_proxy', { enabled });
   await refresh();
+}
+async function applyApps(list) {
+  if (!config.value) return;
+  config.value.apps = list.map(a => ({ id: a.id, mode: a.mode }));
+  await invoke('save_config', { config: config.value });
+  await refresh();
+}
+function onSshSaved(next) {
+  config.value = { ...config.value, ...next };
 }
 let timer;
 onMounted(async () => {

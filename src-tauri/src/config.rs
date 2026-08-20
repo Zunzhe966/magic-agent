@@ -25,13 +25,31 @@ pub struct AppSetting {
     pub mode: String,
 }
 
+/// SSH 服务器连接信息（不存明文密码/私钥，只存标记）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerInfo {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub auth: String, // "password" | "key"
+    pub password_saved: bool,
+    pub private_key_saved: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     pub nodes: Vec<ProxyNode>,
+    pub selected_node: Option<String>,
     pub apps: Vec<AppSetting>,
     pub system_proxy: bool,
     pub auto_global: String,
+    pub subscription_url: Option<String>,
+    pub servers: Vec<ServerInfo>,
+    // 兼容旧配置：仍保留这几个字段，但新逻辑不再把明文写进 config.json
     pub ssh_host: Option<String>,
     pub ssh_port: Option<u16>,
     pub ssh_user: Option<String>,
@@ -73,9 +91,17 @@ impl Default for AppConfig {
                     sni: String::new(),
                 },
             ],
-            apps: vec![],
+            selected_node: Some("搬瓦工直连".to_string()),
+            apps: vec![
+                AppSetting { id: "app-Google Chrome".to_string(), mode: "proxy".to_string() },
+                AppSetting { id: "app-Safari".to_string(), mode: "direct".to_string() },
+                AppSetting { id: "app-WeChat".to_string(), mode: "direct".to_string() },
+                AppSetting { id: "app-QQ".to_string(), mode: "direct".to_string() },
+            ],
             system_proxy: true,
             auto_global: "auto".to_string(),
+            subscription_url: None,
+            servers: vec![],
             ssh_host: None,
             ssh_port: Some(22),
             ssh_user: Some("root".to_string()),
@@ -83,6 +109,27 @@ impl Default for AppConfig {
             ssh_password: None,
             ssh_private_key: None,
         }
+    }
+}
+
+impl AppConfig {
+    /// 当前激活的 SSH 服务器（优先 servers 列表，其次旧字段）
+    pub fn active_server(&self) -> Option<ServerInfo> {
+        if let Some(s) = self.servers.first() {
+            return Some(s.clone());
+        }
+        // 旧字段兼容
+        let host = self.ssh_host.clone()?;
+        Some(ServerInfo {
+            id: format!("ssh-{}", host),
+            name: host.clone(),
+            host,
+            port: self.ssh_port.unwrap_or(22),
+            user: self.ssh_user.clone().unwrap_or_else(|| "root".to_string()),
+            auth: self.ssh_auth.clone().unwrap_or_else(|| "password".to_string()),
+            password_saved: self.ssh_password.as_deref().map(|p| !p.is_empty()).unwrap_or(false),
+            private_key_saved: self.ssh_private_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false),
+        })
     }
 }
 

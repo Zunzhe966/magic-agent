@@ -32,11 +32,25 @@ pub fn status() -> SystemProxyStatus {
     let output = Command::new("scutil").arg("--proxy").output().ok();
     let text = output.and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
     let enabled = text.contains("HTTPEnable : 1") || text.contains("SOCKSEnable : 1");
-    SystemProxyStatus { enabled, http_port: 7890, socks_port: 7890 }
+    let http_port = parse_port(&text, "HTTPPort");
+    let socks_port = parse_port(&text, "SOCKS port");
+    SystemProxyStatus { enabled, http_port: http_port.unwrap_or(0), socks_port: socks_port.unwrap_or(0) }
 }
 
 fn list_services() -> Vec<String> {
     let output = Command::new("networksetup").arg("-listallnetworkservices").output().ok();
     let text = output.and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
     text.lines().filter(|l| !l.is_empty() && !l.contains("asterisk") && !l.contains("An asterisk")).map(|s| s.trim().to_string()).collect()
+}
+
+
+fn parse_port(text: &str, key: &str) -> Option<u16> {
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix(key) {
+            let v = rest.trim_start_matches(':').trim();
+            return v.parse().ok();
+        }
+    }
+    None
 }

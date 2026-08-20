@@ -23,13 +23,14 @@
   </div>
 </template>
 <script setup>
-import { ref, onMounted, onUnmounted, nextTick } from 'vue';
+import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 
 const props = defineProps({ config: Object });
+const emit = defineEmits(['saved']);
 const termEl = ref(null);
 const connected = ref(false);
 let term, fit, timer, decoder = new TextDecoder();
@@ -41,6 +42,15 @@ const form = ref({
   password: props.config?.sshPassword || '',
   key: props.config?.sshPrivateKey || '',
 });
+watch(() => props.config, c => {
+  if (!c) return;
+  form.value.host = c.sshHost || form.value.host;
+  form.value.port = c.sshPort || form.value.port;
+  form.value.user = c.sshUser || form.value.user;
+  form.value.auth = c.sshAuth || form.value.auth;
+  form.value.password = c.sshPassword || form.value.password;
+  form.value.key = c.sshPrivateKey || form.value.key;
+}, { immediate: true });
 onMounted(async () => {
   await nextTick();
   term = new Terminal({ fontSize: 13, fontFamily: 'Menlo, monospace', theme: { background: '#0c111b', foreground: '#d7e0ee', cursor: '#6ea8fe' } });
@@ -58,13 +68,25 @@ async function poll() {
   if (data && data.length) term.write(decoder.decode(new Uint8Array(data)));
 }
 async function connect() {
-  await invoke('ssh_connect', {
-    host: form.value.host, port: form.value.port, user: form.value.user,
-    auth: form.value.auth, password: form.value.password || null, key: form.value.key || null,
-  });
-  connected.value = true;
-  term.clear();
-  term.writeln('已连接。');
+  try {
+    await invoke('ssh_connect', {
+      host: form.value.host, port: form.value.port, user: form.value.user,
+      auth: form.value.auth, password: form.value.password || null, key: form.value.key || null,
+    });
+    emit('saved', {
+      sshHost: form.value.host,
+      sshPort: form.value.port,
+      sshUser: form.value.user,
+      sshAuth: form.value.auth,
+      sshPassword: form.value.password || null,
+      sshPrivateKey: form.value.key || null,
+    });
+    connected.value = true;
+    term.clear();
+    term.writeln('已连接。');
+  } catch (e) {
+    term.writeln('\r\n连接失败: ' + e);
+  }
 }
 async function disconnect() {
   await invoke('ssh_disconnect');

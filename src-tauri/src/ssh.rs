@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex};
+
+use crate::keychain;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -16,77 +19,120 @@ pub struct SshSession {
 pub struct SshManager {
     pub child: Mutex<Option<Child>>,
     pub stdin: Mutex<Option<ChildStdin>>,
-    pub stdout: Mutex<Option<ChildStdout>>,
+    pub buffer: Arc<Mutex<Vec<u8>>>,
     pub session: Mutex<Option<SshSession>>,
 }
 
 impl SshManager {
     pub fn new() -> Self {
-        Self { child: Mutex::new(None), stdin: Mutex::new(None), stdout: Mutex::new(None), session: Mutex::new(None) }
+        Self {
+            child: Mutex::new(None),
+            stdin: Mutex::new(None),
+            buffer: Arc::new(Mutex::new(Vec::new())),
+            session: Mutex::new(None),
+        }
+    }
+
+    /// Keychain 中存储 SSH 密码所用的 account 名
+    pub fn password_account(host: &str, user: &str) -> String {
+        format!("ssh-password-{}@{}", user, host)
+    }
+
+    /// Keychain 中存储 SSH 私钥内容所用的 account 名
+    pub fn key_account(host: &str, user: &str) -> String {
+        format!("ssh-key-{}@{}", user, host)
     }
 
     pub fn connect(&self, host: String, port: u16, user: String, auth: String, password: Option<String>, key: Option<String>) -> Result<SshSession, String> {
         self.disconnect();
+
+        // key 路径展开（~ 支持）
+        let key = key.map(|k| {
+            let t = k.trim().to_string();
+            if t.is_empty() { t } else { expand_ssh_key(&t).to_string_lossy().to_string() }
+        });
+
+        // 如果调用方没有给明文密码，尝试从 Keychain 读取
+        let pw_from_chain = keychain::get(&Self::password_account(&host, &user)).ok();
+        let password = password
+            .filter(|p| !p.trim().is_empty())
+            .or(pw_from_chain);
+
         let mut cmd = Command::new("/usr/bin/ssh");
-        cmd.arg("-tt").arg("-o").arg("StrictHostKeyChecking=accept-new").arg("-o").arg("ServerAliveInterval=15");
-        if port != 22 {
-            cmd.arg("-p").arg(port.to_string());
-        }
-        if let Some(k) = key {
-            if !k.trim().is_empty() {
-                cmd.arg("-i").arg(k);
-            }
-        }
+        cmd.arg("-tt")
+            .arg("-o").arg("StrictHostKeyChecking=accept-new")
+            .arg("-o").arg("ServerAliveInterval=15")
+            .arg("-o").arg("ServerAliveCountMax=3")
+            .arg("-o").arg("ConnectTimeout=10");
+        if port != 22 { cmd.arg("-p").arg(port.to_string()); }
+        if let Some(ref k) = key { if !k.trim().is_empty() && std::path::Path::new(k.trim()).exists() { cmd.arg("-i").arg(k.trim()); } }
         cmd.arg(format!("{}@{}", user, host));
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| format!("启动 ssh 失败: {e}"))?;
+
+        let use_password = auth == "password" && password.as_deref().unwrap_or("").len() > 0;
+        let mut child = if use_password {
+            let pw = password.unwrap_or_default();
+            let mut args = vec!["/usr/bin/ssh", "-tt", "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", "ConnectTimeout=10"];
+            let port_str = port.to_string();
+            if port != 22 { args.push("-p"); args.push(&port_str); }
+            if let Some(ref k) = key { if !k.trim().is_empty() && std::path::Path::new(k.trim()).exists() { args.push("-i"); args.push(k.trim()); } }
+            let user_host = format!("{}@{}", user, host);
+            args.push(&user_host);
+
+            let escaped = pw.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$").replace('`', "\\`");
+            let script = format!(
+                "#!/usr/bin/expect -f\nset timeout 20\nspawn {} {}\nexpect {{\n  -re \"(?i)password:\\s*\" {{\n    send \"{}\\r\"\n  }}\n  -re \"Are you sure.*\" {{\n    send \"yes\\r\"\n    exp_continue\n  }}\n  eof {{ exit 1 }}\n}}\ninteract\n",
+                args.join(" "), if port != 22 { format!("-p {}", port) } else { String::new() }, escaped
+            );
+            let tmp = std::env::temp_dir().join(format!("magic-ssh-{}.expect", std::process::id()));
+            std::fs::write(&tmp, script).map_err(|e| format!("写 SSH 脚本失败: {e}"))?;
+            let mut s = Command::new("/usr/bin/expect");
+            s.arg("-f").arg(&tmp);
+            s.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            s.spawn().map_err(|e| format!("启动 SSH 失败: {e}"))?
+        } else {
+            cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            cmd.spawn().map_err(|e| format!("启动 SSH 失败: {e}"))?
+        };
+
         let stdin = child.stdin.take().ok_or("无法获取 stdin")?;
         let stdout = child.stdout.take().ok_or("无法获取 stdout")?;
-        // 若密码方式，用 expect 脚本包装更可靠
-        // 此处保留基础实现：密码走 expect 子进程处理，防止 shell 交互
-        if auth == "password" {
-            if let Some(p) = password {
-                if !p.is_empty() {
-                    drop(child);
-                    return self.connect_expect(host, port, user, p);
+        *self.child.lock().unwrap() = Some(child);
+        *self.stdin.lock().unwrap() = Some(stdin);
+
+        // 后台线程持续读取 stdout 到共享 buffer，避免阻塞 Tauri 命令线程
+        let buf = self.buffer.clone();
+        {
+            let mut b = buf.lock().unwrap();
+            b.clear();
+        }
+        let mut reader = stdout;
+        std::thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop {
+                match reader.read(&mut tmp) {
+                    Ok(n) if n > 0 => {
+                        if let Ok(mut b) = buf.lock() {
+                            b.extend_from_slice(&tmp[..n]);
+                        }
+                    }
+                    _ => break,
                 }
             }
-        }
-        *self.child.lock().unwrap() = Some(child);
-        *self.stdin.lock().unwrap() = Some(stdin);
-        *self.stdout.lock().unwrap() = Some(stdout);
-        let sess = SshSession { id: format!("ssh-{}", host), host, port, user, status: "connected".into() };
-        *self.session.lock().unwrap() = Some(sess.clone());
-        Ok(sess)
-    }
+        });
 
-    fn connect_expect(&self, host: String, port: u16, user: String, password: String) -> Result<SshSession, String> {
-        let mut cmd = Command::new("/usr/bin/expect");
-        cmd.arg("-c").arg(format!(
-            "spawn ssh -tt -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=15 {} -l {} -p {}; expect \"*assword:*\"; send \"{}\\r\"; interact",
-            host, user, port, password
-        ));
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| format!("启动 expect 失败: {e}"))?;
-        let stdin = child.stdin.take().ok_or("无法获取 stdin")?;
-        let stdout = child.stdout.take().ok_or("无法获取 stdout")?;
-        *self.child.lock().unwrap() = Some(child);
-        *self.stdin.lock().unwrap() = Some(stdin);
-        *self.stdout.lock().unwrap() = Some(stdout);
-        let sess = SshSession { id: format!("ssh-{}", host), host, port, user, status: "connected".into() };
+        let sess = SshSession { id: format!("ssh-{}", host), host, port, user, status: "connected".to_string() };
         *self.session.lock().unwrap() = Some(sess.clone());
         Ok(sess)
     }
 
     pub fn disconnect(&self) {
         let mut child = self.child.lock().unwrap();
-        if let Some(mut c) = child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+        if let Some(mut c) = child.take() { let _ = c.kill(); let _ = c.wait(); }
         *self.stdin.lock().unwrap() = None;
-        *self.stdout.lock().unwrap() = None;
         *self.session.lock().unwrap() = None;
+        if let Ok(mut b) = self.buffer.lock() {
+            b.clear();
+        }
     }
 
     pub fn write(&self, data: Vec<u8>) -> Result<(), String> {
@@ -96,18 +142,25 @@ impl SshManager {
     }
 
     pub fn read(&self) -> Result<Vec<u8>, String> {
-        let mut stdout = self.stdout.lock().unwrap();
-        let s = stdout.as_mut().ok_or("未连接")?;
-        let mut buf = [0u8; 4096];
-        match s.read(&mut buf) {
-            Ok(n) if n > 0 => Ok(buf[..n].to_vec()),
-            Ok(_) => Ok(vec![]),
-            Err(e) => Err(e.to_string()),
-        }
+        let mut buf = self.buffer.lock().unwrap();
+        if buf.is_empty() { return Ok(vec![]); }
+        Ok(std::mem::take(&mut *buf))
     }
 
     pub fn status(&self) -> Option<SshSession> {
-        let g = self.session.lock().unwrap();
-        g.clone()
+        self.session.lock().unwrap().clone()
     }
+}
+
+pub fn expand_ssh_key(path: &str) -> PathBuf {
+    let p = PathBuf::from(path);
+    if p.starts_with("~") {
+        if let Some(home) = dirs::home_dir() {
+            let mut np = home;
+            let comps: Vec<_> = p.components().skip(1).collect();
+            for c in comps { np.push(c.as_os_str()); }
+            return np;
+        }
+    }
+    p
 }

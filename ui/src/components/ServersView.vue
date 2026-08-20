@@ -15,16 +15,12 @@
       </div>
     </div>
     <section class="panel">
-      <div class="panel-head"><h2>SSH 控制</h2><button class="btn" @click="openSsh">打开控制台</button></div>
+      <div class="panel-head"><h2>SSH 控制</h2><button class="btn" @click="$emit('nav')">打开控制台</button></div>
       <p class="muted">通过 SSH 直接控制云服务器：执行命令、安装软件、查看日志。</p>
     </section>
   </div>
 </template>
 <script setup>
-import { defineProps } from 'vue';
-const props = defineProps({ config: Object, status: Object });
-function openSsh() {
-  // 切到控制台页
-  window.dispatchEvent(new CustomEvent('magic-nav', { detail: 'ssh' }));
-}
+defineProps({ config: Object, status: Object });
+defineEmits(['nav']);
 </script>
