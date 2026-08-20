@@ -1,0 +1,75 @@
+<template>
+  <div class="page">
+    <header class="page-head">
+      <div><h1>服务器控制台</h1><p>通过 SSH 直接操作云服务器</p></div>
+      <div class="head-actions">
+        <button v-if="!connected" class="btn primary" @click="connect">连接</button>
+        <button v-else class="btn danger" @click="disconnect">断开</button>
+      </div>
+    </header>
+    <section class="panel ssh-panel">
+      <div class="ssh-form" v-if="!connected">
+        <div class="field"><label>主机</label><input v-model="form.host" placeholder="104.160.40.35" /></div>
+        <div class="field"><label>端口</label><input v-model.number="form.port" type="number" /></div>
+        <div class="field"><label>用户名</label><input v-model="form.user" /></div>
+        <div class="field"><label>认证方式</label><select v-model="form.auth"><option value="password">密码</option><option value="key">私钥</option></select></div>
+        <div class="field" v-if="form.auth === 'password'"><label>密码</label><input v-model="form.password" type="password" /></div>
+        <div class="field" v-else><label>私钥路径</label><input v-model="form.key" placeholder="~/.ssh/id_ed25519" /></div>
+      </div>
+      <div class="terminal-wrap">
+        <div ref="termEl" class="terminal"></div>
+      </div>
+    </section>
+  </div>
+</template>
+<script setup>
+import { ref, onMounted, onUnmounted, nextTick } from 'vue';
+import { invoke } from '@tauri-apps/api/core';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import '@xterm/xterm/css/xterm.css';
+
+const props = defineProps({ config: Object });
+const termEl = ref(null);
+const connected = ref(false);
+let term, fit, timer, decoder = new TextDecoder();
+const form = ref({
+  host: props.config?.sshHost || '',
+  port: props.config?.sshPort || 22,
+  user: props.config?.sshUser || 'root',
+  auth: props.config?.sshAuth || 'password',
+  password: props.config?.sshPassword || '',
+  key: props.config?.sshPrivateKey || '',
+});
+onMounted(async () => {
+  await nextTick();
+  term = new Terminal({ fontSize: 13, fontFamily: 'Menlo, monospace', theme: { background: '#0c111b', foreground: '#d7e0ee', cursor: '#6ea8fe' } });
+  fit = new FitAddon();
+  term.loadAddon(fit);
+  term.open(termEl.value);
+  fit.fit();
+  term.writeln('输入连接信息后点击“连接”。');
+  term.onData(d => { if (connected.value) invoke('ssh_write', { data: Array.from(new TextEncoder().encode(d)) }); });
+  timer = setInterval(poll, 200);
+});
+async function poll() {
+  if (!connected.value) return;
+  const data = await invoke('ssh_read');
+  if (data && data.length) term.write(decoder.decode(new Uint8Array(data)));
+}
+async function connect() {
+  await invoke('ssh_connect', {
+    host: form.value.host, port: form.value.port, user: form.value.user,
+    auth: form.value.auth, password: form.value.password || null, key: form.value.key || null,
+  });
+  connected.value = true;
+  term.clear();
+  term.writeln('已连接。');
+}
+async function disconnect() {
+  await invoke('ssh_disconnect');
+  connected.value = false;
+  term.writeln('\r\n已断开。');
+}
+onUnmounted(() => clearInterval(timer));
+</script>
