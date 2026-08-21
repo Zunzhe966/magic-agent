@@ -139,6 +139,53 @@ impl MihomoManager {
         })
     }
 
+    /// 热更新 rules（通过 external-controller PATCH /configs），
+    /// 保存分流/域名规则后立即生效，不需要重启进程、不弹授权框。
+    pub fn reload_rules(&self, cfg: &AppConfig, app_rules: &[(Vec<String>, String)]) -> Result<(), String> {
+        let rules = self.build_rules(cfg, &[], app_rules);
+        let body = serde_json::json!({ "rules": rules });
+        let out = Command::new("/usr/bin/curl")
+            .arg("-s")
+            .arg("-X").arg("PATCH")
+            .arg("-H").arg("Content-Type: application/json")
+            .arg("-d").arg(body.to_string())
+            .arg("http://127.0.0.1:19091/configs")
+            .output()
+            .map_err(|e| format!("调用 curl 热更新失败: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(format!("mihomo 热更新失败: {}", err));
+        }
+        Ok(())
+    }
+
+    /// 只生成 rules 列表（供热更新用），逻辑与 build_conf 的 rules 段保持一致。
+    fn build_rules(&self, cfg: &AppConfig, rules: &[String], app_rules: &[(Vec<String>, String)]) -> Vec<String> {
+        let mut out = Vec::new();
+        for node in &cfg.nodes {
+            if node.server.parse::<std::net::IpAddr>().is_ok() {
+                out.push(format!("IP-CIDR,{}/32,DIRECT,no-resolve", node.server));
+            } else {
+                out.push(format!("DOMAIN-SUFFIX,{},DIRECT", node.server));
+            }
+        }
+        for (paths, target) in app_rules {
+            for p in paths {
+                out.push(format!("PROCESS-PATH-REGEX,^{},{}", regex_escape_path(p), target));
+            }
+        }
+        for dr in &cfg.domain_rules {
+            let target = if dr.target == "proxy" { "PROXY" } else { "DIRECT" };
+            out.push(format!("DOMAIN-SUFFIX,{},{}", dr.domain, target));
+        }
+        for r in rules {
+            out.push(r.clone());
+        }
+        out.push("GEOIP,LAN,DIRECT,no-resolve".to_string());
+        out.push("MATCH,DIRECT".to_string());
+        out
+    }
+
     pub fn stop(&self) {
         let mut guard = self.pid.lock().unwrap();
         if let Some(pid) = guard.take() {
@@ -252,36 +299,10 @@ impl MihomoManager {
         }
 
         out.push_str("\nrules:\n");
-        // 1) 防卷铁律（最高优先级）：所有节点服务器自身的流量无条件直连。
-        //    任何软件（包括终端 SSH、代理自己）访问节点服务器，都绝不进入代理隧道。
-        for node in &cfg.nodes {
-            if node.server.parse::<std::net::IpAddr>().is_ok() {
-                out.push_str(&format!("  - IP-CIDR,{}/32,DIRECT,no-resolve\n", node.server));
-            } else {
-                out.push_str(&format!("  - DOMAIN-SUFFIX,{},DIRECT\n", node.server));
-            }
-        }
-        // 2) 已确认的软件规则：按 App 包路径前缀匹配整组进程
-        //    （Chrome 主程序+全部 Helper、Safari+WebKit.Networking 都命中所属 App 的前缀）
-        for (paths, target) in app_rules {
-            for p in paths {
-                out.push_str(&format!("  - PROCESS-PATH-REGEX,^{},{}\n", regex_escape_path(p), target));
-            }
-        }
-        // 3) 域名分流规则：同一个软件下载混合源时，按域名精确决定代理/直连
-        for dr in &cfg.domain_rules {
-            let target = if dr.target == "proxy" { "PROXY" } else { "DIRECT" };
-            out.push_str(&format!("  - DOMAIN-SUFFIX,{},{}\n", dr.domain, target));
-        }
-        // 4) 用户自定义规则
-        for r in rules {
+        // rules 段与热更新共用同一份生成逻辑，避免两处不一致
+        for r in self.build_rules(cfg, rules, app_rules) {
             out.push_str(&format!("  - {}\n", r));
         }
-        // 4) 内网流量直连
-        out.push_str("  - GEOIP,LAN,DIRECT,no-resolve\n");
-        // 5) 兜底：未确认/未列出的软件一律直连。
-        //    本机默认是干净的直连网络，只有用户明确放行的软件才进隧道。
-        out.push_str("  - MATCH,DIRECT\n");
         out
     }
 }
