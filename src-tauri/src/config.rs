@@ -154,3 +154,119 @@ pub fn save(cfg: &AppConfig) -> Result<(), String> {
     std::fs::write(&p, serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())
 }
+
+
+/// 从订阅文本中解析 VLESS 节点。
+/// 订阅内容可能是：明文 vless:// 链接、每行一个，或 base64 编码的整段内容。
+pub fn parse_vless_subscription(text: &str) -> Result<Vec<ProxyNode>, String> {
+    // 若文本不含 vless://，尝试 base64 解码（macOS 自带 base64 -D）
+    let mut content = text.to_string();
+    if !content.contains("vless://") {
+        let cleaned: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+        if !cleaned.is_empty() {
+            let out = std::process::Command::new("/usr/bin/base64")
+                .arg("-D")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut c| {
+                    use std::io::Write;
+                    if let Some(mut stdin) = c.stdin.take() {
+                        let _ = stdin.write_all(cleaned.as_bytes());
+                    }
+                    c.wait_with_output()
+                });
+            if let Ok(out) = out {
+                if out.status.success() {
+                    if let Ok(decoded) = String::from_utf8(out.stdout) {
+                        content = decoded;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut nodes = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        let Some(idx) = line.find("vless://") else { continue };
+        let uri = &line[idx..];
+        if let Ok(node) = parse_vless_uri(uri) {
+            nodes.push(node);
+        }
+    }
+    if nodes.is_empty() {
+        return Err("未能从订阅中解析出任何 VLESS 节点".to_string());
+    }
+    Ok(nodes)
+}
+
+/// 解析单个 vless:// URI 为 ProxyNode。
+fn parse_vless_uri(uri: &str) -> Result<ProxyNode, String> {
+    let rest = uri.strip_prefix("vless://").ok_or("不是 vless 链接")?;
+    // 分离 query 和 fragment
+    let (auth_part, after) = match rest.find('?') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    let (query, fragment) = match after.find('#') {
+        Some(i) => (&after[..i], &after[i + 1..]),
+        None => (after, ""),
+    };
+
+    // auth_part: uuid@host:port
+    let (userinfo, hostport) = auth_part.rsplit_once('@').ok_or("缺少 @")?;
+    let (host, port_str) = hostport.rsplit_once(':').ok_or("缺少端口")?;
+    let port: u16 = port_str.parse().map_err(|_| "端口无效")?;
+
+    // 解析 query 参数
+    let mut params = std::collections::HashMap::new();
+    for kv in query.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            params.insert(k, url_decode(v));
+        }
+    }
+
+    let name = if fragment.is_empty() {
+        host.to_string()
+    } else {
+        url_decode(fragment)
+    };
+
+    Ok(ProxyNode {
+        name,
+        server: host.to_string(),
+        port,
+        uuid: userinfo.to_string(),
+        flow: params.get("flow").cloned().unwrap_or_default(),
+        network: params.get("type").cloned().unwrap_or_else(|| "tcp".to_string()),
+        tls: params.get("security").map(|s| s == "reality" || s == "tls").unwrap_or(false),
+        udp: true,
+        fingerprint: params.get("fp").cloned().unwrap_or_else(|| "chrome".to_string()),
+        public_key: params.get("pbk").cloned().unwrap_or_default(),
+        short_id: params.get("sid").cloned().unwrap_or_default(),
+        sni: params.get("sni").cloned().unwrap_or_default(),
+    })
+}
+
+/// 简易 URL 百分号解码（%XX）
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Ok(h), Ok(l)) = (
+                u8::from_str_radix(&s[i + 1..i + 2], 16),
+                u8::from_str_radix(&s[i + 2..i + 3], 16),
+            ) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}

@@ -33,14 +33,26 @@ pub fn status() -> SystemProxyStatus {
     let text = output.and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
     let enabled = text.contains("HTTPEnable : 1") || text.contains("SOCKSEnable : 1");
     let http_port = parse_port(&text, "HTTPPort");
-    let socks_port = parse_port(&text, "SOCKS port");
+    let socks_port = parse_port(&text, "SOCKSPort");
     SystemProxyStatus { enabled, http_port: http_port.unwrap_or(0), socks_port: socks_port.unwrap_or(0) }
 }
 
 fn list_services() -> Vec<String> {
     let output = Command::new("networksetup").arg("-listallnetworkservices").output().ok();
     let text = output.and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
-    text.lines().filter(|l| !l.is_empty() && !l.contains("asterisk") && !l.contains("An asterisk")).map(|s| s.trim().to_string()).collect()
+    text.lines()
+        .map(|s| s.trim().to_string())
+        .filter(|l| {
+            if l.is_empty() { return false; }
+            let lower = l.to_lowercase();
+            // 跳过非真实网络服务（蓝牙、USB 虚拟、Thunderbolt 桥接等），避免误设代理
+            !lower.contains("asterisk")
+                && !lower.contains("bluetooth")
+                && !lower.contains("iphone")
+                && !lower.contains("thunderbolt")
+                && !lower.contains("bridge")
+        })
+        .collect()
 }
 
 

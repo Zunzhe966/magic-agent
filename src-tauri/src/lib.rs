@@ -23,6 +23,59 @@ pub struct AppStatus {
     pub ssh: Option<crate::ssh::SshSession>,
 }
 
+/// 代理端口与现有 Clash/FlClash 冲突检测结果
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictInfo {
+    pub has_conflict: bool,
+    pub messages: Vec<String>,
+}
+
+#[tauri::command]
+fn check_conflicts() -> ConflictInfo {
+    let mut messages = Vec::new();
+    // 1) 检测正在运行的代理程序（FlClash / Clash / mihomo）
+    if let Ok(ps) = std::process::Command::new("/bin/ps").args(["-axo", "comm="]).output() {
+        let text = String::from_utf8_lossy(&ps.stdout).to_lowercase();
+        let mut names = std::collections::HashSet::new();
+        for line in text.lines() {
+            let l = line.to_lowercase();
+            for name in ["mihomo", "clash", "flclash"] {
+                if l.contains(name) {
+                    names.insert(name);
+                }
+            }
+        }
+        for name in names {
+            messages.push(format!("检测到正在运行的代理程序: {}", name));
+        }
+    }
+    // 2) 检测本程序要用的混合端口是否已被占用
+    let port = MihomoManager::new().port;
+    if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        messages.push(format!("端口 {} 已被其他程序占用，请先关闭冲突程序", port));
+    }
+    ConflictInfo { has_conflict: !messages.is_empty(), messages }
+}
+
+#[tauri::command]
+fn fetch_subscription(url: String) -> Result<Vec<crate::config::ProxyNode>, String> {
+    // 用系统 curl 拉取订阅内容
+    let out = std::process::Command::new("/usr/bin/curl")
+        .arg("-sL")
+        .arg("--max-time").arg("15")
+        .arg("-A").arg("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
+        .arg(&url)
+        .output()
+        .map_err(|e| format!("调用 curl 失败: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(format!("拉取订阅失败: {}", if err.is_empty() { "HTTP 错误".to_string() } else { err }));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    crate::config::parse_vless_subscription(&text)
+}
+
 struct AppState {
     config: AppConfig,
     mihomo: MihomoManager,
@@ -90,6 +143,11 @@ fn effective_app_lists(config: &AppConfig) -> (Vec<String>, Vec<String>) {
 
 #[tauri::command]
 fn start_proxy(state: tauri::State<Arc<Mutex<AppState>>>) -> Result<MihomoStatus, String> {
+    // 启动前先做冲突检测：FlClash/mihomo 占用端口时直接提示，避免抢端口
+    let conflict = check_conflicts();
+    if conflict.has_conflict {
+        return Err(conflict.messages.join("；"));
+    }
     let g = state.lock().unwrap();
     let cfg = g.config.clone();
     let (direct, proxy) = effective_app_lists(&cfg);
@@ -222,8 +280,28 @@ pub fn start_proxy_standalone() -> Result<MihomoStatus, String> {
 }
 
 pub fn stop_proxy_standalone() -> Result<(), String> {
-    let mihomo = MihomoManager::new();
-    mihomo.stop();
+    // start_proxy_standalone 与 stop_proxy_standalone 各自创建实例无法共享 child，
+    // 这里改为按启动参数（runtime 下的 mihomo.yaml）精确查找并结束 mihomo 进程。
+    let runtime = MihomoManager::new().runtime_dir;
+    let conf_path = runtime.join("mihomo.yaml");
+    let conf_str = conf_path.to_string_lossy().to_string();
+    if let Ok(out) = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,args="])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            if line.contains("mihomo") && line.contains(&conf_str) {
+                if let Some(pid_str) = line.split_whitespace().next() {
+                    if let Ok(pid) = pid_str.parse::<i32>() {
+                        let _ = std::process::Command::new("/bin/kill")
+                            .arg(pid.to_string())
+                            .output();
+                    }
+                }
+            }
+        }
+    }
     let _ = system_proxy::set_system_proxy(false, 7891);
     Ok(())
 }
@@ -249,7 +327,9 @@ pub fn run() {
             ssh_write,
             ssh_read,
             ssh_disconnect,
-            self_test
+            self_test,
+            check_conflicts,
+            fetch_subscription
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

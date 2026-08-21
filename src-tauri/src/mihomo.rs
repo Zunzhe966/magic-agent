@@ -172,8 +172,12 @@ impl MihomoManager {
         }
 
         out.push_str("\nproxy-groups:\n");
+        // PROXY 组：把选中的节点排到第一个，select 默认选中第一项，从而让 selected_node 真正生效
         out.push_str("  - name: PROXY\n    type: select\n    proxies:\n");
-        for node in &cfg.nodes {
+        let selected = cfg.selected_node.clone().unwrap_or_default();
+        let mut ordered: Vec<&crate::config::ProxyNode> = cfg.nodes.iter().collect();
+        ordered.sort_by_key(|n| if n.name == selected { 0 } else { 1 });
+        for node in ordered {
             out.push_str(&format!("      - \"{}\"\n", node.name));
         }
         out.push_str("  - name: AUTO\n    type: url-test\n    url: http://www.gstatic.com/generate_204\n    interval: 300\n    proxies:\n");
@@ -185,11 +189,11 @@ impl MihomoManager {
         out.push_str("\nrules:\n");
         // 1) 按软件：显式直连，优先级最高
         for a in direct_apps {
-            out.push_str(&format!("  - PROCESS-PATH-REGEX,{},DIRECT\n", regex_escape_path(a)));
+            out.push_str(&format!("  - PROCESS-PATH-REGEX,^{}$,DIRECT\n", regex_escape_path(a)));
         }
         // 2) 按软件：显式代理
         for a in proxy_apps {
-            out.push_str(&format!("  - PROCESS-PATH-REGEX,{},PROXY\n", regex_escape_path(a)));
+            out.push_str(&format!("  - PROCESS-PATH-REGEX,^{}$,PROXY\n", regex_escape_path(a)));
         }
         // 3) 用户规则
         for r in rules {

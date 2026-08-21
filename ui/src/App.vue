@@ -25,7 +25,7 @@
     <main class="main">
       <Dashboard v-if="view === 'dashboard'" :status="status" :config="config" @start="startProxy" @stop="stopProxy" @toggle-system-proxy="toggleSystemProxy" />
       <AppsView v-else-if="view === 'apps'" :apps="apps" @change="applyApps" @refresh="refresh" />
-      <ServersView v-else-if="view === 'servers'" :config="config" @nav="view = 'ssh'" />
+      <ServersView v-else-if="view === 'servers'" :config="config" @update="saveConfig" @nav="view = 'ssh'" />
       <SshView v-else-if="view === 'ssh'" :config="config" @saved="onSshSaved" />
     </main>
   </div>
@@ -60,11 +60,21 @@ async function refresh() {
   }
 }
 async function startProxy() {
-  await invoke('start_proxy');
+  try {
+    await invoke('start_proxy');
+  } catch (e) {
+    alert('启动失败：' + e);
+    return;
+  }
   await refresh();
 }
 async function stopProxy() {
-  await invoke('stop_proxy');
+  try {
+    await invoke('stop_proxy');
+  } catch (e) {
+    alert('停止失败：' + e);
+    return;
+  }
   await refresh();
 }
 async function toggleSystemProxy(enabled) {
@@ -74,6 +84,12 @@ async function toggleSystemProxy(enabled) {
 async function applyApps(list) {
   if (!config.value) return;
   config.value.apps = list.map(a => ({ id: a.id, mode: a.mode }));
+  await invoke('save_config', { config: config.value });
+  await refresh();
+}
+async function saveConfig(patch) {
+  if (!config.value) return;
+  config.value = { ...config.value, ...patch };
   await invoke('save_config', { config: config.value });
   await refresh();
 }
