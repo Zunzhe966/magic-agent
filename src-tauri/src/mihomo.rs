@@ -42,9 +42,14 @@ impl MihomoManager {
 
     pub fn status(&self) -> MihomoStatus {
         let mut guard = self.pid.lock().unwrap();
-        let alive = guard.map(process_alive).unwrap_or(false);
+        let mut alive = guard.map(process_alive).unwrap_or(false);
         if !alive {
             *guard = None;
+        }
+        // 如果 PID 不在（例如 mihomo 由外部/MCP 启动），但混合端口开放，
+        // 也认为代理在运行，这样界面状态与真实状态一致。
+        if !alive && TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
+            alive = true;
         }
         MihomoStatus {
             running: alive,
