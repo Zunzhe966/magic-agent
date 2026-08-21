@@ -87,7 +87,7 @@ async function applyApps(list) {
     id: a.id,
     mode: a.mode,
     // 用户在界面保存过该软件，视为已确认；节点保持原选择
-    confirmed: a.confirmed || true,
+    confirmed: true,
     node: a.node || null,
   }));
   await invoke('save_config', { config: config.value });
