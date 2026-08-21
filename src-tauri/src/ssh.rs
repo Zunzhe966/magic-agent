@@ -129,7 +129,7 @@ impl SshManager {
             }
         });
 
-        let sess = SshSession { id: format!("ssh-{}", host), host, port, user, status: "connected".to_string() };
+        let sess = SshSession { id: format!("ssh-{}@{}", user, host), host, port, user, status: "connected".to_string() };
         *self.session.lock().unwrap() = Some(sess.clone());
         Ok(sess)
     }

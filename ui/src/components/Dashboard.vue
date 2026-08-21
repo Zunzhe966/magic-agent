@@ -25,6 +25,7 @@
         <div class="stat-label">系统代理</div>
         <div class="stat-value" :class="{ good: status?.systemProxy }">{{ status?.systemProxy ? '已开启' : '未开启' }}</div>
         <div class="stat-sub">macOS networksetup</div>
+        <button class="btn small" @click="$emit('toggle-system-proxy', !status?.systemProxy)">{{ status?.systemProxy ? '关闭系统代理' : '开启系统代理' }}</button>
       </div>
       <div class="stat-card">
         <div class="stat-label">已识别软件</div>
