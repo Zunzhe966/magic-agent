@@ -148,6 +148,18 @@ def generate_config(cfg):
             lines.append(f'  - IP-CIDR,{server}/32,DIRECT,no-resolve')
         else:
             lines.append(f'  - DOMAIN-SUFFIX,{server},DIRECT')
+    # 软件规则：confirmed 的 App 按路径前缀匹配整组进程
+    for app in cfg.get('apps', []):
+        if not app.get('confirmed'):
+            continue
+        paths = app_paths_for(app['id'])
+        if app.get('mode') == 'proxy':
+            node = app.get('node')
+            target = f'NODE-{node}' if node else 'PROXY'
+        else:
+            target = 'DIRECT'
+        for p in paths:
+            lines.append(f'  - PROCESS-PATH-REGEX,^{p},{target}')
     # 域名分流规则：同一个软件下载混合源时按域名决定代理/直连
     for dr in cfg.get('domainRules', []):
         target = 'PROXY' if dr.get('target') == 'proxy' else 'DIRECT'
@@ -155,6 +167,27 @@ def generate_config(cfg):
     lines.append('  - GEOIP,LAN,DIRECT,no-resolve')
     lines.append('  - MATCH,DIRECT')
     return '\n'.join(lines) + '\n'
+
+
+def app_paths_for(app_id):
+    """根据 app id（app-<Name>）返回 mihomo 规则路径前缀。"""
+    import re as _re
+    name = app_id
+    if app_id.startswith('app-'):
+        name = app_id[4:]
+    paths = []
+    for base in ['/Applications', '/System/Applications', '/System/Applications/Utilities']:
+        app_dir = os.path.join(base, name + '.app')
+        if os.path.isdir(app_dir):
+            p = _re.escape(app_dir + '/Contents/')
+            paths.append(p)
+            break
+    if not paths:
+        # 未找到 App 时用名字构造常见路径
+        paths.append(_re.escape('/Applications/' + name + '.app/Contents/'))
+    if name == 'Safari':
+        paths.append(_re.escape('/System/Library/Frameworks/WebKit.framework/'))
+    return paths
 
 
 def regenerate_config():
@@ -166,6 +199,47 @@ def regenerate_config():
     with open(RUNTIME_DIR + '/mihomo.yaml', 'w') as f:
         f.write(conf)
     return {'ok': True}
+
+
+def build_rules_for_config(cfg):
+    """与 Rust build_rules 保持一致，返回规则列表。"""
+    import re as _re
+    rules = []
+    for n in cfg.get('nodes', []):
+        server = n['server']
+        if server.replace('.', '').isdigit():
+            rules.append(f'IP-CIDR,{server}/32,DIRECT,no-resolve')
+        else:
+            rules.append(f'DOMAIN-SUFFIX,{server},DIRECT')
+    for app in cfg.get('apps', []):
+        if not app.get('confirmed'):
+            continue
+        if app.get('mode') == 'proxy':
+            node = app.get('node')
+            target = f'NODE-{node}' if node else 'PROXY'
+        else:
+            target = 'DIRECT'
+        for p in app_paths_for(app['id']):
+            rules.append(f'PROCESS-PATH-REGEX,^{p},{target}')
+    for dr in cfg.get('domainRules', []):
+        target = 'PROXY' if dr.get('target') == 'proxy' else 'DIRECT'
+        rules.append(f'DOMAIN-SUFFIX,{dr.get("domain", "")},{target}')
+    rules.append('GEOIP,LAN,DIRECT,no-resolve')
+    rules.append('MATCH,DIRECT')
+    return rules
+
+
+def hot_reload_rules(cfg):
+    """通过 PATCH /configs 热更新 rules，不重启、不弹授权框。"""
+    rules = build_rules_for_config(cfg)
+    body = json.dumps({'rules': rules}).encode()
+    req = urllib.request.Request(API + '/configs', data=body, method='PATCH')
+    req.add_header('Content-Type', 'application/json')
+    try:
+        r = urllib.request.urlopen(req, timeout=10)
+        return r.status in (200, 204)
+    except Exception as e:
+        return False
 
 
 def check_network():
@@ -257,9 +331,7 @@ def call_tool(name, args):
             cfg['apps'].append({'id': app_id, 'mode': mode, 'confirmed': True, 'node': None})
         write_config(cfg)
         if mihomo_running():
-            stop_mihomo()
-            regenerate_config()
-            start_mihomo()
+            hot_reload_rules(cfg)
         return {'ok': True, 'message': f'{app_id} -> {mode}'}
     elif name == 'check_network':
         return check_network()
@@ -288,9 +360,7 @@ def call_tool(name, args):
         cfg['domainRules'] = rules
         write_config(cfg)
         if mihomo_running():
-            stop_mihomo()
-            regenerate_config()
-            start_mihomo()
+            hot_reload_rules(cfg)
         return {'ok': True, 'message': f'域名规则已保存: {domain} -> {target}'}
     elif name == 'remove_domain_rule':
         cfg = read_config()
@@ -301,9 +371,7 @@ def call_tool(name, args):
         cfg['domainRules'] = [r for r in rules if r['domain'] != domain]
         write_config(cfg)
         if mihomo_running():
-            stop_mihomo()
-            regenerate_config()
-            start_mihomo()
+            hot_reload_rules(cfg)
         return {'ok': True, 'message': f'域名规则已删除: {domain}'}
     return {'error': f'unknown tool {name}'}
 

@@ -123,6 +123,14 @@ fn save_config(state: tauri::State<Arc<Mutex<AppState>>>, config: AppConfig) -> 
     let mut g = state.lock().unwrap();
     g.config = config.clone();
     config::save(&config)?;
+    // 如果代理正在运行，热更新 rules，让新保存的分流/域名规则立即生效（不重启、不弹授权框）
+    if g.mihomo.status().running {
+        let app_rules = effective_app_rules(&config);
+        if let Err(e) = g.mihomo.reload_rules(&config, &app_rules) {
+            // 热更新失败不阻塞保存，但要把错误返回给前端提示
+            return Err(format!("配置已保存，但规则热更新失败：{}", e));
+        }
+    }
     Ok(config)
 }
 
