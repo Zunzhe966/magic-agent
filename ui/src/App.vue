@@ -25,7 +25,7 @@
     <main class="main">
       <Dashboard v-if="view === 'dashboard'" :status="status" :config="config" @start="startProxy" @stop="stopProxy" @toggle-system-proxy="toggleSystemProxy" />
       <AppsView v-else-if="view === 'apps'" :apps="apps" @change="applyApps" @refresh="refresh" />
-      <ServersView v-else-if="view === 'servers'" :config="config" @update="saveConfig" @nav="view = 'ssh'" />
+      <ServersView v-else-if="view === 'servers'" :config="config" @update="saveConfig" @select-server="selectSshServer" @delete-server="deleteSshServer" @nav="view = 'ssh'" />
       <SshView v-else-if="view === 'ssh'" :config="config" @saved="onSshSaved" />
     </main>
   </div>
@@ -99,6 +99,31 @@ function onSshSaved(next) {
 let timer;
 onMounted(async () => {
   await refresh();
+async function selectSshServer(serverId) {
+  try {
+    const server = await invoke('select_ssh_server', { serverId });
+    config.value = {
+      ...config.value,
+      activeServerId: server.id,
+      sshHost: server.host,
+      sshPort: server.port,
+      sshUser: server.user,
+      sshAuth: server.auth,
+      sshPassword: null,
+      sshPrivateKey: server.keyPath || null,
+    };
+  } catch (e) {
+    alert('选择服务器失败：' + e);
+  }
+}
+async function deleteSshServer(serverId) {
+  try {
+    await invoke('delete_ssh_server', { serverId });
+    await refresh();
+  } catch (e) {
+    alert('删除服务器失败：' + e);
+  }
+}
   timer = setInterval(refresh, 3000);
 });
 onUnmounted(() => clearInterval(timer));

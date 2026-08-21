@@ -82,3 +82,7 @@ body { background: var(--bg); color: var(--text); }
 .quick-command-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
 .quick-command-row .muted { margin-right: 4px; font-size: 13px; }
 .btn.small { padding: 6px 10px; font-size: 12px; }
+.saved-server-list { display: grid; gap: 8px; }
+.saved-server { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel2); }
+.saved-server.active { border-color: var(--accent); }
+.saved-server strong, .saved-server .muted { display: block; }

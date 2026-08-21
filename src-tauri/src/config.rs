@@ -37,6 +37,8 @@ pub struct ServerInfo {
     pub auth: String, // "password" | "key"
     pub password_saved: bool,
     pub private_key_saved: bool,
+    #[serde(default)]
+    pub key_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,8 +49,12 @@ pub struct AppConfig {
     pub apps: Vec<AppSetting>,
     pub system_proxy: bool,
     pub auto_global: String,
+    #[serde(default)]
     pub subscription_url: Option<String>,
+    #[serde(default)]
     pub servers: Vec<ServerInfo>,
+    #[serde(default)]
+    pub active_server_id: Option<String>,
     // 兼容旧配置：仍保留这几个字段，但新逻辑不再把明文写进 config.json
     pub ssh_host: Option<String>,
     pub ssh_port: Option<u16>,
@@ -102,6 +108,7 @@ impl Default for AppConfig {
             auto_global: "auto".to_string(),
             subscription_url: None,
             servers: vec![],
+            active_server_id: None,
             ssh_host: None,
             ssh_port: Some(22),
             ssh_user: Some("root".to_string()),
@@ -113,8 +120,13 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// 当前激活的 SSH 服务器（优先 servers 列表，其次旧字段）
+    /// 当前激活的 SSH 服务器（优先 active_server_id，其次 servers 首项和旧字段）
     pub fn active_server(&self) -> Option<ServerInfo> {
+        if let Some(id) = &self.active_server_id {
+            if let Some(s) = self.servers.iter().find(|s| &s.id == id) {
+                return Some(s.clone());
+            }
+        }
         if let Some(s) = self.servers.first() {
             return Some(s.clone());
         }
@@ -129,6 +141,7 @@ impl AppConfig {
             auth: self.ssh_auth.clone().unwrap_or_else(|| "password".to_string()),
             password_saved: self.ssh_password.as_deref().map(|p| !p.is_empty()).unwrap_or(false),
             private_key_saved: self.ssh_private_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false),
+            key_path: self.ssh_private_key.clone(),
         })
     }
 }
