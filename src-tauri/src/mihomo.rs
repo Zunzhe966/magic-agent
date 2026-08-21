@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::Mutex;
 
 use crate::config::AppConfig;
@@ -16,9 +16,19 @@ pub struct MihomoStatus {
 }
 
 pub struct MihomoManager {
-    pub child: Mutex<Option<Child>>,
+    /// mihomo 以 root 权限启动（TUN 需要），无法作为普通子进程管理，记录 PID 即可
+    pub pid: Mutex<Option<u32>>,
     pub port: u16,
     pub runtime_dir: PathBuf,
+}
+
+fn process_alive(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 impl MihomoManager {
@@ -27,24 +37,25 @@ impl MihomoManager {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("magic-agent")
             .join("runtime");
-        Self { child: Mutex::new(None), port: 7891, runtime_dir }
+        Self { pid: Mutex::new(None), port: 7891, runtime_dir }
     }
 
     pub fn status(&self) -> MihomoStatus {
-        let mut guard = self.child.lock().unwrap();
-        let alive = guard.as_mut().map(|c| c.try_wait().ok().flatten().is_none()).unwrap_or(false);
+        let mut guard = self.pid.lock().unwrap();
+        let alive = guard.map(process_alive).unwrap_or(false);
         if !alive {
             *guard = None;
         }
         MihomoStatus {
             running: alive,
-            pid: guard.as_ref().and_then(|c| c.id().into()),
+            pid: *guard,
             port: self.port,
             node: None,
         }
     }
 
     /// 启动 mihomo。
+    /// TUN 模式需要 root 权限，通过 osascript 弹管理员授权后以 root 启动。
     /// app_rules: (路径前缀列表, 目标) 列表，目标为 "DIRECT" 或 "NODE-<节点名>" / "PROXY"。
     pub fn start(&self, cfg: &AppConfig, rules: &[String], app_rules: &[(Vec<String>, String)]) -> Result<MihomoStatus, String> {
         self.stop();
@@ -58,20 +69,44 @@ impl MihomoManager {
         if !bin.exists() {
             return Err(format!("代理内核不存在: {}", bin.display()));
         }
-        let child = Command::new(&bin)
-            .arg("-f")
-            .arg(&conf_path)
-            .arg("-d")
-            .arg(&self.runtime_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(std::fs::File::create(self.runtime_dir.join("mihomo.log")).map_err(|e| format!("创建日志失败: {e}"))?))
-            .stderr(Stdio::from(std::fs::File::create(self.runtime_dir.join("mihomo.err.log")).map_err(|e| format!("创建错误日志失败: {e}"))?))
-            .spawn()
-            .map_err(|e| format!("启动 mihomo 失败: {e}"))?;
-        let pid = child.id();
-        *self.child.lock().unwrap() = Some(child);
+
+        let log_path = self.runtime_dir.join("mihomo.log");
+        let err_path = self.runtime_dir.join("mihomo.err.log");
+        // 用 nohup 后台启动并输出 $!（后台进程 PID），由 osascript 以管理员权限执行。
+        // 注意：do shell script 会等待前台命令结束，但 & 让 mihomo 立即后台化，$! 被 echo 返回。
+        let shell_cmd = format!(
+            "nohup '{}' -f '{}' -d '{}' > '{}' 2> '{}' & echo $!",
+            bin.display(),
+            conf_path.display(),
+            self.runtime_dir.display(),
+            log_path.display(),
+            err_path.display()
+        );
+        let escaped = shell_cmd
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        let apple_script = format!("do shell script \"{}\" with administrator privileges", escaped);
+
+        let out = Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(&apple_script)
+            .output()
+            .map_err(|e| format!("调用 osascript 请求管理员权限失败: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            if err.to_lowercase().contains("canceled") || err.to_lowercase().contains("cancel") {
+                return Err("用户取消了管理员授权，代理内核未启动".to_string());
+            }
+            return Err(format!("以管理员权限启动 mihomo 失败: {}", err));
+        }
+        let pid_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let pid: u32 = pid_str
+            .parse()
+            .map_err(|e| format!("解析 mihomo PID 失败（返回: {:?}）: {e}", pid_str))?;
+        *self.pid.lock().unwrap() = Some(pid);
+
         let mut ok = false;
-        for _ in 0..100 {
+        for _ in 0..150 {
             if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
                 ok = true;
                 break;
@@ -79,7 +114,16 @@ impl MihomoManager {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
         if !ok {
-            return Err(format!("代理端口 {} 未能启动", self.port));
+            // 启动失败时清理
+            let _ = Command::new("/bin/kill").arg(pid.to_string()).output();
+            *self.pid.lock().unwrap() = None;
+            let err_tail = std::fs::read_to_string(&err_path).unwrap_or_default();
+            let err_suffix: String = err_tail.chars().rev().take(600).collect::<String>().chars().rev().collect();
+            return Err(format!(
+                "代理端口 {} 未能在 30 秒内就绪，mihomo 可能启动失败。错误日志末尾：{}",
+                self.port,
+                if err_suffix.trim().is_empty() { "空" } else { err_suffix.trim() }
+            ));
         }
         Ok(MihomoStatus {
             running: true,
@@ -90,10 +134,16 @@ impl MihomoManager {
     }
 
     pub fn stop(&self) {
-        let mut guard = self.child.lock().unwrap();
-        if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        let mut guard = self.pid.lock().unwrap();
+        if let Some(pid) = guard.take() {
+            let _ = Command::new("/bin/kill").arg(pid.to_string()).output();
+            // 等待进程退出，最多 10 秒
+            for _ in 0..100 {
+                if !process_alive(pid) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
         }
     }
 
@@ -145,6 +195,8 @@ impl MihomoManager {
         let mut out = String::new();
         out.push_str(&format!("mixed-port: {}\n", self.port));
         out.push_str("mode: rule\n");
+        // TUN 模式：mihomo 以 root 运行并接管系统路由，PROCESS-PATH-REGEX 依赖 TUN 连接表做进程匹配
+        out.push_str("tun:\n  enable: true\n  stack: system\n  auto-route: true\n  auto-detect-interface: true\n  dns-hijack:\n    - any:53\n");
         out.push_str("log-level: info\n");
         out.push_str("allow-lan: false\n");
         out.push_str("ipv6: false\n");
