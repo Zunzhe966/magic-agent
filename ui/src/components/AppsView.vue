@@ -25,7 +25,7 @@
         </div>
         <span class="tag">{{ app.category }}</span>
         <select class="mode-select" v-model="app.mode">
-          <option value="auto">智能</option><option value="proxy">代理</option><option value="direct">直连</option>
+          <option value="proxy">代理</option><option value="direct">直连</option>
         </select>
         <span class="conn-status" :class="connClass(app)">{{ connText(app) }}</span>
         <span class="path muted">{{ app.path }}</span>
@@ -40,7 +40,7 @@ const emit = defineEmits(['change', 'refresh']);
 const q = ref('');
 const filter = ref('all');
 const modes = [
-  { value: 'all', label: '全部' }, { value: 'proxy', label: '走代理' }, { value: 'direct', label: '直连' }, { value: 'auto', label: '智能' }
+  { value: 'all', label: '全部' }, { value: 'proxy', label: '走代理' }, { value: 'direct', label: '直连' }
 ];
 const filtered = computed(() => {
   const query = q.value.toLowerCase();

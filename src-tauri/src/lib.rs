@@ -93,18 +93,21 @@ struct AppState {
     config: AppConfig,
     mihomo: MihomoManager,
     ssh: crate::ssh::SshManager,
+    /// 已安装 App 列表缓存（scan_apps 时更新，get_status 只读长度，避免重扫描卡界面）
+    apps_cache: Mutex<Vec<crate::apps::AppEntry>>,
 }
 
 #[tauri::command]
 fn get_status(state: tauri::State<Arc<Mutex<AppState>>>) -> AppStatus {
     let g = state.lock().unwrap();
     let m = g.mihomo.status();
+    let apps_count = g.apps_cache.lock().unwrap().len();
     AppStatus {
         proxy_running: m.running,
         proxy_pid: m.pid,
         proxy_port: m.port,
         system_proxy: system_proxy::status().enabled,
-        apps_count: apps::scan_macos_apps().len(),
+        apps_count,
         nodes_count: g.config.nodes.len(),
         ssh: g.ssh.status(),
     }
@@ -134,6 +137,8 @@ fn scan_apps(state: tauri::State<Arc<Mutex<AppState>>>) -> Vec<crate::apps::AppE
             app.node = setting.node.clone();
         }
     }
+    // 更新缓存，供 get_status 轻量读取数量
+    *g.apps_cache.lock().unwrap() = list.clone();
     list
 }
 
@@ -399,6 +404,7 @@ pub fn run() {
         config: config::load(),
         mihomo: MihomoManager::new(),
         ssh: crate::ssh::SshManager::new(),
+        apps_cache: Mutex::new(Vec::new()),
     }));
     tauri::Builder::default()
         .manage(state)

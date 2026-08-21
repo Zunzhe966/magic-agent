@@ -140,8 +140,11 @@ onMounted(async () => {
   await refresh();
   // App 扫描只加载一次，之后用户手动点"重新扫描"才刷新
   await refreshApps();
-  // 定时器只做轻量状态轮询，不再扫描 App，避免界面卡顿
-  timer = setInterval(refresh, 5000);
+  // 定时器只做轻量状态轮询；只有停留在软件分流页时才刷新 App 运行状态
+  timer = setInterval(() => {
+    refresh();
+    if (view.value === 'apps') refreshApps();
+  }, 5000);
 });
 onUnmounted(() => clearInterval(timer));
 </script>
