@@ -72,6 +72,21 @@
     </section>
 
     <section class="panel">
+      <div class="panel-head"><h2>域名分流</h2></div>
+      <p class="muted" style="margin-bottom: 8px;">同一个软件下载时有的走代理有的走直连？在这里按域名指定。一行一个域名，选"代理"或"直连"。</p>
+      <div v-for="(rule, i) in domainRules" :key="i" class="domain-rule-row">
+        <input v-model="rule.domain" placeholder="github.com" />
+        <select v-model="rule.target">
+          <option value="proxy">代理</option>
+          <option value="direct">直连</option>
+        </select>
+        <button class="btn small danger" @click="removeDomainRule(i)">删</button>
+      </div>
+      <button class="btn small" @click="domainRules.push({ domain: '', target: 'proxy' })">+ 加域名</button>
+      <button class="btn small primary" style="margin-left: 8px;" @click="saveDomainRules">保存域名规则</button>
+    </section>
+
+    <section class="panel">
       <div class="panel-head"><h2>SSH 控制</h2><button class="btn" @click="$emit('nav')">打开控制台</button></div>
       <p class="muted">通过 SSH 直接控制云服务器：执行命令、安装软件、查看日志。</p>
     </section>
@@ -84,6 +99,13 @@ const props = defineProps({ config: Object, status: Object });
 const emit = defineEmits(['nav', 'update', 'select-server', 'delete-server']);
 const showAdd = ref(false);
 const subUrl = ref(props.config?.subscriptionUrl || '');
+const domainRules = ref((props.config?.domainRules || []).map(r => ({ ...r })));
+watch(() => props.config?.domainRules, v => { domainRules.value = (v || []).map(r => ({ ...r })); });
+function removeDomainRule(i) { domainRules.value.splice(i, 1); }
+function saveDomainRules() {
+  const rules = domainRules.value.filter(r => r.domain.trim());
+  emit('update', { domainRules: rules });
+}
 const form = ref({
   name: '', server: '', port: 443, uuid: '',
   flow: 'xtls-rprx-vision', sni: '', publicKey: '', shortId: '', fingerprint: 'chrome',

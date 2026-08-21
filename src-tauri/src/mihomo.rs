@@ -268,7 +268,12 @@ impl MihomoManager {
                 out.push_str(&format!("  - PROCESS-PATH-REGEX,^{},{}\n", regex_escape_path(p), target));
             }
         }
-        // 3) 用户自定义规则
+        // 3) 域名分流规则：同一个软件下载混合源时，按域名精确决定代理/直连
+        for dr in &cfg.domain_rules {
+            let target = if dr.target == "proxy" { "PROXY" } else { "DIRECT" };
+            out.push_str(&format!("  - DOMAIN-SUFFIX,{},{}\n", dr.domain, target));
+        }
+        // 4) 用户自定义规则
         for r in rules {
             out.push_str(&format!("  - {}\n", r));
         }

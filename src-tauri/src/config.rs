@@ -63,6 +63,15 @@ pub struct ServerInfo {
     pub key_path: Option<String>,
 }
 
+/// 域名分流规则：按域名后缀/关键字指定走代理或直连。
+/// 优先级在"软件规则"之后、"兜底直连"之前，解决同一个软件下载混合源的问题。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DomainRule {
+    pub domain: String,   // 如 github.com、huggingface.co
+    pub target: String,   // "proxy" 走代理 | "direct" 直连
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
@@ -77,6 +86,8 @@ pub struct AppConfig {
     pub servers: Vec<ServerInfo>,
     #[serde(default)]
     pub active_server_id: Option<String>,
+    #[serde(default)]
+    pub domain_rules: Vec<DomainRule>,
     // 兼容旧配置：仍保留这几个字段，但新逻辑不再把明文写进 config.json
     pub ssh_host: Option<String>,
     pub ssh_port: Option<u16>,
@@ -98,6 +109,7 @@ impl Default for AppConfig {
             subscription_url: None,
             servers: vec![],
             active_server_id: None,
+            domain_rules: vec![],
             ssh_host: None,
             ssh_port: Some(22),
             ssh_user: Some("root".to_string()),

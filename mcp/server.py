@@ -148,13 +148,10 @@ def generate_config(cfg):
             lines.append(f'  - IP-CIDR,{server}/32,DIRECT,no-resolve')
         else:
             lines.append(f'  - DOMAIN-SUFFIX,{server},DIRECT')
-    # 软件规则
-    for app in cfg.get('apps', []):
-        if not app.get('confirmed'):
-            continue
-        # 从 scan 结果获取路径（简化：通过 App 名构造规则）
-        # 实际 App 扫描由 Rust 端完成，这里用存储的规则路径
-        pass
+    # 域名分流规则：同一个软件下载混合源时按域名决定代理/直连
+    for dr in cfg.get('domainRules', []):
+        target = 'PROXY' if dr.get('target') == 'proxy' else 'DIRECT'
+        lines.append(f'  - DOMAIN-SUFFIX,{dr.get("domain", "")},{target}')
     lines.append('  - GEOIP,LAN,DIRECT,no-resolve')
     lines.append('  - MATCH,DIRECT')
     return '\n'.join(lines) + '\n'
@@ -192,6 +189,9 @@ TOOLS = [
     {'name': 'list_apps', 'description': '列出软件分流配置'},
     {'name': 'set_app_mode', 'description': '设置某 App 的代理模式（proxy/direct）'},
     {'name': 'check_network', 'description': '测试国内外网站连通性'},
+    {'name': 'list_domain_rules', 'description': '列出域名分流规则（哪些域名走代理/直连）'},
+    {'name': 'add_domain_rule', 'description': '添加或更新域名分流规则，如 {"domain":"github.com","target":"proxy"}'},
+    {'name': 'remove_domain_rule', 'description': '删除域名分流规则，如 {"domain":"github.com"}'},
 ]
 
 
@@ -263,6 +263,48 @@ def call_tool(name, args):
         return {'ok': True, 'message': f'{app_id} -> {mode}'}
     elif name == 'check_network':
         return check_network()
+    elif name == 'list_domain_rules':
+        cfg = read_config()
+        if 'error' in cfg:
+            return cfg
+        return cfg.get('domainRules', [])
+    elif name == 'add_domain_rule':
+        cfg = read_config()
+        if 'error' in cfg:
+            return cfg
+        domain = args.get('domain', '').strip()
+        target = args.get('target', 'proxy')
+        if not domain:
+            return {'error': 'domain is required'}
+        if target not in ('proxy', 'direct'):
+            return {'error': 'target must be proxy or direct'}
+        rules = cfg.get('domainRules', [])
+        for r in rules:
+            if r['domain'] == domain:
+                r['target'] = target
+                break
+        else:
+            rules.append({'domain': domain, 'target': target})
+        cfg['domainRules'] = rules
+        write_config(cfg)
+        if mihomo_running():
+            stop_mihomo()
+            regenerate_config()
+            start_mihomo()
+        return {'ok': True, 'message': f'域名规则已保存: {domain} -> {target}'}
+    elif name == 'remove_domain_rule':
+        cfg = read_config()
+        if 'error' in cfg:
+            return cfg
+        domain = args.get('domain', '').strip()
+        rules = cfg.get('domainRules', [])
+        cfg['domainRules'] = [r for r in rules if r['domain'] != domain]
+        write_config(cfg)
+        if mihomo_running():
+            stop_mihomo()
+            regenerate_config()
+            start_mihomo()
+        return {'ok': True, 'message': f'域名规则已删除: {domain}'}
     return {'error': f'unknown tool {name}'}
 
 
