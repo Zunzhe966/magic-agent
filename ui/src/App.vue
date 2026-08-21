@@ -24,7 +24,7 @@
     </aside>
     <main class="main">
       <Dashboard v-if="view === 'dashboard'" :status="status" :config="config" @start="startProxy" @stop="stopProxy" @toggle-system-proxy="toggleSystemProxy" />
-      <AppsView v-else-if="view === 'apps'" :apps="apps" @change="applyApps" @refresh="refresh" />
+      <AppsView v-else-if="view === 'apps'" :apps="apps" @change="applyApps" @refresh="refreshApps" />
       <ServersView v-else-if="view === 'servers'" :config="config" @update="saveConfig" @select-server="selectSshServer" @delete-server="deleteSshServer" @nav="view = 'ssh'" />
       <SshView v-else-if="view === 'ssh'" :config="config" @saved="onSshSaved" />
     </main>
@@ -50,13 +50,20 @@ const navs = [
 ];
 
 async function refresh() {
+  // 轻量刷新：只拉状态和配置，不扫描 App（scan_apps 是重操作，放 refreshApps 单独做）
   try {
-    const [s, c, a] = await Promise.all([invoke('get_status'), invoke('get_config'), invoke('scan_apps')]);
+    const [s, c] = await Promise.all([invoke('get_status'), invoke('get_config')]);
     status.value = s;
     config.value = c;
-    apps.value = a;
   } catch (e) {
     console.error('refresh failed', e);
+  }
+}
+async function refreshApps() {
+  try {
+    apps.value = await invoke('scan_apps');
+  } catch (e) {
+    console.error('scan apps failed', e);
   }
 }
 async function startProxy() {
@@ -131,7 +138,10 @@ async function deleteSshServer(serverId) {
 }
 onMounted(async () => {
   await refresh();
-  timer = setInterval(refresh, 3000);
+  // App 扫描只加载一次，之后用户手动点"重新扫描"才刷新
+  await refreshApps();
+  // 定时器只做轻量状态轮询，不再扫描 App，避免界面卡顿
+  timer = setInterval(refresh, 5000);
 });
 onUnmounted(() => clearInterval(timer));
 </script>

@@ -13,9 +13,10 @@
         <button v-for="m in modes" :key="m.value" class="seg-btn" :class="{ on: filter === m.value }" @click="filter = m.value">{{ m.label }}</button>
       </div>
     </div>
+    <p class="muted" style="margin-bottom: 10px;">默认策略：所有软件直连。只有你在下面明确选为「代理」的软件才会走代理。</p>
     <div class="apps-table">
       <div class="apps-row head">
-        <span>软件</span><span>类别</span><span>模式</span><span>路径</span>
+        <span>软件</span><span>类别</span><span>模式</span><span>当前连接</span><span>路径</span>
       </div>
       <div class="apps-row" v-for="app in filtered" :key="app.id">
         <div class="app-name">
@@ -26,6 +27,7 @@
         <select class="mode-select" v-model="app.mode">
           <option value="auto">智能</option><option value="proxy">代理</option><option value="direct">直连</option>
         </select>
+        <span class="conn-status" :class="connClass(app)">{{ connText(app) }}</span>
         <span class="path muted">{{ app.path }}</span>
       </div>
     </div>
@@ -44,6 +46,18 @@ const filtered = computed(() => {
   const query = q.value.toLowerCase();
   return props.apps.filter(a => (!query || a.name.toLowerCase().includes(query)) && (filter.value === 'all' || a.mode === filter.value));
 });
+function connText(app) {
+  if (!app.running) return '未运行';
+  if (!app.confirmed) return '默认直连';
+  if (app.mode === 'proxy') return app.node ? ('代理：' + app.node) : '代理';
+  return '直连';
+}
+function connClass(app) {
+  if (!app.running) return 'idle';
+  if (!app.confirmed) return 'direct';
+  if (app.mode === 'proxy') return 'proxy';
+  return 'direct';
+}
 function save() {
   emit('change', props.apps);
 }
