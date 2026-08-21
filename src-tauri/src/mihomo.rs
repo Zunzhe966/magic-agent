@@ -293,11 +293,56 @@ fn regex_escape_path(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProxyNode;
+
     #[test]
     fn resource_root_exists() {
         let m = MihomoManager::new();
         let root = m.resource_root();
         assert!(root.exists(), "resource root missing: {}", root.display());
         assert!(root.join("bin/mihomo").exists(), "mihomo binary missing");
+    }
+
+    #[test]
+    fn generated_conf_is_valid_mihomo_yaml() {
+        let m = MihomoManager::new();
+        let node = ProxyNode {
+            name: "test-node".to_string(),
+            server: "104.160.40.35".to_string(),
+            port: 443,
+            uuid: "test-uuid".to_string(),
+            flow: "xtls-rprx-vision".to_string(),
+            network: "tcp".to_string(),
+            tls: true,
+            udp: true,
+            fingerprint: "chrome".to_string(),
+            public_key: "c7wQJ08b7byOCBzPejQJSwTe8gVN5H4gZxY9vE-k1X0".to_string(),
+            short_id: "be08e6123ddcaf32".to_string(),
+            sni: String::new(),
+            source: "manual".to_string(),
+            region: String::new(),
+        };
+        let cfg = AppConfig {
+            nodes: vec![node],
+            selected_node: Some("test-node".to_string()),
+            ..Default::default()
+        };
+        let conf = m.build_conf(&cfg, &[], &[]);
+        let tmp = std::env::temp_dir().join("magic-agent-test-conf.yaml");
+        std::fs::write(&tmp, &conf).unwrap();
+        let out = Command::new(m.bin_path())
+            .arg("-t")
+            .arg("-f")
+            .arg(&tmp)
+            .output()
+            .expect("run mihomo -t");
+        let _ = std::fs::remove_file(&tmp);
+        assert!(
+            out.status.success(),
+            "mihomo -t rejected config:\nSTDOUT: {}\nSTDERR: {}\nCONF:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+            conf
+        );
     }
 }
