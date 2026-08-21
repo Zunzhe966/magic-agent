@@ -33,7 +33,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 const quickCommands = [
   { label: '系统信息', command: 'uname -a; uptime\n' },
-  { label: '内存', command: 'vm_stat; sysctl hw.memsize\n' },
+  { label: '内存', command: 'free -h; nproc\n' },
   { label: '磁盘', command: 'df -h\n' },
   { label: '进程', command: 'ps aux | head -20\n' },
 ];

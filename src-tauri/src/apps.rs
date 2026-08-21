@@ -11,7 +11,8 @@ pub struct AppEntry {
     pub running: bool,
     pub mode: String,
     pub category: String,
-    pub rule_path: String,
+    /// 规则匹配用的路径前缀列表：该 App 全部进程（主程序+Helper+子进程）都命中这些前缀
+    pub rule_paths: Vec<String>,
 }
 
 
@@ -65,13 +66,13 @@ fn scan_installed_apps() -> Vec<AppEntry> {
             apps.push(AppEntry {
                 id,
                 name: name.clone(),
-                bundle_id,
-                // path 与 rule_path 都指向可执行文件，供 PROCESS-PATH-REGEX 精确匹配
-                path: Some(path.clone()),
+                bundle_id: bundle_id.clone(),
+                // path 指向主可执行文件（展示用）；rule_paths 是规则前缀（匹配整组进程用）
+                path: Some(path),
                 running: false,
-                mode: "auto".to_string(),
+                mode: "direct".to_string(),
                 category: classify(&name),
-                rule_path: path,
+                rule_paths: rule_paths_for(&p, bundle_id.as_deref()),
             });
         }
     }
@@ -141,6 +142,18 @@ fn read_bundle_id(app: &Path) -> Option<String> {
         return Some(String::from_utf8_lossy(&out.stdout).trim().to_string());
     }
     None
+}
+
+/// 生成该 App 的规则路径前缀列表。
+/// 默认覆盖 App 包 Contents/ 下所有进程（主程序、Helper、Frameworks 里的子进程）。
+/// 特例：Safari 的实际联网进程是系统级 XPC 服务 com.apple.WebKit.Networking，
+/// 位于 /System/Library/Frameworks/WebKit.framework/ 下，不在 Safari.app 包内，必须单独纳入。
+fn rule_paths_for(app_dir: &Path, bundle_id: Option<&str>) -> Vec<String> {
+    let mut v = vec![format!("{}/Contents/", app_dir.to_string_lossy())];
+    if bundle_id == Some("com.apple.Safari") {
+        v.push("/System/Library/Frameworks/WebKit.framework/".to_string());
+    }
+    v
 }
 
 pub fn classify(name: &str) -> String {

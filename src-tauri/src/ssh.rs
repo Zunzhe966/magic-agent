@@ -94,7 +94,10 @@ impl SshManager {
             let mut s = Command::new("/usr/bin/expect");
             s.arg("-f").arg(&tmp);
             s.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-            s.spawn().map_err(|e| format!("启动 SSH 失败: {e}"))?
+            let spawned = s.spawn().map_err(|e| format!("启动 SSH 失败: {e}"))?;
+            // 临时脚本含明文密码，spawn 成功后立即删除，避免残留
+            let _ = std::fs::remove_file(&tmp);
+            spawned
         } else {
             cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
             cmd.spawn().map_err(|e| format!("启动 SSH 失败: {e}"))?

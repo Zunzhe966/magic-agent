@@ -34,20 +34,25 @@ pub struct ConflictInfo {
 #[tauri::command]
 fn check_conflicts() -> ConflictInfo {
     let mut messages = Vec::new();
-    // 1) 检测正在运行的代理程序（FlClash / Clash / mihomo）
-    if let Ok(ps) = std::process::Command::new("/bin/ps").args(["-axo", "comm="]).output() {
-        let text = String::from_utf8_lossy(&ps.stdout).to_lowercase();
-        let mut names = std::collections::HashSet::new();
+    // 本程序自己启动的 mihomo 会带 runtime 目录参数，遇到时跳过，避免误报自身
+    let runtime = MihomoManager::new().runtime_dir;
+    let runtime_str = runtime.to_string_lossy().to_string();
+    // 1) 检测正在运行的第三方代理程序（FlClash / Clash / 外部 mihomo）
+    if let Ok(ps) = std::process::Command::new("/bin/ps").args(["-axo", "args="]).output() {
+        let text = String::from_utf8_lossy(&ps.stdout);
+        let mut foreign = false;
         for line in text.lines() {
-            let l = line.to_lowercase();
-            for name in ["mihomo", "clash", "flclash"] {
-                if l.contains(name) {
-                    names.insert(name);
-                }
+            let lower = line.to_lowercase();
+            let hit = lower.contains("mihomo") || lower.contains("clash") || lower.contains("flclash");
+            if !hit { continue; }
+            // 跳过本程序 runtime 目录启动的 mihomo
+            if line.contains(&runtime_str) {
+                continue;
             }
+            foreign = true;
         }
-        for name in names {
-            messages.push(format!("检测到正在运行的代理程序: {}", name));
+        if foreign {
+            messages.push("检测到正在运行的第三方代理程序（FlClash/Clash/mihomo），请先关闭".to_string());
         }
     }
     // 2) 检测本程序要用的混合端口是否已被占用
@@ -122,36 +127,46 @@ fn scan_apps(state: tauri::State<Arc<Mutex<AppState>>>) -> Vec<crate::apps::AppE
     list
 }
 
-fn effective_app_lists(config: &AppConfig) -> (Vec<String>, Vec<String>) {
+/// 生成生效的软件分流规则：只处理用户已确认（confirmed）的条目。
+/// 返回 (路径前缀列表, 目标) 列表；目标 = DIRECT | NODE-<节点名> | PROXY(当前选中节点)。
+fn effective_app_rules(config: &AppConfig) -> Vec<(Vec<String>, String)> {
     let apps = crate::apps::scan_macos_apps();
     let mut by_id = std::collections::HashMap::new();
     for a in apps {
-        by_id.insert(a.id, a.rule_path);
+        by_id.insert(a.id, a.rule_paths);
     }
-    let mut direct = Vec::new();
-    let mut proxy = Vec::new();
+    let mut out = Vec::new();
     for setting in &config.apps {
-        let Some(path) = by_id.get(&setting.id) else { continue };
-        if setting.mode == "direct" {
-            direct.push(path.clone());
-        } else if setting.mode == "proxy" {
-            proxy.push(path.clone());
+        if !setting.confirmed {
+            continue; // 未确认的软件不进规则表，由 MATCH,DIRECT 兜底
         }
+        let Some(paths) = by_id.get(&setting.id) else { continue };
+        let target = if setting.mode == "proxy" {
+            match &setting.node {
+                Some(n) if !n.trim().is_empty() => format!("NODE-{}", n.trim()),
+                _ => "PROXY".to_string(),
+            }
+        } else {
+            "DIRECT".to_string()
+        };
+        out.push((paths.clone(), target));
     }
-    (direct, proxy)
+    out
 }
 
 #[tauri::command]
 fn start_proxy(state: tauri::State<Arc<Mutex<AppState>>>) -> Result<MihomoStatus, String> {
-    // 启动前先做冲突检测：FlClash/mihomo 占用端口时直接提示，避免抢端口
+    let g = state.lock().unwrap();
+    // 先停止自己可能还在运行的 mihomo，避免重启时端口检测误报自身
+    g.mihomo.stop();
+    let cfg = g.config.clone();
+    let app_rules = effective_app_rules(&cfg);
+    // 再检测第三方代理冲突：FlClash/mihomo 占用端口时直接提示，避免抢端口
     let conflict = check_conflicts();
     if conflict.has_conflict {
         return Err(conflict.messages.join("；"));
     }
-    let g = state.lock().unwrap();
-    let cfg = g.config.clone();
-    let (direct, proxy) = effective_app_lists(&cfg);
-    let status = g.mihomo.start(&cfg, &[], &direct, &proxy)?;
+    let status = g.mihomo.start(&cfg, &[], &app_rules)?;
     if cfg.system_proxy {
         let _ = system_proxy::set_system_proxy(true, g.mihomo.port);
     }
@@ -320,8 +335,8 @@ fn self_test(state: tauri::State<Arc<Mutex<AppState>>>) -> Result<String, String
 pub fn start_proxy_standalone() -> Result<MihomoStatus, String> {
     let cfg = config::load();
     let mihomo = MihomoManager::new();
-    let (direct, proxy) = effective_app_lists(&cfg);
-    let status = mihomo.start(&cfg, &[], &direct, &proxy)?;
+    let app_rules = effective_app_rules(&cfg);
+    let status = mihomo.start(&cfg, &[], &app_rules)?;
     if cfg.system_proxy {
         let _ = system_proxy::set_system_proxy(true, mihomo.port);
     }
