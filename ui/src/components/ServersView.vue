@@ -50,8 +50,10 @@
         <div class="kv"><span>Short ID</span><b class="mono">{{ node.shortId }}</b></div>
         <div class="card-actions">
           <button class="btn small" @click="selectNode(node)">设为当前</button>
+          <button class="btn small" @click="testDelay(node)">测延迟</button>
           <button class="btn small danger" @click="removeNode(i)">删除</button>
         </div>
+        <div v-if="delays[node.name]" class="delay-line" :class="delayClass(delays[node.name])">{{ delays[node.name] }} ms</div>
       </div>
     </div>
 
@@ -150,6 +152,23 @@ function addNode() {
   });
   emit('update', { nodes });
   form.value = { name: '', server: '', port: 443, uuid: '', flow: 'xtls-rprx-vision', sni: '', publicKey: '', shortId: '', fingerprint: 'chrome' };
+}
+const delays = ref({});
+async function testDelay(node) {
+  try {
+    const url = 'http://127.0.0.1:19091/proxies/' + encodeURIComponent(node.name) + '/delay?timeout=5000&url=http://www.gstatic.com/generate_204';
+    const resp = await fetch(url);
+    const data = await resp.json();
+    delays.value[node.name] = data.delay;
+  } catch (e) {
+    delays.value[node.name] = -1;
+  }
+}
+function delayClass(v) {
+  if (v < 0) return 'delay-bad';
+  if (v < 800) return 'delay-good';
+  if (v < 2000) return 'delay-mid';
+  return 'delay-bad';
 }
 function selectNode(node) {
   emit('update', { selectedNode: node.name });
