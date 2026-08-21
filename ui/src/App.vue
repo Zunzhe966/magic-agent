@@ -83,7 +83,13 @@ async function toggleSystemProxy(enabled) {
 }
 async function applyApps(list) {
   if (!config.value) return;
-  config.value.apps = list.map(a => ({ id: a.id, mode: a.mode }));
+  config.value.apps = list.map(a => ({
+    id: a.id,
+    mode: a.mode,
+    // 用户在界面保存过该软件，视为已确认；节点保持原选择
+    confirmed: a.confirmed || true,
+    node: a.node || null,
+  }));
   await invoke('save_config', { config: config.value });
   await refresh();
 }

@@ -122,6 +122,8 @@ fn scan_apps(state: tauri::State<Arc<Mutex<AppState>>>) -> Vec<crate::apps::AppE
     for app in list.iter_mut() {
         if let Some(setting) = g.config.apps.iter().find(|s| s.id == app.id) {
             app.mode = setting.mode.clone();
+            app.confirmed = setting.confirmed;
+            app.node = setting.node.clone();
         }
     }
     list
