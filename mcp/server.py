@@ -230,15 +230,22 @@ def build_rules_for_config(cfg):
 
 
 def hot_reload_rules(cfg):
-    """通过 PATCH /configs 热更新 rules，不重启、不弹授权框。"""
-    rules = build_rules_for_config(cfg)
-    body = json.dumps({'rules': rules}).encode()
-    req = urllib.request.Request(API + '/configs', data=body, method='PATCH')
-    req.add_header('Content-Type', 'application/json')
+    """写完整 YAML + SIGHUP 重载。PATCH /configs 对多条 PROCESS-PATH-REGEX 只保留第一条，不可用。"""
     try:
-        r = urllib.request.urlopen(req, timeout=10)
-        return r.status in (200, 204)
-    except Exception as e:
+        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        conf_text = generate_config(cfg)
+        conf_path = RUNTIME_DIR + '/mihomo.yaml'
+        with open(conf_path, 'w') as f:
+            f.write(conf_text)
+        # 找 mihomo pid
+        p = subprocess.run(['/usr/bin/pgrep', '-f', 'resources/bin/mihomo'], capture_output=True, text=True)
+        pid = p.stdout.strip().split()[0] if p.stdout.strip() else ''
+        if not pid:
+            return False
+        script = f'do shell script "/bin/kill -HUP {pid}" with administrator privileges'
+        p2 = subprocess.run(['/usr/bin/osascript', '-e', script], capture_output=True, text=True, timeout=300)
+        return p2.returncode == 0
+    except Exception:
         return False
 
 

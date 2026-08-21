@@ -139,22 +139,42 @@ impl MihomoManager {
         })
     }
 
-    /// 热更新 rules（通过 external-controller PATCH /configs），
-    /// 保存分流/域名规则后立即生效，不需要重启进程、不弹授权框。
+    /// 热更新配置：写完整 YAML 到 mihomo.yaml，然后提权发送 SIGHUP 让 mihomo 重载。
+    /// 不用 PATCH /configs——实测 mihomo 的 PATCH 对多条 PROCESS-PATH-REGEX 只保留第一条。
     pub fn reload_rules(&self, cfg: &AppConfig, app_rules: &[(Vec<String>, String)]) -> Result<(), String> {
-        let rules = self.build_rules(cfg, &[], app_rules);
-        let body = serde_json::json!({ "rules": rules });
-        let out = Command::new("/usr/bin/curl")
-            .arg("-s")
-            .arg("-X").arg("PATCH")
-            .arg("-H").arg("Content-Type: application/json")
-            .arg("-d").arg(body.to_string())
-            .arg("http://127.0.0.1:19091/configs")
+        // 1. 写完整配置
+        let conf = self.build_conf(cfg, &[], app_rules);
+        let conf_path = self.runtime_dir.join("mihomo.yaml");
+        std::fs::write(&conf_path, conf).map_err(|e| format!("写配置失败: {e}"))?;
+
+        // 2. 找 mihomo PID
+        let out = Command::new("/bin/ps")
+            .args(["-axo", "pid=,args="])
             .output()
-            .map_err(|e| format!("调用 curl 热更新失败: {e}"))?;
+            .map_err(|e| e.to_string())?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let conf_str = conf_path.to_string_lossy().to_string();
+        let mut pid: Option<String> = None;
+        for line in text.lines() {
+            if line.contains("mihomo") && line.contains(&conf_str) {
+                pid = line.split_whitespace().next().map(|s| s.to_string());
+                break;
+            }
+        }
+        let Some(pid) = pid else {
+            return Err("未找到运行中的 mihomo 进程".to_string());
+        };
+
+        // 3. 提权发送 SIGHUP 重载配置
+        let script = format!("do shell script \"/bin/kill -HUP {}\" with administrator privileges", pid);
+        let out = Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .map_err(|e| format!("调用 osascript 失败: {e}"))?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            return Err(format!("mihomo 热更新失败: {}", err));
+            return Err(format!("SIGHUP 重载失败（用户可能取消了授权）: {}", err));
         }
         Ok(())
     }
