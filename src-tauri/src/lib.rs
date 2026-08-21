@@ -159,11 +159,14 @@ fn effective_app_rules(config: &AppConfig) -> Vec<(Vec<String>, String)> {
 #[tauri::command]
 fn start_proxy(state: tauri::State<Arc<Mutex<AppState>>>) -> Result<MihomoStatus, String> {
     let g = state.lock().unwrap();
-    // 先停止自己可能还在运行的 mihomo，避免重启时端口检测误报自身
-    g.mihomo.stop();
+    // 已经在运行就直接返回，避免先停后启导致"点了没反应"（停启都会弹授权框）
+    let current = g.mihomo.status();
+    if current.running {
+        return Ok(current);
+    }
     let cfg = g.config.clone();
     let app_rules = effective_app_rules(&cfg);
-    // 再检测第三方代理冲突：FlClash/mihomo 占用端口时直接提示，避免抢端口
+    // 检测第三方代理冲突：FlClash/mihomo 占用端口时直接提示，避免抢端口
     let conflict = check_conflicts();
     if conflict.has_conflict {
         return Err(conflict.messages.join("；"));
