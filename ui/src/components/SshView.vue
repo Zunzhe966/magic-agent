@@ -19,6 +19,10 @@
       <div class="terminal-wrap">
         <div ref="termEl" class="terminal"></div>
       </div>
+      <div class="quick-command-row" v-if="connected">
+        <span class="muted">快捷命令</span>
+        <button v-for="item in quickCommands" :key="item.label" class="btn small" @click="runQuickCommand(item.command)">{{ item.label }}</button>
+      </div>
     </section>
   </div>
 </template>
@@ -27,6 +31,12 @@ import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
+const quickCommands = [
+  { label: '系统信息', command: 'uname -a; uptime\n' },
+  { label: '内存', command: 'vm_stat; sysctl hw.memsize\n' },
+  { label: '磁盘', command: 'df -h\n' },
+  { label: '进程', command: 'ps aux | head -20\n' },
+];
 import '@xterm/xterm/css/xterm.css';
 
 const props = defineProps({ config: Object });
@@ -64,8 +74,21 @@ onMounted(async () => {
 });
 async function poll() {
   if (!connected.value) return;
-  const data = await invoke('ssh_read');
-  if (data && data.length) term.write(decoder.decode(new Uint8Array(data)));
+  try {
+    const data = await invoke('ssh_read');
+    if (data && data.length) term.write(decoder.decode(new Uint8Array(data)));
+  } catch (e) {
+    connected.value = false;
+    term.writeln('\\r\\n连接已断开: ' + e);
+  }
+}
+async function runQuickCommand(command) {
+  if (!connected.value) return;
+  try {
+    await invoke('ssh_write', { data: Array.from(new TextEncoder().encode(command)) });
+  } catch (e) {
+    term.writeln('\\r\\n命令发送失败: ' + e);
+  }
 }
 async function connect() {
   try {
@@ -89,9 +112,16 @@ async function connect() {
   }
 }
 async function disconnect() {
-  await invoke('ssh_disconnect');
+  try {
+    await invoke('ssh_disconnect');
+  } catch (e) {
+    term.writeln('\r\n断开失败: ' + e);
+  }
   connected.value = false;
   term.writeln('\r\n已断开。');
 }
-onUnmounted(() => clearInterval(timer));
+onUnmounted(async () => {
+  clearInterval(timer);
+  if (connected.value) await invoke('ssh_disconnect').catch(() => {});
+});
 </script>
