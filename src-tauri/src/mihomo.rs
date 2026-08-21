@@ -72,10 +72,11 @@ impl MihomoManager {
 
         let log_path = self.runtime_dir.join("mihomo.log");
         let err_path = self.runtime_dir.join("mihomo.err.log");
-        // 用 nohup 后台启动并输出 $!（后台进程 PID），由 osascript 以管理员权限执行。
+        // 直接 & 后台启动并输出 $!（后台进程 PID），由 osascript 以管理员权限执行。
         // 注意：do shell script 会等待前台命令结束，但 & 让 mihomo 立即后台化，$! 被 echo 返回。
+        // 不能用 nohup：osascript 的 shell 没有 TTY，nohup 会报 "can't detach from console"。
         let shell_cmd = format!(
-            "nohup '{}' -f '{}' -d '{}' > '{}' 2> '{}' & echo $!",
+            "'{}' -f '{}' -d '{}' > '{}' 2> '{}' & echo $!",
             bin.display(),
             conf_path.display(),
             self.runtime_dir.display(),
