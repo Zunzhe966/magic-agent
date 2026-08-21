@@ -90,3 +90,7 @@ body { background: var(--bg); color: var(--text); }
 .conn-status.proxy { background: rgba(77,124,254,.15); color: #6ea8fe; }
 .conn-status.direct { background: rgba(62,207,142,.12); color: #3ecf8e; }
 .conn-status.idle { background: rgba(140,152,173,.12); color: #8c98ad; }
+.delay-line { margin-top: 8px; font-size: 13px; font-weight: 600; }
+.delay-good { color: #3ecf8e; }
+.delay-mid { color: #f5a524; }
+.delay-bad { color: #ef5b6e; }
