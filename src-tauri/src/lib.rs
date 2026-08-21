@@ -346,11 +346,12 @@ pub fn start_proxy_standalone() -> Result<MihomoStatus, String> {
 }
 
 pub fn stop_proxy_standalone() -> Result<(), String> {
-    // start_proxy_standalone 与 stop_proxy_standalone 各自创建实例无法共享 child，
-    // 这里改为按启动参数（runtime 下的 mihomo.yaml）精确查找并结束 mihomo 进程。
+    // start_proxy_standalone 与 stop_proxy_standalone 各自创建实例无法共享 pid，
+    // 这里改为按启动参数（runtime 下的 mihomo.yaml）精确查找并提权结束 mihomo 进程。
     let runtime = MihomoManager::new().runtime_dir;
     let conf_path = runtime.join("mihomo.yaml");
     let conf_str = conf_path.to_string_lossy().to_string();
+    let mut pids = Vec::new();
     if let Ok(out) = std::process::Command::new("/bin/ps")
         .args(["-axo", "pid=,args="])
         .output()
@@ -360,13 +361,22 @@ pub fn stop_proxy_standalone() -> Result<(), String> {
             if line.contains("mihomo") && line.contains(&conf_str) {
                 if let Some(pid_str) = line.split_whitespace().next() {
                     if let Ok(pid) = pid_str.parse::<i32>() {
-                        let _ = std::process::Command::new("/bin/kill")
-                            .arg(pid.to_string())
-                            .output();
+                        pids.push(pid);
                     }
                 }
             }
         }
+    }
+    for pid in pids {
+        // mihomo 以 root 运行，普通 kill 会被拒；用 osascript 提权 kill
+        let script = format!(
+            "do shell script \"/bin/kill {}\" with administrator privileges",
+            pid
+        );
+        let _ = std::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(&script)
+            .output();
     }
     let _ = system_proxy::set_system_proxy(false, 7891);
     Ok(())
