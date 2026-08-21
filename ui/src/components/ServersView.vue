@@ -55,6 +55,22 @@
       </div>
     </div>
 
+    <section class="panel" v-if="config?.servers?.length">
+      <div class="panel-head"><h2>已保存 SSH 服务器</h2></div>
+      <div class="saved-server-list">
+        <div class="saved-server" v-for="server in config.servers" :key="server.id" :class="{ active: config.activeServerId === server.id }">
+          <div>
+            <strong>{{ server.name }}</strong>
+            <span class="muted">{{ server.user }}@{{ server.host }}:{{ server.port }}</span>
+          </div>
+          <div class="card-actions">
+            <button class="btn small" @click="$emit('select-server', server.id)">使用</button>
+            <button class="btn small danger" @click="$emit('delete-server', server.id)">删除</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section class="panel">
       <div class="panel-head"><h2>SSH 控制</h2><button class="btn" @click="$emit('nav')">打开控制台</button></div>
       <p class="muted">通过 SSH 直接控制云服务器：执行命令、安装软件、查看日志。</p>
@@ -65,7 +81,7 @@
 import { ref, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 const props = defineProps({ config: Object, status: Object });
-const emit = defineEmits(['nav', 'update']);
+const emit = defineEmits(['nav', 'update', 'select-server', 'delete-server']);
 const showAdd = ref(false);
 const subUrl = ref(props.config?.subscriptionUrl || '');
 const form = ref({

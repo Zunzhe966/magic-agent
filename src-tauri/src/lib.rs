@@ -190,11 +190,11 @@ fn ssh_connect(state: tauri::State<Arc<Mutex<AppState>>>, host: String, port: u1
         false
     };
     let private_key_saved = if auth == "key" {
-        match key {
+        match key.as_ref() {
             Some(k) if !k.trim().is_empty() => {
                 // 如果是路径，不存内容；如果是私钥内容（多行），存 Keychain
                 if k.contains('\n') {
-                    keychain::store(&crate::ssh::SshManager::key_account(&host, &user), &k)?;
+                    keychain::store(&crate::ssh::SshManager::key_account(&host, &user), k)?;
                     true
                 } else {
                     false // 路径形式，直接引用路径
@@ -217,12 +217,14 @@ fn ssh_connect(state: tauri::State<Arc<Mutex<AppState>>>, host: String, port: u1
         auth: auth.clone(),
         password_saved,
         private_key_saved,
+        key_path: key.as_ref().filter(|k| !k.contains('\n')).cloned(),
     };
     if let Some(existing) = g.config.servers.iter_mut().find(|s| s.id == id) {
         *existing = info.clone();
     } else {
         g.config.servers.push(info);
     }
+    g.config.active_server_id = Some(id);
 
     // 兼容旧字段（不再存明文密码）
     g.config.ssh_host = Some(host);
@@ -233,6 +235,53 @@ fn ssh_connect(state: tauri::State<Arc<Mutex<AppState>>>, host: String, port: u1
     g.config.ssh_private_key = None;
     let _ = config::save(&g.config);
     Ok(session)
+}
+
+#[tauri::command]
+fn select_ssh_server(state: tauri::State<Arc<Mutex<AppState>>>, server_id: String) -> Result<crate::config::ServerInfo, String> {
+    let mut g = state.lock().unwrap();
+    let server = g.config.servers.iter().find(|s| s.id == server_id)
+        .cloned()
+        .ok_or("服务器不存在")?;
+    g.config.active_server_id = Some(server.id.clone());
+    g.config.ssh_host = Some(server.host.clone());
+    g.config.ssh_port = Some(server.port);
+    g.config.ssh_user = Some(server.user.clone());
+    g.config.ssh_auth = Some(server.auth.clone());
+    g.config.ssh_password = None;
+    g.config.ssh_private_key = server.key_path.clone();
+    config::save(&g.config)?;
+    Ok(server)
+}
+
+#[tauri::command]
+fn delete_ssh_server(state: tauri::State<Arc<Mutex<AppState>>>, server_id: String) -> Result<(), String> {
+    let mut g = state.lock().unwrap();
+    let idx = g.config.servers.iter().position(|s| s.id == server_id).ok_or("服务器不存在")?;
+    let server = g.config.servers.remove(idx);
+    keychain::delete(&crate::ssh::SshManager::password_account(&server.host, &server.user));
+    keychain::delete(&crate::ssh::SshManager::key_account(&server.host, &server.user));
+    if g.config.active_server_id.as_deref() == Some(server.id.as_str()) {
+        if let Some(next) = g.config.servers.first().cloned() {
+            g.config.active_server_id = Some(next.id.clone());
+            g.config.ssh_host = Some(next.host);
+            g.config.ssh_port = Some(next.port);
+            g.config.ssh_user = Some(next.user);
+            g.config.ssh_auth = Some(next.auth);
+            g.config.ssh_password = None;
+            g.config.ssh_private_key = next.key_path;
+        } else {
+            g.config.active_server_id = None;
+            g.config.ssh_host = None;
+            g.config.ssh_port = Some(22);
+            g.config.ssh_user = Some("root".to_string());
+            g.config.ssh_auth = Some("password".to_string());
+            g.config.ssh_password = None;
+            g.config.ssh_private_key = None;
+        }
+    }
+    config::save(&g.config)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -327,6 +376,8 @@ pub fn run() {
             ssh_write,
             ssh_read,
             ssh_disconnect,
+            select_ssh_server,
+            delete_ssh_server,
             self_test,
             check_conflicts,
             fetch_subscription
