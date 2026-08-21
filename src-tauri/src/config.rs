@@ -270,3 +270,23 @@ fn url_decode(s: &str) -> String {
     }
     String::from_utf8_lossy(&out).to_string()
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_vless_uri_reality() {
+        let uri = "vless://268a1166-d31e-478c-a66f-7f9c06c9afaa@104.160.40.35:443?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=c7wQJ08b7byOCBzPejQJSwTe8gVN5H4gZxY9vE-k1X0&sid=be08e6123ddcaf32&flow=xtls-rprx-vision&type=tcp#%E6%90%AC%E7%93%A6%E5%B7%A5%E7%9B%B4%E8%BF%9E";
+        let node = parse_vless_uri(uri).expect("parse should succeed");
+        assert_eq!(node.server, "104.160.40.35");
+        assert_eq!(node.port, 443);
+        assert_eq!(node.uuid, "268a1166-d31e-478c-a66f-7f9c06c9afaa");
+        assert_eq!(node.flow, "xtls-rprx-vision");
+        assert_eq!(node.public_key, "c7wQJ08b7byOCBzPejQJSwTe8gVN5H4gZxY9vE-k1X0");
+        assert_eq!(node.short_id, "be08e6123ddcaf32");
+        assert_eq!(node.sni, "www.microsoft.com");
+        assert_eq!(node.name, "\u{642c}\u{74e6}\u{5de5}\u{76f4}\u{8fde}");
+    }
+}
