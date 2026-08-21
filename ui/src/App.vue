@@ -24,7 +24,7 @@
     </aside>
     <main class="main">
       <Dashboard v-if="view === 'dashboard'" :status="status" :config="config" @start="startProxy" @stop="stopProxy" @toggle-system-proxy="toggleSystemProxy" />
-      <AppsView v-else-if="view === 'apps'" :apps="apps" @change="applyApps" @refresh="refreshApps" />
+      <AppsView v-else-if="view === 'apps'" :apps="apps" :nodes="config?.nodes || []" @change="applyApps" @refresh="refreshApps" />
       <ServersView v-else-if="view === 'servers'" :config="config" @update="saveConfig" @select-server="selectSshServer" @delete-server="deleteSshServer" @nav="view = 'ssh'" />
       <SshView v-else-if="view === 'ssh'" :config="config" @saved="onSshSaved" />
     </main>
