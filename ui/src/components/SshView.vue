@@ -69,7 +69,21 @@ onMounted(async () => {
   term.open(termEl.value);
   fit.fit();
   term.writeln('输入连接信息后点击“连接”。');
-  term.onData(d => { if (connected.value) invoke('ssh_write', { data: Array.from(new TextEncoder().encode(d)) }); });
+  // 输入缓冲：合并 30ms 内的按键，避免每次击键都发一次 IPC
+  let inputBuf = '';
+  let inputTimer = null;
+  term.onData(d => {
+    if (!connected.value) return;
+    inputBuf += d;
+    if (!inputTimer) {
+      inputTimer = setTimeout(() => {
+        inputTimer = null;
+        const data = Array.from(new TextEncoder().encode(inputBuf));
+        inputBuf = '';
+        invoke('ssh_write', { data }).catch(() => {});
+      }, 30);
+    }
+  });
   timer = setInterval(poll, 200);
 });
 async function poll() {
