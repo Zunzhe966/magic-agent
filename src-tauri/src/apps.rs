@@ -41,10 +41,14 @@ pub fn scan_macos_apps() -> Vec<AppEntry> {
 
 fn scan_installed_apps() -> Vec<AppEntry> {
     let mut apps = Vec::new();
-    let roots = [
+    let mut roots = vec![
         PathBuf::from("/Applications"),
-        dirs::home_dir().map(|h| h.join("Applications")).unwrap_or_default(),
+        PathBuf::from("/System/Applications"),
+        PathBuf::from("/System/Applications/Utilities"),
     ];
+    if let Some(home_apps) = dirs::home_dir().map(|h| h.join("Applications")) {
+        roots.push(home_apps);
+    }
     let mut seen = std::collections::HashSet::new();
     for root in roots {
         let Ok(rd) = std::fs::read_dir(&root) else { continue };
@@ -53,6 +57,7 @@ fn scan_installed_apps() -> Vec<AppEntry> {
             if p.extension().and_then(|s| s.to_str()) != Some("app") { continue; }
             let name = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
             if !seen.insert(name.clone()) { continue; }
+            // 可执行文件通常是 Contents/MacOS/<AppName>，也可能是 Info.plist 里的 CFBundleExecutable
             let exe = p.join("Contents/MacOS").join(&name);
             let path = if exe.exists() { exe.to_string_lossy().to_string() } else { p.to_string_lossy().to_string() };
             let bundle_id = read_bundle_id(&p);
@@ -61,11 +66,12 @@ fn scan_installed_apps() -> Vec<AppEntry> {
                 id,
                 name: name.clone(),
                 bundle_id,
+                // path 与 rule_path 都指向可执行文件，供 PROCESS-PATH-REGEX 精确匹配
                 path: Some(path.clone()),
                 running: false,
                 mode: "auto".to_string(),
                 category: classify(&name),
-                rule_path: format!("{}/", p.to_string_lossy()),
+                rule_path: path,
             });
         }
     }
@@ -94,9 +100,13 @@ fn scan_running_processes() -> Vec<RunningProcess> {
         if !comm.contains(".app/") { continue; }
         let marker = ".app/";
         let Some(pos) = comm.find(marker) else { continue };
-        let app_path = &comm[..pos + marker.len()];
-        let bundle_id = bundle_id_for_path(app_path);
-        let key = app_path.to_string();
+        // 取到 .app 目录（形如 /Applications/xxx.app/）
+        let app_dir = &comm[..pos + marker.len()];
+        // 完整可执行文件路径（形如 /Applications/xxx.app/Contents/MacOS/xxx）
+        let exe_path = comm.trim();
+        let bundle_id = bundle_id_for_path(app_dir);
+        // 用可执行文件路径去匹配 installed 列表
+        let key = exe_path.to_string();
         if !seen.insert(key.clone()) { continue; }
         out.push(RunningProcess { app_path: key, bundle_id });
     }

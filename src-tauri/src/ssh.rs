@@ -78,10 +78,16 @@ impl SshManager {
             let user_host = format!("{}@{}", user, host);
             args.push(&user_host);
 
-            let escaped = pw.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$").replace('`', "\\`");
+            let escaped = pw
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('$', "\\$")
+                .replace('`', "\\`")
+                .replace('[', "\\[")
+                .replace(']', "\\]");
             let script = format!(
                 "#!/usr/bin/expect -f\nset timeout 20\nspawn {} {}\nexpect {{\n  -re \"(?i)password:\\s*\" {{\n    send \"{}\\r\"\n  }}\n  -re \"Are you sure.*\" {{\n    send \"yes\\r\"\n    exp_continue\n  }}\n  eof {{ exit 1 }}\n}}\ninteract\n",
-                args.join(" "), if port != 22 { format!("-p {}", port) } else { String::new() }, escaped
+                args.join(" "), String::new(), escaped
             );
             let tmp = std::env::temp_dir().join(format!("magic-ssh-{}.expect", std::process::id()));
             std::fs::write(&tmp, script).map_err(|e| format!("写 SSH 脚本失败: {e}"))?;
