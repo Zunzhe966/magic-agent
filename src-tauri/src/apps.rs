@@ -11,6 +11,10 @@ pub struct AppEntry {
     pub running: bool,
     pub mode: String,
     pub category: String,
+    /// 用户是否确认过该软件的规则（未确认的软件不进入规则表，由兜底直连接管）
+    pub confirmed: bool,
+    /// mode=proxy 时指定的节点名；None 表示用当前选中节点
+    pub node: Option<String>,
     /// 规则匹配用的路径前缀列表：该 App 全部进程（主程序+Helper+子进程）都命中这些前缀
     pub rule_paths: Vec<String>,
 }
@@ -72,6 +76,8 @@ fn scan_installed_apps() -> Vec<AppEntry> {
                 running: false,
                 mode: "direct".to_string(),
                 category: classify(&name),
+                confirmed: false,
+                node: None,
                 rule_paths: rule_paths_for(&p, bundle_id.as_deref()),
             });
         }
