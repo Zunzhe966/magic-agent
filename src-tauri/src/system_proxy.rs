@@ -11,19 +11,44 @@ pub struct SystemProxyStatus {
 
 pub fn set_system_proxy(enable: bool, port: u16) -> Result<SystemProxyStatus, String> {
     let services = list_services();
+    let port_str = port.to_string();
+    let mut any_success = false;
+    let mut first_err = String::new();
     for svc in &services {
-        if enable {
-            let _ = Command::new("networksetup").args(["-setwebproxy", svc, "127.0.0.1", &port.to_string()]).output();
-            let _ = Command::new("networksetup").args(["-setsecurewebproxy", svc, "127.0.0.1", &port.to_string()]).output();
-            let _ = Command::new("networksetup").args(["-setsocksfirewallproxy", svc, "127.0.0.1", &port.to_string()]).output();
-            let _ = Command::new("networksetup").args(["-setwebproxystate", svc, "on"]).output();
-            let _ = Command::new("networksetup").args(["-setsecurewebproxystate", svc, "on"]).output();
-            let _ = Command::new("networksetup").args(["-setsocksfirewallproxystate", svc, "on"]).output();
+        let args_list: Vec<Vec<&str>> = if enable {
+            vec![
+                vec!["-setwebproxy", svc, "127.0.0.1", &port_str],
+                vec!["-setsecurewebproxy", svc, "127.0.0.1", &port_str],
+                vec!["-setsocksfirewallproxy", svc, "127.0.0.1", &port_str],
+                vec!["-setwebproxystate", svc, "on"],
+                vec!["-setsecurewebproxystate", svc, "on"],
+                vec!["-setsocksfirewallproxystate", svc, "on"],
+            ]
         } else {
-            let _ = Command::new("networksetup").args(["-setwebproxystate", svc, "off"]).output();
-            let _ = Command::new("networksetup").args(["-setsecurewebproxystate", svc, "off"]).output();
-            let _ = Command::new("networksetup").args(["-setsocksfirewallproxystate", svc, "off"]).output();
+            vec![
+                vec!["-setwebproxystate", svc, "off"],
+                vec!["-setsecurewebproxystate", svc, "off"],
+                vec!["-setsocksfirewallproxystate", svc, "off"],
+            ]
+        };
+        for args in args_list {
+            match Command::new("networksetup").args(&args).output() {
+                Ok(out) if out.status.success() => any_success = true,
+                Ok(out) => {
+                    if first_err.is_empty() {
+                        first_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    }
+                }
+                Err(e) => {
+                    if first_err.is_empty() {
+                        first_err = e.to_string();
+                    }
+                }
+            }
         }
+    }
+    if !any_success && !services.is_empty() {
+        return Err(format!("设置系统代理失败（可能需要管理员权限或授权）：{}", first_err));
     }
     Ok(SystemProxyStatus { enabled: enable, http_port: port, socks_port: port })
 }
