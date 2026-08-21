@@ -116,6 +116,7 @@ async function selectSshServer(serverId) {
       sshPassword: null,
       sshPrivateKey: server.keyPath || null,
     };
+    view.value = 'ssh';
   } catch (e) {
     alert('选择服务器失败：' + e);
   }
