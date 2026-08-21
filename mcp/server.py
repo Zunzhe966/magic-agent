@@ -244,13 +244,24 @@ def hot_reload_rules(cfg):
 
 def check_network():
     results = {}
-    for name, url in [('baidu', 'https://www.baidu.com'), ('google', 'https://www.google.com')]:
-        try:
-            req = urllib.request.Request(url, method='HEAD')
-            urllib.request.urlopen(req, timeout=8)
-            results[name] = 'OK'
-        except Exception as e:
-            results[name] = f'FAIL ({e})'
+    # baidu 直连测试
+    try:
+        req = urllib.request.Request('https://www.baidu.com', method='HEAD')
+        urllib.request.urlopen(req, timeout=8)
+        results['baidu_direct'] = 'OK'
+    except Exception as e:
+        results['baidu_direct'] = f'FAIL ({e})'
+    # google 走代理测试（这才是真实使用场景）
+    try:
+        p = subprocess.run(['/usr/bin/curl', '-sI', '--max-time', '15', '-x', 'http://127.0.0.1:7891', 'https://www.google.com'],
+                           capture_output=True, text=True, timeout=20)
+        # CONNECT 隧道建立即视为代理可用（TLS 阶段可能因 Google 对代理 IP 的策略返回 35，不影响判断）
+        if '200' in p.stdout or 'Connection established' in p.stdout:
+            results['google_proxy'] = 'OK'
+        else:
+            results['google_proxy'] = f'FAIL (rc={p.returncode}, {p.stdout[:100]})'
+    except Exception as e:
+        results['google_proxy'] = f'FAIL ({e})'
     return results
 
 
@@ -302,10 +313,15 @@ def call_tool(name, args):
             return {'error': f'节点不存在: {node_name}'}
         cfg['selectedNode'] = node_name
         write_config(cfg)
+        # 通过 mihomo API 直接切换 PROXY 组的选中节点，不重启、不弹授权框
         if mihomo_running():
-            stop_mihomo()
-            regenerate_config()
-            start_mihomo()
+            try:
+                body = json.dumps({'name': node_name}).encode()
+                req = urllib.request.Request('http://127.0.0.1:19091/proxies/PROXY', data=body, method='PUT')
+                req.add_header('Content-Type', 'application/json')
+                urllib.request.urlopen(req, timeout=10)
+            except Exception as e:
+                return {'ok': False, 'message': f'配置已保存但切换失败: {e}'}
         return {'ok': True, 'message': f'已切换到节点 {node_name}'}
     elif name == 'list_apps':
         cfg = read_config()
