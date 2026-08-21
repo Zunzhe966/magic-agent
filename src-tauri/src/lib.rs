@@ -55,10 +55,18 @@ fn check_conflicts() -> ConflictInfo {
             messages.push("检测到正在运行的第三方代理程序（FlClash/Clash/mihomo），请先关闭".to_string());
         }
     }
-    // 2) 检测本程序要用的混合端口是否已被占用
+    // 2) 检测本程序要用的混合端口是否已被占用。
+    //    如果占用端口的是本程序 runtime 目录的 mihomo，不算冲突。
     let port = MihomoManager::new().port;
     if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-        messages.push(format!("端口 {} 已被其他程序占用，请先关闭冲突程序", port));
+        let own = std::process::Command::new("/bin/ps")
+            .args(["-axo", "args="])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        if !own.contains("mihomo") || !own.contains(&runtime_str) {
+            messages.push(format!("端口 {} 已被其他程序占用，请先关闭冲突程序", port));
+        }
     }
     ConflictInfo { has_conflict: !messages.is_empty(), messages }
 }
