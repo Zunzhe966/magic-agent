@@ -44,7 +44,9 @@ const modes = [
 ];
 const filtered = computed(() => {
   const query = q.value.toLowerCase();
-  return props.apps.filter(a => (!query || a.name.toLowerCase().includes(query)) && (filter.value === 'all' || a.mode === filter.value));
+  return props.apps
+    .filter(a => (!query || a.name.toLowerCase().includes(query)) && (filter.value === 'all' || a.mode === filter.value))
+    .sort((a, b) => (b.running ? 1 : 0) - (a.running ? 1 : 0));
 });
 function connText(app) {
   if (!app.running) return '未运行';
