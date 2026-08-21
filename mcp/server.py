@@ -242,6 +242,84 @@ def hot_reload_rules(cfg):
         return False
 
 
+def fetch_subscription_from_url(url):
+    """拉取订阅并解析 VLESS 节点。"""
+    import base64
+    import re
+    from urllib.parse import unquote
+    p = subprocess.run(['/usr/bin/curl', '-sL', '--max-time', '20', '-A', 'Mozilla/5.0', url],
+                       capture_output=True, text=True, timeout=30)
+    if p.returncode != 0:
+        return {'error': f'curl 拉取失败 rc={p.returncode}: {p.stderr[:100]}'}
+    text = p.stdout
+    if 'vless://' not in text:
+        # 尝试 base64 解码
+        try:
+            decoded = base64.b64decode(text).decode('utf-8')
+            if 'vless://' in decoded:
+                text = decoded
+        except Exception:
+            pass
+    nodes = []
+    for line in text.splitlines():
+        idx = line.find('vless://')
+        if idx < 0:
+            continue
+        uri = line[idx:].strip().split()[0]
+        # 去掉末尾可能带的反斜杠/引号
+        uri = uri.rstrip('\\"\'').rstrip(',')
+        node = parse_vless_uri_py(uri)
+        if node:
+            nodes.append(node)
+    if not nodes:
+        return {'error': '订阅中未解析到 VLESS 节点'}
+    return nodes
+
+
+def parse_vless_uri_py(uri):
+    from urllib.parse import unquote, urlparse, parse_qs
+    rest = uri[len('vless://'):]
+    if '?' in rest:
+        auth, after = rest.split('?', 1)
+    else:
+        auth, after = rest, ''
+    if '#' in after:
+        query, fragment = after.split('#', 1)
+    else:
+        query, fragment = after, ''
+    if '@' not in auth:
+        return None
+    uuid, hostport = auth.rsplit('@', 1)
+    if ':' not in hostport:
+        return None
+    host, port_str = hostport.rsplit(':', 1)
+    try:
+        port = int(port_str)
+    except ValueError:
+        return None
+    params = {}
+    for kv in query.split('&'):
+        if '=' in kv:
+            k, v = kv.split('=', 1)
+            params[k] = unquote(v)
+    return {
+        'name': unquote(fragment) if fragment else host,
+        'server': host,
+        'port': port,
+        'uuid': uuid,
+        'flow': params.get('flow', ''),
+        'network': params.get('type', 'tcp'),
+        'tls': params.get('security', '') in ('reality', 'tls'),
+        'udp': True,
+        'fingerprint': params.get('fp', 'chrome'),
+        'publicKey': params.get('pbk', ''),
+        'shortId': params.get('sid', ''),
+        'sni': params.get('sni', ''),
+        'source': 'subscription',
+        'region': '',
+    }
+
+
 def check_network():
     results = {}
     # baidu 直连测试
@@ -277,6 +355,8 @@ TOOLS = [
     {'name': 'list_domain_rules', 'description': '列出域名分流规则（哪些域名走代理/直连）'},
     {'name': 'add_domain_rule', 'description': '添加或更新域名分流规则，如 {"domain":"github.com","target":"proxy"}'},
     {'name': 'remove_domain_rule', 'description': '删除域名分流规则，如 {"domain":"github.com"}'},
+    {'name': 'fetch_subscription', 'description': '从订阅 URL 拉取 VLESS 节点，如 {"url":"https://..."}'},
+    {'name': 'test_node_delay', 'description': '测试节点延迟（通过 mihomo API），如 {"name":"搬瓦工直连"}'},
 ]
 
 
@@ -389,6 +469,43 @@ def call_tool(name, args):
         if mihomo_running():
             hot_reload_rules(cfg)
         return {'ok': True, 'message': f'域名规则已删除: {domain}'}
+    elif name == 'fetch_subscription':
+        url = args.get('url', '')
+        if not url:
+            return {'error': 'url is required'}
+        nodes = fetch_subscription_from_url(url)
+        if isinstance(nodes, dict) and 'error' in nodes:
+            return nodes
+        cfg = read_config()
+        if 'error' in cfg:
+            return cfg
+        existing = cfg.get('nodes', [])
+        seen = {n['server'] + ':' + str(n['port']) for n in existing}
+        added = 0
+        for n in nodes:
+            key = n['server'] + ':' + str(n['port'])
+            if key not in seen:
+                existing.append(n)
+                seen.add(key)
+                added += 1
+        cfg['nodes'] = existing
+        if not cfg.get('selectedNode') and existing:
+            cfg['selectedNode'] = existing[0]['name']
+        write_config(cfg)
+        return {'ok': True, 'message': f'订阅拉取成功，新增 {added} 个节点，共 {len(existing)} 个'}
+    elif name == 'test_node_delay':
+        node_name = args.get('name', '')
+        if not node_name:
+            return {'error': 'name is required'}
+        try:
+            body = json.dumps({'name': node_name}).encode()
+            req = urllib.request.Request('http://127.0.0.1:19091/proxies/NODE-' + urllib.parse.quote(node_name) + '/delay?timeout=5000&url=http://www.gstatic.com/generate_204',
+                                          data=body, method='GET')
+            r = urllib.request.urlopen(req, timeout=8)
+            resp = json.loads(r.read())
+            return {'node': node_name, 'delay_ms': resp.get('delay')}
+        except Exception as e:
+            return {'node': node_name, 'error': str(e)}
     return {'error': f'unknown tool {name}'}
 
 
