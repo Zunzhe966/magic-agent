@@ -97,8 +97,6 @@ function onSshSaved(next) {
   config.value = { ...config.value, ...next };
 }
 let timer;
-onMounted(async () => {
-  await refresh();
 async function selectSshServer(serverId) {
   try {
     const server = await invoke('select_ssh_server', { serverId });
@@ -124,6 +122,8 @@ async function deleteSshServer(serverId) {
     alert('删除服务器失败：' + e);
   }
 }
+onMounted(async () => {
+  await refresh();
   timer = setInterval(refresh, 3000);
 });
 onUnmounted(() => clearInterval(timer));

@@ -16,13 +16,35 @@ pub struct ProxyNode {
     pub public_key: String,
     pub short_id: String,
     pub sni: String,
+    /// 节点来源："manual" 手动添加 | "subscription" 订阅拉取
+    #[serde(default = "default_source")]
+    pub source: String,
+    /// 地区标签（如 美国/日本/香港），空则展示时从名称猜测
+    #[serde(default)]
+    pub region: String,
 }
 
+fn default_source() -> String {
+    "manual".to_string()
+}
+
+/// 软件分流设置：两态模型，没有"智能"。
+/// 每个软件由用户与 AI 探讨后确认：直连，或走代理（可指定到具体节点）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSetting {
     pub id: String,
+    /// "direct" 直连 | "proxy" 走代理
     pub mode: String,
+    /// mode=proxy 时指定的节点名；None 表示用"当前选中节点"
+    #[serde(default)]
+    pub node: Option<String>,
+    /// 为什么这么定（AI 探讨时给出的理由，留在表里可查）
+    #[serde(default)]
+    pub reason: String,
+    /// 用户确认过才生效；未确认的一律按直连处理
+    #[serde(default)]
+    pub confirmed: bool,
 }
 
 /// SSH 服务器连接信息（不存明文密码/私钥，只存标记）
@@ -67,43 +89,10 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            nodes: vec![
-                ProxyNode {
-                    name: "搬瓦工直连".to_string(),
-                    server: "104.160.40.35".to_string(),
-                    port: 443,
-                    uuid: "268a1166-d31e-478c-a66f-7f9c06c9afaa".to_string(),
-                    flow: "xtls-rprx-vision".to_string(),
-                    network: "tcp".to_string(),
-                    tls: true,
-                    udp: true,
-                    fingerprint: "chrome".to_string(),
-                    public_key: "c7wQJ08b7byOCBzPejQJSwTe8gVN5H4gZxY9vE-k1X0".to_string(),
-                    short_id: "be08e6123ddcaf32".to_string(),
-                    sni: String::new(),
-                },
-                ProxyNode {
-                    name: "Texas住宅".to_string(),
-                    server: "104.160.40.35".to_string(),
-                    port: 443,
-                    uuid: "7f3e9a2b-4c5d-6e8f-1a2b-3c4d5e6f7a8b".to_string(),
-                    flow: "xtls-rprx-vision".to_string(),
-                    network: "tcp".to_string(),
-                    tls: true,
-                    udp: true,
-                    fingerprint: "chrome".to_string(),
-                    public_key: "c7wQJ08b7byOCBzPejQJSwTe8gVN5H4gZxY9vE-k1X0".to_string(),
-                    short_id: "bca4b7cfbcb66d57".to_string(),
-                    sni: String::new(),
-                },
-            ],
-            selected_node: Some("搬瓦工直连".to_string()),
-            apps: vec![
-                AppSetting { id: "app-Google Chrome".to_string(), mode: "proxy".to_string() },
-                AppSetting { id: "app-Safari".to_string(), mode: "direct".to_string() },
-                AppSetting { id: "app-WeChat".to_string(), mode: "direct".to_string() },
-                AppSetting { id: "app-QQ".to_string(), mode: "direct".to_string() },
-            ],
+            // 节点默认空：不硬编码任何真实节点信息（隐私），由用户手动添加或订阅拉取
+            nodes: vec![],
+            selected_node: None,
+            apps: vec![],
             system_proxy: true,
             auto_global: "auto".to_string(),
             subscription_url: None,
@@ -247,6 +236,7 @@ fn parse_vless_uri(uri: &str) -> Result<ProxyNode, String> {
     };
 
     Ok(ProxyNode {
+        region: guess_region(&name),
         name,
         server: host.to_string(),
         port,
@@ -259,7 +249,31 @@ fn parse_vless_uri(uri: &str) -> Result<ProxyNode, String> {
         public_key: params.get("pbk").cloned().unwrap_or_default(),
         short_id: params.get("sid").cloned().unwrap_or_default(),
         sni: params.get("sni").cloned().unwrap_or_default(),
+        source: "subscription".to_string(),
     })
+}
+
+/// 从节点名称猜测地区标签（用于分组展示）
+pub fn guess_region(name: &str) -> String {
+    let n = name.to_lowercase();
+    let pairs = [
+        ("美国", vec!["美国", "美", "us", "usa", "america", "texas", "硅谷", "洛杉矶", "纽约"]),
+        ("日本", vec!["日本", "日", "jp", "japan", "tokyo", "东京", "大阪"]),
+        ("香港", vec!["香港", "港", "hk", "hongkong", "hong kong"]),
+        ("台湾", vec!["台湾", "台", "tw", "taiwan", "台北"]),
+        ("新加坡", vec!["新加坡", "新", "sg", "singapore", "狮城"]),
+        ("韩国", vec!["韩国", "韩", "kr", "korea", "首尔"]),
+        ("英国", vec!["英国", "英", "uk", "britain", "伦敦"]),
+        ("德国", vec!["德国", "德", "de", "germany", "法兰克福"]),
+    ];
+    for (region, keys) in pairs {
+        for k in keys {
+            if n.contains(k) {
+                return region.to_string();
+            }
+        }
+    }
+    String::new()
 }
 
 /// 简易 URL 百分号解码（%XX）

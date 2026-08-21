@@ -44,11 +44,13 @@ impl MihomoManager {
         }
     }
 
-    pub fn start(&self, cfg: &AppConfig, rules: &[String], direct_apps: &[String], proxy_apps: &[String]) -> Result<MihomoStatus, String> {
+    /// 启动 mihomo。
+    /// app_rules: (路径前缀列表, 目标) 列表，目标为 "DIRECT" 或 "NODE-<节点名>" / "PROXY"。
+    pub fn start(&self, cfg: &AppConfig, rules: &[String], app_rules: &[(Vec<String>, String)]) -> Result<MihomoStatus, String> {
         self.stop();
         let _ = std::fs::create_dir_all(&self.runtime_dir);
         self.copy_geo_files()?;
-        let conf = self.build_conf(cfg, rules, direct_apps, proxy_apps);
+        let conf = self.build_conf(cfg, rules, app_rules);
         let conf_path = self.runtime_dir.join("mihomo.yaml");
         std::fs::write(&conf_path, conf).map_err(|e| format!("写配置失败: {e}"))?;
 
@@ -139,10 +141,9 @@ impl MihomoManager {
         if p.exists() { p } else { PathBuf::from("/usr/local/bin/mihomo") }
     }
 
-    fn build_conf(&self, cfg: &AppConfig, rules: &[String], direct_apps: &[String], proxy_apps: &[String]) -> String {
+    fn build_conf(&self, cfg: &AppConfig, rules: &[String], app_rules: &[(Vec<String>, String)]) -> String {
         let mut out = String::new();
-        out.push_str(&format!("mixed-port: {}
-", self.port));
+        out.push_str(&format!("mixed-port: {}\n", self.port));
         out.push_str("mode: rule\n");
         out.push_str("log-level: info\n");
         out.push_str("allow-lan: false\n");
@@ -180,29 +181,44 @@ impl MihomoManager {
         for node in ordered {
             out.push_str(&format!("      - \"{}\"\n", node.name));
         }
+        // 每个节点独立成组：软件分流规则可以精确指向"走哪个节点"
+        for node in &cfg.nodes {
+            out.push_str(&format!(
+                "  - name: \"NODE-{}\"\n    type: select\n    proxies:\n      - \"{}\"\n",
+                node.name, node.name
+            ));
+        }
         out.push_str("  - name: AUTO\n    type: url-test\n    url: http://www.gstatic.com/generate_204\n    interval: 300\n    proxies:\n");
         for node in &cfg.nodes {
             out.push_str(&format!("      - \"{}\"\n", node.name));
         }
 
-
         out.push_str("\nrules:\n");
-        // 1) 按软件：显式直连，优先级最高
-        for a in direct_apps {
-            out.push_str(&format!("  - PROCESS-PATH-REGEX,^{}$,DIRECT\n", regex_escape_path(a)));
+        // 1) 防卷铁律（最高优先级）：所有节点服务器自身的流量无条件直连。
+        //    任何软件（包括终端 SSH、代理自己）访问节点服务器，都绝不进入代理隧道。
+        for node in &cfg.nodes {
+            if node.server.parse::<std::net::IpAddr>().is_ok() {
+                out.push_str(&format!("  - IP-CIDR,{}/32,DIRECT,no-resolve\n", node.server));
+            } else {
+                out.push_str(&format!("  - DOMAIN-SUFFIX,{},DIRECT\n", node.server));
+            }
         }
-        // 2) 按软件：显式代理
-        for a in proxy_apps {
-            out.push_str(&format!("  - PROCESS-PATH-REGEX,^{}$,PROXY\n", regex_escape_path(a)));
+        // 2) 已确认的软件规则：按 App 包路径前缀匹配整组进程
+        //    （Chrome 主程序+全部 Helper、Safari+WebKit.Networking 都命中所属 App 的前缀）
+        for (paths, target) in app_rules {
+            for p in paths {
+                out.push_str(&format!("  - PROCESS-PATH-REGEX,^{},{}\n", regex_escape_path(p), target));
+            }
         }
-        // 3) 用户规则
+        // 3) 用户自定义规则
         for r in rules {
             out.push_str(&format!("  - {}\n", r));
         }
-        // 4) 国内/内网直连，避免代理吞掉本地流量
-        out.push_str("  - GEOIP,CN,DIRECT\n  - GEOIP,LAN,DIRECT\n  - GEOSITE,cn,DIRECT\n");
-        // 5) 其余走代理
-        out.push_str("  - MATCH,PROXY\n");
+        // 4) 内网流量直连
+        out.push_str("  - GEOIP,LAN,DIRECT,no-resolve\n");
+        // 5) 兜底：未确认/未列出的软件一律直连。
+        //    本机默认是干净的直连网络，只有用户明确放行的软件才进隧道。
+        out.push_str("  - MATCH,DIRECT\n");
         out
     }
 }
