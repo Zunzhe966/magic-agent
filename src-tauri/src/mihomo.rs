@@ -278,7 +278,9 @@ impl MihomoManager {
         out.push_str("geo-auto-update: false\n");
         out.push_str("geodata-mode: false\n");
         out.push_str("geodata-loader: memconservative\n\n");
-        out.push_str("dns:\n  enable: true\n  listen: 127.0.0.1:1054\n  enhanced-mode: redir-host\n  nameserver:\n    - 223.5.5.5\n    - 119.29.29.29\n  fallback:\n    - tls://8.8.8.8\n    - tls://1.1.1.1\n  fallback-filter:\n    geoip: true\n    geoip-code: CN\n\n");
+        // DNS 全加密：国内 DoH + 境外 DoT。国内明文 DNS（223.5.5.5）会看到用户解析了哪些域名，
+        // 属于隐私泄漏。全部改成加密通道，国内 DNS 看不到任何明文查询。
+        out.push_str("dns:\n  enable: true\n  listen: 127.0.0.1:1054\n  enhanced-mode: redir-host\n  nameserver:\n    - https://dns.alidns.com/dns-query\n    - https://doh.pub/dns-query\n  fallback:\n    - tls://8.8.8.8\n    - tls://1.1.1.1\n  fallback-filter:\n    geoip: true\n    geoip-code: CN\n\n");
 
         out.push_str("proxies:\n");
         for node in &cfg.nodes {

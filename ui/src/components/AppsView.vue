@@ -27,6 +27,10 @@
         <select class="mode-select" v-model="app.mode">
           <option value="proxy">代理</option><option value="direct">直连</option>
         </select>
+        <select v-if="app.mode === 'proxy'" class="mode-select" v-model="app.node">
+          <option :value="null">当前节点</option>
+          <option v-for="n in nodes" :key="n.name" :value="n.name">{{ n.name }}</option>
+        </select>
         <span class="conn-status" :class="connClass(app)">{{ connText(app) }}</span>
         <span class="path muted">{{ app.path }}</span>
       </div>
@@ -35,7 +39,7 @@
 </template>
 <script setup>
 import { ref, computed } from 'vue';
-const props = defineProps({ apps: Array });
+const props = defineProps({ apps: Array, nodes: Array });
 const emit = defineEmits(['change', 'refresh']);
 const q = ref('');
 const filter = ref('all');
