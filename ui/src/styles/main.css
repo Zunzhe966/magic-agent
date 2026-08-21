@@ -86,3 +86,7 @@ body { background: var(--bg); color: var(--text); }
 .saved-server { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel2); }
 .saved-server.active { border-color: var(--accent); }
 .saved-server strong, .saved-server .muted { display: block; }
+.conn-status { font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 6px; }
+.conn-status.proxy { background: rgba(77,124,254,.15); color: #6ea8fe; }
+.conn-status.direct { background: rgba(62,207,142,.12); color: #3ecf8e; }
+.conn-status.idle { background: rgba(140,152,173,.12); color: #8c98ad; }
