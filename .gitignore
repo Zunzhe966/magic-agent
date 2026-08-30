@@ -5,3 +5,7 @@ src-tauri/target/
 src-tauri/resources/runtime/
 .workbuddy/
 __pycache__/
+
+# Vite 临时文件
+ui/*.mjs
+*.timestamp-*.mjs

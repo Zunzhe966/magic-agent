@@ -10,9 +10,11 @@ macOS 桌面软件：**按软件分流** + **云服务器 SSH 控制台**。
 
 - **按软件分流**：扫描本机 App（/Applications、/System/Applications），每个软件可设 代理 / 直连 / 智能
 - **云服务器**：VLESS 节点管理（手动添加 + 订阅拉取）、SSH 终端（xterm.js）、Keychain 凭据存储
+- **服务器仪表盘**：可视化远程服务器的 CPU/内存/磁盘/负载/网络（10 秒自动刷新）
 - **代理引擎**：mihomo 管理（启停、VLESS+Reality 配置生成、国内直连兜底）
 - **冲突检测**：启动前检测 FlClash / mihomo / 端口占用
 - **系统代理**：通过 networksetup 设置 macOS HTTP/SOCKS 代理
+- **MCP 服务**：`mcp/server.py` 暴露 24 个工具，供 AI 客户端（Claude/Codex/WorkBuddy）控制代理、双路探测、远程服务器管理
 
 ## 开发
 
@@ -49,6 +51,9 @@ cargo run --bin magic_probe    # 启动代理 -> 8 秒后停止（验证 mihomo 
 
 ```
 ui/             Vue3 前端（Vite + xterm.js）
+mcp/            Python MCP server（server.py，AI 控制入口，24 个工具）
+scripts/        部署/守护/自检脚本（mcp 守护、mihomo 控制、订阅解析）
+docs/           需求设计、技术选型、OpenRouter 免费模型调研
 src-tauri/      Rust 后端（Tauri 2）
   src/
     lib.rs          Tauri command 注册、冲突检测、代理启停
@@ -67,3 +72,19 @@ src-tauri/      Rust 后端（Tauri 2）
 
 - 启动代理前请关闭 FlClash / 其它占用 7891 端口的代理，否则会提示冲突。
 - 系统代理只对「遵守系统代理」的软件生效；Telegram、部分游戏等可能自行直连，属于已知边界。
+
+## 分流模型与统一端口
+
+**三层漏斗规则引擎**（mihomo 规则首条命中生效，顺序即优先级）：
+
+1. **进程级（谁进隧道）**：防卷优先——节点服务器自身流量永远直连（`IP-CIDR,<server>/32,DIRECT,no-resolve`）
+2. **域名级（去了哪）**：显式域名规则（target 支持 `direct`/`proxy`/节点名）→ 国内清单直连（`GEOSITE,cn` + `GEOIP,CN`）
+3. **节点级（谁来送）**：进程规则把该软件剩余流量交给指定节点（`PROCESS-PATH-REGEX`），最后 `MATCH,DIRECT` 兜底
+
+**统一本地端口：7891**。所有需要显式指定出站代理的外部程序（如监控 daemon 的
+`config.ini [网络] 出站代理 = http://127.0.0.1:7891`）都应指向此端口，
+流量进入 mihomo 后仍按上述域名级分流裁决——国内直连、海外走节点。
+
+**裸二进制白名单**：分流表条目 id 支持 `bin-<绝对路径>` 前缀，用于非 .app 的
+可执行文件（如 zunzhe-core 监控 daemon），按精确进程路径生成 `PROCESS-PATH-REGEX` 规则。
+

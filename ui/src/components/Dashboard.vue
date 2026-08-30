@@ -6,9 +6,10 @@
         <p>代理引擎与应用分流状态</p>
       </div>
       <div class="head-actions">
-        <button v-if="!status?.proxyRunning" class="btn primary" @click="$emit('start')">启动代理</button>
-        <button v-else class="btn danger" @click="$emit('stop')">停止代理</button>
+        <button v-if="!status?.proxyRunning" class="btn primary" :disabled="proxyBusy" @click="$emit('start')">{{ proxyBusy ? '正在启动…' : '启动代理' }}</button>
+        <button v-else class="btn danger" :disabled="proxyBusy" @click="$emit('stop')">{{ proxyBusy ? '正在停止…' : '停止代理' }}</button>
       </div>
+      <div v-if="proxyError" class="proxy-error" role="alert">{{ proxyError }}</div>
     </header>
     <div class="stat-grid">
       <div class="stat-card">
@@ -56,6 +57,11 @@
   </div>
 </template>
 <script setup>
-const props = defineProps({ status: Object, config: Object });
+const props = defineProps({
+  status: Object,
+  config: Object,
+  proxyBusy: Boolean,
+  proxyError: String,
+});
 const emit = defineEmits(['start', 'stop', 'toggle-system-proxy']);
 </script>

@@ -28,6 +28,12 @@ body { background: var(--bg); color: var(--text); }
 .page-head p { color: var(--muted); margin-top: 6px; font-size: 14px; }
 .head-actions { display: flex; gap: 10px; }
 .btn { border: 1px solid var(--line); background: var(--panel); color: var(--text); padding: 9px 16px; border-radius: 8px; font-size: 14px; cursor: pointer; }
+.btn:disabled { opacity: .55; cursor: wait; }
+.proxy-error { margin-top: 10px; background: rgba(239,91,110,.12); border: 1px solid rgba(239,91,110,.5); color: var(--danger); padding: 10px 14px; border-radius: 10px; font-size: 13px; max-width: 640px; word-break: break-all; }
+.domain-rule-head { display: grid; grid-template-columns: 28px 1fr 130px 2fr 40px; gap: 8px; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.domain-rule-row { display: grid; grid-template-columns: 28px 1fr 130px 2fr 40px; gap: 8px; align-items: center; margin-bottom: 8px; }
+.domain-idx { text-align: center; color: var(--muted); font-size: 13px; }
+.domain-rule-row input, .domain-rule-row select { background: var(--panel2); border: 1px solid var(--line); color: var(--text); border-radius: 8px; padding: 8px 10px; font-size: 13px; min-width: 0; }
 .btn:hover { border-color: #3c4a66; }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn.danger { background: rgba(239,91,110,.12); border-color: rgba(239,91,110,.5); color: var(--danger); }
@@ -94,3 +100,12 @@ body { background: var(--bg); color: var(--text); }
 .delay-good { color: #3ecf8e; }
 .delay-mid { color: #f5a524; }
 .delay-bad { color: #ef5b6e; }
+
+/* ---- 全局 toast ---- */
+.toast-container { position: fixed; top: 18px; right: 18px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
+.toast { min-width: 220px; max-width: 360px; padding: 12px 16px; border-radius: 8px; font-size: 13px; line-height: 1.5; color: #fff; background: var(--panel2); border: 1px solid var(--line); box-shadow: 0 8px 24px rgba(0,0,0,.35); opacity: 0; transform: translateY(-8px); transition: opacity .25s, transform .25s; }
+.toast.toast-show { opacity: 1; transform: translateY(0); }
+.toast.toast-hide { opacity: 0; transform: translateY(-8px); }
+.toast-info { border-left: 3px solid #4d7cfe; }
+.toast-success { border-left: 3px solid #3ecf8e; }
+.toast-error { border-left: 3px solid #ef5b6e; }
