@@ -9,7 +9,7 @@
     </header>
     <section class="panel ssh-panel">
       <div class="ssh-form" v-if="!connected">
-        <div class="field"><label>主机</label><input v-model="form.host" placeholder="104.160.40.35" /></div>
+        <div class="field"><label>主机</label><input v-model="form.host" placeholder="例: 203.0.113.10" /></div>
         <div class="field"><label>端口</label><input v-model.number="form.port" type="number" /></div>
         <div class="field"><label>用户名</label><input v-model="form.user" /></div>
         <div class="field"><label>认证方式</label><select v-model="form.auth"><option value="password">密码</option><option value="key">私钥</option></select></div>
@@ -36,6 +36,8 @@ const quickCommands = [
   { label: '内存', command: 'free -h; nproc\n' },
   { label: '磁盘', command: 'df -h\n' },
   { label: '进程', command: 'ps aux | head -20\n' },
+  { label: '监听端口', command: 'ss -tlnp | head -20\n' },
+  { label: '最近日志', command: 'journalctl -n 15 --no-pager\n' },
 ];
 import '@xterm/xterm/css/xterm.css';
 

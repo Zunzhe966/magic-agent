@@ -63,13 +63,16 @@ pub struct ServerInfo {
     pub key_path: Option<String>,
 }
 
-/// 域名分流规则：按域名后缀/关键字指定走代理或直连。
-/// 优先级在"软件规则"之后、"兜底直连"之前，解决同一个软件下载混合源的问题。
+/// 域名分流规则：按域名后缀指定去向，优先级高于国内域名清单（GEOSITE,cn）和进程规则。
+/// 解决同一个软件内部混合源的问题（如下载器：GitHub 走代理、国内源直连）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DomainRule {
     pub domain: String,   // 如 github.com、huggingface.co
-    pub target: String,   // "proxy" 走代理 | "direct" 直连
+    pub target: String,   // "proxy" 走代理 | "direct" 直连 | 节点名（走该节点）
+    /// 服务于哪个密钥/软件（如"WorkBuddy 的 OpenRouter 密钥"），防止日久失忆误删
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +91,10 @@ pub struct AppConfig {
     pub active_server_id: Option<String>,
     #[serde(default)]
     pub domain_rules: Vec<DomainRule>,
+    /// mihomo 控制 API（127.0.0.1:19091）的鉴权 secret。
+    /// 缺失时在 load() 自动生成并持久化，防止本机任意进程/网页 CSRF 操控代理。
+    #[serde(default)]
+    pub api_secret: Option<String>,
     // 兼容旧配置：仍保留这几个字段，但新逻辑不再把明文写进 config.json
     pub ssh_host: Option<String>,
     pub ssh_port: Option<u16>,
@@ -110,6 +117,7 @@ impl Default for AppConfig {
             servers: vec![],
             active_server_id: None,
             domain_rules: vec![],
+            api_secret: None,
             ssh_host: None,
             ssh_port: Some(22),
             ssh_user: Some("root".to_string()),
@@ -154,10 +162,55 @@ pub fn config_path() -> PathBuf {
 
 pub fn load() -> AppConfig {
     let p = config_path();
-    std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let mut cfg: AppConfig = match std::fs::read_to_string(&p) {
+        Ok(s) => match serde_json::from_str::<AppConfig>(&s) {
+            Ok(c) => c,
+            Err(e) => {
+                // 配置损坏：不静默吞掉，先备份坏文件再回退默认，避免用户节点/设置全丢
+                eprintln!("[magic-agent] config.json 解析失败，已备份为 .corrupt 并回退默认配置: {e}");
+                let bak = p.with_extension("json.corrupt");
+                let _ = std::fs::copy(&p, &bak);
+                AppConfig::default()
+            }
+        },
+        Err(_) => AppConfig::default(),
+    };
+    // 首次运行生成 API secret 并持久化（mihomo external-controller 的鉴权令牌）
+    if cfg.api_secret.as_deref().map(|s| s.is_empty()).unwrap_or(true) {
+        cfg.api_secret = Some(generate_api_secret());
+        let _ = save(&cfg);
+    }
+    cfg
+}
+
+/// 从 /dev/urandom 读 16 字节转 hex，无第三方依赖。
+/// 失败时用当前纳秒时间戳 + 进程 id + 计数器异或打散，避免退化成全 0 的弱密钥。
+fn generate_api_secret() -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    let mut filled = false;
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        if f.read_exact(&mut buf).is_ok() {
+            filled = true;
+        }
+    }
+    if !filled {
+        // 兜底：时间戳/进程号/地址异或，仍比全 0 强，且每次调用都不同
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let pid = std::process::id() as u64;
+        let addr = &buf as *const _ as u64;
+        let mut seed = now ^ pid.rotate_left(17) ^ addr.rotate_left(31) ^ 0x9e3779b97f4a7c15u64;
+        for b in buf.iter_mut() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *b = (seed & 0xff) as u8;
+        }
+    }
+    buf.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 pub fn save(cfg: &AppConfig) -> Result<(), String> {
@@ -165,10 +218,98 @@ pub fn save(cfg: &AppConfig) -> Result<(), String> {
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(&p, serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    // 原子写：临时文件+rename，防止与 Python(MCP) 并发写时出现半截 JSON
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
+    // 配置含 apiSecret 与节点密钥，收紧为仅当前用户可读写
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
+
+/// 校验订阅 URL 的 host 是否指向公网，拒绝回环/内网/链路本地/组播/保留地址，
+/// 防止恶意前端借 fetch_subscription 触发 SSRF 拉取内网内容。
+/// 返回 Ok(()) 表示可安全访问；Err(msg) 表示被拦截。
+pub fn validate_public_host(host: &str) -> Result<(), String> {
+    // 去端口（IPv6 用方括号包裹）
+    let h = host.trim();
+    let host_only = if h.starts_with('[') {
+        // [::1]:8080 形式
+        match h.find(']') {
+            Some(i) => &h[1..i],
+            None => h,
+        }
+    } else if h.matches(':').count() > 1 {
+        // 裸 IPv6（无方括号、无端口），如 ::1、fe80::1
+        h
+    } else {
+        // host 或 host:port；IPv4 直接按冒号分隔，域名无冒号
+        match h.rfind(':') {
+            Some(i) if h[i + 1..].chars().all(|c| c.is_ascii_digit()) => &h[..i],
+            _ => h,
+        }
+    };
+    if host_only.is_empty() {
+        return Err("订阅地址 host 为空".to_string());
+    }
+    // 字面 IP：直接判内网/保留地址
+    if let Ok(ip) = host_only.parse::<std::net::IpAddr>() {
+        if is_private_or_reserved(ip) {
+            return Err(format!("订阅地址指向内网/保留地址 {}，已拦截", ip));
+        }
+        return Ok(());
+    }
+    // 域名：做 DNS 解析，任一解析结果落到内网/保留地址即拦截，
+    // 堵住「域名解析到内网」的 SSRF 绕过（如 http://intranet.corp.local/）。
+    // 注意：这里只做静态解析校验；真正的拉取仍走 curl，需配合 --resolve 或在
+    // 解析后重连才 100% 防 DNS rebinding，但本机单人场景下先拦常见绕过。
+    if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(host_only, 443)) {
+        for a in addrs {
+            if is_private_or_reserved(a.ip()) {
+                return Err(format!("订阅域名 {} 解析到内网/保留地址 {}，已拦截", host_only, a.ip()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 判断 IP 是否为回环/内网/链路本地/组播/未指定等非公网地址。
+pub fn is_private_or_reserved(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                // 100.64.0.0/10 运营商级 NAT（CGNAT），非公网
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // IPv4-mapped IPv6 内网地址（::ffff:127.0.0.1 等）
+                || v6.to_ipv4().map(is_private_or_reserved_ipv4).unwrap_or(false)
+                // 唯一本地地址 fc00::/7（含 fd00::/8）
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // 链路本地 fe80::/10
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+pub fn is_private_or_reserved_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    is_private_or_reserved(std::net::IpAddr::V4(v4))
+}
 
 /// 从订阅文本中解析 VLESS 节点。
 /// 订阅内容可能是：明文 vless:// 链接、每行一个，或 base64 编码的整段内容。
@@ -201,12 +342,17 @@ pub fn parse_vless_subscription(text: &str) -> Result<Vec<ProxyNode>, String> {
     }
 
     let mut nodes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for line in content.lines() {
         let line = line.trim();
         let Some(idx) = line.find("vless://") else { continue };
         let uri = &line[idx..];
         if let Ok(node) = parse_vless_uri(uri) {
-            nodes.push(node);
+            // 按 server:port 去重：订阅可能重复返回同一节点，避免重复添加
+            let key = format!("{}:{}", node.server, node.port);
+            if seen.insert(key) {
+                nodes.push(node);
+            }
         }
     }
     if nodes.is_empty() {
@@ -316,16 +462,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn validate_public_host_blocks_private() {
+        // 回环
+        assert!(validate_public_host("127.0.0.1").is_err());
+        assert!(validate_public_host("127.0.0.1:8080").is_err());
+        assert!(validate_public_host("[::1]:8080").is_err());
+        assert!(validate_public_host("::1").is_err());
+        // 内网
+        assert!(validate_public_host("192.168.1.1").is_err());
+        assert!(validate_public_host("10.0.0.1").is_err());
+        assert!(validate_public_host("172.16.0.1").is_err());
+        assert!(validate_public_host("100.64.0.1").is_err());
+        // 链路本地 / 组播 / 未指定
+        assert!(validate_public_host("169.254.1.1").is_err());
+        assert!(validate_public_host("224.0.0.1").is_err());
+        assert!(validate_public_host("0.0.0.0").is_err());
+        assert!(validate_public_host("fe80::1").is_err());
+        assert!(validate_public_host("fc00::1").is_err());
+        assert!(validate_public_host("fd00::1").is_err());
+        // IPv4-mapped 内网
+        assert!(validate_public_host("::ffff:127.0.0.1").is_err());
+    }
+
+    #[test]
+    fn validate_public_host_allows_public_and_domain() {
+        // 公网 IP
+        assert!(validate_public_host("8.8.8.8").is_ok());
+        assert!(validate_public_host("1.1.1.1:443").is_ok());
+        // 域名
+        assert!(validate_public_host("example.com").is_ok());
+        assert!(validate_public_host("sub.example.com:8080").is_ok());
+        // 空 host 拒绝
+        assert!(validate_public_host("").is_err());
+        assert!(validate_public_host(":8080").is_err());
+    }
+
+    #[test]
+    fn validate_public_host_blocks_domain_resolving_to_localhost() {
+        // 域名解析到回环地址，应被 SSRF 防护拦截（堵住域名绕过）
+        assert!(validate_public_host("localhost").is_err());
+        assert!(validate_public_host("localhost.localdomain").is_err());
+    }
+
+    #[test]
     fn parse_vless_uri_reality() {
-        let uri = "vless://268a1166-d31e-478c-a66f-7f9c06c9afaa@104.160.40.35:443?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=c7wQJ08b7byOCBzPejQJSwTe8gVN5H4gZxY9vE-k1X0&sid=be08e6123ddcaf32&flow=xtls-rprx-vision&type=tcp#%E6%90%AC%E7%93%A6%E5%B7%A5%E7%9B%B4%E8%BF%9E";
+        let uri = "vless://00000000-0000-4000-8000-000000000000@1.1.1.1:443?encryption=none&security=reality&sni=www.example.com&fp=chrome&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0000000000000000&flow=xtls-rprx-vision&type=tcp#%E7%A4%BA%E4%BE%8B%E8%8A%82%E7%82%B9";
         let node = parse_vless_uri(uri).expect("parse should succeed");
-        assert_eq!(node.server, "104.160.40.35");
+        assert_eq!(node.server, "1.1.1.1");
         assert_eq!(node.port, 443);
-        assert_eq!(node.uuid, "268a1166-d31e-478c-a66f-7f9c06c9afaa");
+        assert_eq!(node.uuid, "00000000-0000-4000-8000-000000000000");
         assert_eq!(node.flow, "xtls-rprx-vision");
-        assert_eq!(node.public_key, "c7wQJ08b7byOCBzPejQJSwTe8gVN5H4gZxY9vE-k1X0");
-        assert_eq!(node.short_id, "be08e6123ddcaf32");
-        assert_eq!(node.sni, "www.microsoft.com");
-        assert_eq!(node.name, "\u{642c}\u{74e6}\u{5de5}\u{76f4}\u{8fde}");
+        assert_eq!(node.public_key, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(node.short_id, "0000000000000000");
+        assert_eq!(node.sni, "www.example.com");
+        assert_eq!(node.name, "\u{793a}\u{4f8b}\u{8282}\u{70b9}");
+    }
+
+    #[test]
+    fn active_server_returns_key_auth_with_key_path() {
+        // 密钥认证服务器：active_server 必须保留 key_path（否则 SSH 探针无法用密钥登录）
+        let cfg = AppConfig {
+            servers: vec![ServerInfo {
+                id: "server-example".into(),
+                name: "示例服务器".into(),
+                host: "1.1.1.1".into(),
+                port: 22022,
+                user: "root".into(),
+                auth: "key".into(),
+                password_saved: false,
+                private_key_saved: true,
+                key_path: Some("~/.ssh/example_ed25519".into()),
+            }],
+            active_server_id: Some("server-example".into()),
+            ..Default::default()
+        };
+        let s = cfg.active_server().expect("active_server 应返回服务器");
+        assert_eq!(s.host, "1.1.1.1");
+        assert_eq!(s.port, 22022);
+        assert_eq!(s.auth, "key");
+        assert_eq!(s.key_path.as_deref(), Some("~/.ssh/example_ed25519"));
     }
 }

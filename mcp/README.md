@@ -5,7 +5,7 @@
 ## 是什么
 
 MCP（Model Context Protocol）是 AI 客户端与外部工具之间的标准协议。
-本 server 通过 stdio 与 AI 客户端通信，暴露 13 个工具，AI 可以：
+本 server 通过 stdio 与 AI 客户端通信，暴露 24 个工具，AI 可以：
 
 - 查看代理状态、启动/停止代理
 - 列出节点、切换节点、测试节点延迟
@@ -13,6 +13,8 @@ MCP（Model Context Protocol）是 AI 客户端与外部工具之间的标准协
 - 添加/删除域名分流规则
 - 拉取 VLESS 订阅
 - 测试国内外网络连通性
+- 双路探测（直连 vs 代理对比延迟/吞吐，用于路由决策）
+- 云服务器远程管理（采集 CPU/内存/磁盘/负载指标、非交互式执行命令）
 
 ## 工具清单
 
@@ -31,6 +33,16 @@ MCP（Model Context Protocol）是 AI 客户端与外部工具之间的标准协
 | remove_domain_rule | {domain} | 删除域名规则 |
 | fetch_subscription | {url} | 从订阅 URL 拉取 VLESS 节点 |
 | check_network | - | 测试百度直连 + Google 走代理 |
+| list_free_models | - | 列出可用的 OpenRouter 免费模型 |
+| list_connections | {limit} | 列出当前 mihomo 活动连接 |
+| node_health | - | 汇总各节点健康/延迟 |
+| download_proxy | {url} | 通过代理下载并返回内容 |
+| doctor | - | 全链路自检（依赖/端口/配置） |
+| install_privileged_helper | - | 安装/校验特权 helper |
+| probe_route | {url} | 双路探测：直连 vs 代理的延迟/吞吐对比 |
+| server_metrics | - | 采集激活云服务器的 CPU/内存/磁盘/负载/网络 |
+| ssh_exec | {command} | 在激活云服务器上非交互式执行命令 |
+| guide | - | 输出帮助/使用说明 |
 
 ## 配置到 AI 客户端
 
@@ -43,11 +55,13 @@ MCP（Model Context Protocol）是 AI 客户端与外部工具之间的标准协
   "mcpServers": {
     "magic-agent": {
       "command": "python3",
-      "args": ["/Users/zhangxuetao/Desktop/魔法代理/mcp/server.py"]
+      "args": ["/绝对路径/魔法代理/mcp/server.py"]
     }
   }
 }
 ```
+
+> 把 `/绝对路径/魔法代理` 替换为你本地 clone 下来的项目路径（如 `/Users/你的用户名/Desktop/魔法代理`）。
 
 ### Codex / WorkBuddy
 
@@ -55,7 +69,7 @@ MCP（Model Context Protocol）是 AI 客户端与外部工具之间的标准协
 
 ```
 command: python3
-args: /Users/zhangxuetao/Desktop/魔法代理/mcp/server.py
+args: /绝对路径/魔法代理/mcp/server.py
 ```
 
 ## 直接测试

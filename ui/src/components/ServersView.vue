@@ -2,7 +2,7 @@
   <div class="page">
     <header class="page-head">
       <div><h1>云服务器</h1><p>管理代理节点与 SSH 连接信息</p></div>
-      <div class="head-actions"><button class="btn primary" @click="showAdd = !showAdd">{{ showAdd ? '收起' : '添加节点' }}</button></div>
+      <div class="head-actions"><button class="btn primary" @click="toggleForm">{{ showAdd ? '收起' : '添加节点' }}</button></div>
     </header>
 
     <!-- 订阅 URL -->
@@ -18,10 +18,10 @@
 
     <!-- 添加节点表单 -->
     <section class="panel" v-if="showAdd">
-      <div class="panel-head"><h2>添加 VLESS 节点</h2></div>
+      <div class="panel-head"><h2>{{ editingIndex === null ? '添加 VLESS 节点' : '编辑节点' }}</h2></div>
       <div class="node-form">
         <div class="field"><label>名称</label><input v-model="form.name" placeholder="例如 香港-01" /></div>
-        <div class="field"><label>服务器</label><input v-model="form.server" placeholder="104.160.40.35" /></div>
+        <div class="field"><label>服务器</label><input v-model="form.server" placeholder="例: 203.0.113.10" /></div>
         <div class="field"><label>端口</label><input v-model.number="form.port" type="number" /></div>
         <div class="field"><label>UUID</label><input v-model="form.uuid" /></div>
         <div class="field"><label>Flow</label><input v-model="form.flow" placeholder="xtls-rprx-vision" /></div>
@@ -30,8 +30,8 @@
         <div class="field"><label>Short ID</label><input v-model="form.shortId" /></div>
         <div class="field"><label>Fingerprint</label><input v-model="form.fingerprint" placeholder="chrome" /></div>
         <div class="field-actions">
-          <button class="btn primary" @click="addNode">添加</button>
-          <button class="btn" @click="showAdd = false">取消</button>
+          <button class="btn primary" @click="submitForm">{{ editingIndex === null ? '添加' : '保存修改' }}</button>
+          <button class="btn" @click="cancelForm">取消</button>
         </div>
       </div>
     </section>
@@ -50,6 +50,7 @@
         <div class="kv"><span>Short ID</span><b class="mono">{{ node.shortId }}</b></div>
         <div class="card-actions">
           <button class="btn small" @click="selectNode(node)">设为当前</button>
+          <button class="btn small" @click="editNode(i)">编辑</button>
           <button class="btn small" @click="testDelay(node)">测延迟</button>
           <button class="btn small danger" @click="removeNode(i)">删除</button>
         </div>
@@ -74,21 +75,6 @@
     </section>
 
     <section class="panel">
-      <div class="panel-head"><h2>域名分流</h2></div>
-      <p class="muted" style="margin-bottom: 8px;">同一个软件下载时有的走代理有的走直连？在这里按域名指定。一行一个域名，选"代理"或"直连"。</p>
-      <div v-for="(rule, i) in domainRules" :key="i" class="domain-rule-row">
-        <input v-model="rule.domain" placeholder="github.com" />
-        <select v-model="rule.target">
-          <option value="proxy">代理</option>
-          <option value="direct">直连</option>
-        </select>
-        <button class="btn small danger" @click="removeDomainRule(i)">删</button>
-      </div>
-      <button class="btn small" @click="domainRules.push({ domain: '', target: 'proxy' })">+ 加域名</button>
-      <button class="btn small primary" style="margin-left: 8px;" @click="saveDomainRules">保存域名规则</button>
-    </section>
-
-    <section class="panel">
       <div class="panel-head"><h2>SSH 控制</h2><button class="btn" @click="$emit('nav')">打开控制台</button></div>
       <p class="muted">通过 SSH 直接控制云服务器：执行命令、安装软件、查看日志。</p>
     </section>
@@ -97,17 +83,12 @@
 <script setup>
 import { ref, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
+import { toast } from '../toast.js';
 const props = defineProps({ config: Object, status: Object });
 const emit = defineEmits(['nav', 'update', 'select-server', 'delete-server']);
 const showAdd = ref(false);
+const editingIndex = ref(null); // null=新增，数字=编辑第 i 个节点
 const subUrl = ref(props.config?.subscriptionUrl || '');
-const domainRules = ref((props.config?.domainRules || []).map(r => ({ ...r })));
-watch(() => props.config?.domainRules, v => { domainRules.value = (v || []).map(r => ({ ...r })); });
-function removeDomainRule(i) { domainRules.value.splice(i, 1); }
-function saveDomainRules() {
-  const rules = domainRules.value.filter(r => r.domain.trim());
-  emit('update', { domainRules: rules });
-}
 const form = ref({
   name: '', server: '', port: 443, uuid: '',
   flow: 'xtls-rprx-vision', sni: '', publicKey: '', shortId: '', fingerprint: 'chrome',
@@ -131,9 +112,9 @@ async function pullSub() {
     }
     const merged = [...existing, ...added];
     emit('update', { nodes: merged });
-    alert('拉取成功：新增 ' + added.length + ' 个节点，共 ' + merged.length + ' 个');
+    toast('拉取成功：新增 ' + added.length + ' 个节点，共 ' + merged.length + ' 个', 'success');
   } catch (e) {
-    alert('拉取失败：' + e);
+    toast('拉取失败：' + e, 'error');
   }
 }
 function addNode() {
@@ -153,12 +134,68 @@ function addNode() {
   emit('update', { nodes });
   form.value = { name: '', server: '', port: 443, uuid: '', flow: 'xtls-rprx-vision', sni: '', publicKey: '', shortId: '', fingerprint: 'chrome' };
 }
+function editNode(i) {
+  const node = (props.config?.nodes || [])[i];
+  if (!node) return;
+  editingIndex.value = i;
+  form.value = {
+    name: node.name, server: node.server, port: node.port, uuid: node.uuid,
+    flow: node.flow || 'xtls-rprx-vision', sni: node.sni || '',
+    publicKey: node.publicKey || '', shortId: node.shortId || '',
+    fingerprint: node.fingerprint || 'chrome',
+  };
+  showAdd.value = true;
+}
+function submitForm() {
+  if (editingIndex.value === null) {
+    addNode();
+  } else {
+    const nodes = [...(props.config?.nodes || [])];
+    const i = editingIndex.value;
+    const oldName = nodes[i]?.name;
+    nodes[i] = {
+      ...nodes[i],
+      name: form.value.name.trim() || oldName,
+      server: form.value.server.trim(),
+      port: form.value.port || 443,
+      uuid: form.value.uuid.trim(),
+      flow: form.value.flow.trim() || 'xtls-rprx-vision',
+      fingerprint: form.value.fingerprint.trim() || 'chrome',
+      publicKey: form.value.publicKey.trim(),
+      shortId: form.value.shortId.trim(),
+      sni: form.value.sni.trim(),
+    };
+    const patch = { nodes };
+    // 若改了节点名，且该节点是当前选中节点，同步更新 selectedNode，避免悬空
+    if (oldName && form.value.name.trim() && form.value.name.trim() !== oldName
+        && props.config?.selectedNode === oldName) {
+      patch.selectedNode = form.value.name.trim();
+    }
+    emit('update', patch);
+    cancelForm();
+  }
+}
+function cancelForm() {
+  showAdd.value = false;
+  editingIndex.value = null;
+  form.value = { name: '', server: '', port: 443, uuid: '', flow: 'xtls-rprx-vision', sni: '', publicKey: '', shortId: '', fingerprint: 'chrome' };
+}
+function toggleForm() {
+  if (showAdd.value) {
+    cancelForm();
+  } else {
+    editingIndex.value = null;
+    showAdd.value = true;
+  }
+}
 const delays = ref({});
 async function testDelay(node) {
   try {
-    const url = 'http://127.0.0.1:19091/proxies/' + encodeURIComponent(node.name) + '/delay?timeout=5000&url=http://www.gstatic.com/generate_204';
-    const resp = await fetch(url);
-    const data = await resp.json();
+    // 不再直接 fetch 19091：走 Rust 后端 proxy_api，secret 由后端持有
+    const path = '/proxies/' + encodeURIComponent(node.name) + '/delay?timeout=5000&url=http://www.gstatic.com/generate_204';
+    const [status, body] = await invoke('proxy_api', { path });
+    if (status !== 200) throw new Error('HTTP ' + status);
+    const data = JSON.parse(body);
     delays.value[node.name] = data.delay;
   } catch (e) {
     delays.value[node.name] = -1;
@@ -175,7 +212,13 @@ function selectNode(node) {
 }
 function removeNode(i) {
   const nodes = [...(props.config?.nodes || [])];
+  const removed = nodes[i];
   nodes.splice(i, 1);
-  emit('update', { nodes });
+  // 删掉的是当前选中节点时，自动回退到剩余第一个，避免 selectedNode 悬空
+  let patch = { nodes };
+  if (removed && props.config?.selectedNode === removed.name) {
+    patch.selectedNode = nodes.length ? nodes[0].name : null;
+  }
+  emit('update', patch);
 }
 </script>

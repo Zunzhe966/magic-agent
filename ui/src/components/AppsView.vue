@@ -13,15 +13,15 @@
         <button v-for="m in modes" :key="m.value" class="seg-btn" :class="{ on: filter === m.value }" @click="filter = m.value">{{ m.label }}</button>
       </div>
     </div>
-    <p class="muted" style="margin-bottom: 10px;">默认策略：所有软件直连。只有你在下面明确选为「代理」的软件才会走代理。</p>
+    <p class="muted" style="margin-bottom: 10px;">默认策略：所有软件直连。只有你在下面明确选为「代理」的软件才会走代理。带「联网」标记的软件/脚本当前正在访问网络，是需要关注的对象；「本地」的则未联网，无需处理。</p>
     <div class="apps-table">
       <div class="apps-row head">
-        <span>软件</span><span>类别</span><span>模式</span><span>当前连接</span><span>路径</span>
+        <span>软件</span><span>类别</span><span>模式</span><span>状态</span><span>路径</span>
       </div>
       <div class="apps-row" v-for="app in filtered" :key="app.id">
         <div class="app-name">
           <div class="app-avatar">{{ app.name.slice(0, 1) }}</div>
-          <div><div>{{ app.name }}</div><div class="muted">{{ app.running ? '运行中' : '未运行' }}</div></div>
+          <div><div>{{ app.name }}</div><div class="muted">{{ statusText(app) }}</div></div>
         </div>
         <span class="tag">{{ app.category }}</span>
         <select class="mode-select" v-model="app.mode">
@@ -44,14 +44,26 @@ const emit = defineEmits(['change', 'refresh']);
 const q = ref('');
 const filter = ref('all');
 const modes = [
-  { value: 'all', label: '全部' }, { value: 'proxy', label: '走代理' }, { value: 'direct', label: '直连' }
+  { value: 'all', label: '全部' }, { value: 'online', label: '联网中' }, { value: 'proxy', label: '走代理' }, { value: 'direct', label: '直连' }
 ];
 const filtered = computed(() => {
   const query = q.value.toLowerCase();
   return props.apps
-    .filter(a => (!query || a.name.toLowerCase().includes(query)) && (filter.value === 'all' || a.mode === filter.value))
+    .filter(a => {
+      const nameOk = !query || a.name.toLowerCase().includes(query);
+      let modeOk = true;
+      if (filter.value === 'online') modeOk = !!a.online;
+      else if (filter.value === 'proxy') modeOk = a.mode === 'proxy';
+      else if (filter.value === 'direct') modeOk = a.mode === 'direct';
+      return nameOk && modeOk;
+    })
     .sort((a, b) => (b.running ? 1 : 0) - (a.running ? 1 : 0));
 });
+function statusText(app) {
+  if (!app.running) return '未运行';
+  if (app.online) return '联网中';
+  return '运行中·本地';
+}
 function connText(app) {
   if (!app.running) return '未运行';
   if (!app.confirmed) return '默认直连';
