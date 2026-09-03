@@ -16,8 +16,11 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- 2026-09-03 修复：去掉 KeepAlive 常驻。MCP 服务随登录启动即可，
+         崩溃不自动复活（重新登录或手动 magic-agent-mcp.sh start 拉起）。
+         KeepAlive 会造成「App 关了服务还在」的失控感，且掩盖崩溃问题。 -->
     <key>KeepAlive</key>
-    <true/>
+    <false/>
 
     <key>StandardOutPath</key>
     <string>/tmp/magic-agent-mcp.log</string>

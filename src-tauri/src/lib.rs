@@ -8,6 +8,7 @@ mod system_proxy;
 
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+use tauri::Manager;
 
 use crate::config::AppConfig;
 use crate::mihomo::{MihomoManager, MihomoStatus};
@@ -778,8 +779,24 @@ pub fn run() {
             fetch_subscription,
             proxy_api
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // ── 退出收尾钩子（2026-09-03 事故根因修复）──
+            // 铁律：App 生命周期必须完整覆盖内核生命周期——关 App = 关代理 + 关系统代理。
+            // 此前 App 退出没有任何清理钩子，root mihomo 变成孤儿进程继续用 TUN
+            // 接管全机流量，劫持其他应用（WorkBuddy 中转站请求被掐成 ECONNRESET）。
+            // RunEvent::Exit 在所有退出路径（关窗、Cmd+Q、app.exit()、系统注销）必经。
+            if let tauri::RunEvent::Exit = event {
+                eprintln!("[magic-agent] RunEvent::Exit：开始收尾（停内核+关系统代理）");
+                let state = app.state::<Arc<Mutex<AppState>>>();
+                // 锁可能被毒化（其他线程持锁 panic），退出路径绝不能再 panic
+                let g = state.lock().unwrap_or_else(|e| e.into_inner());
+                g.mihomo.stop();
+                let _ = system_proxy::set_system_proxy(false, g.mihomo.port);
+                eprintln!("[magic-agent] RunEvent::Exit：收尾完成");
+            }
+        });
 }
 
 #[cfg(test)]

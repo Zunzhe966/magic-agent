@@ -50,6 +50,27 @@ fn process_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// 探测系统默认路由的出网接口名（如 en0），钉死 mihomo 顶层 interface-name。
+/// 背景：auto-detect-interface 在 macOS 上会偶发抓错出网接口（虚拟网卡/桥接/utun），
+/// 导致 DIRECT 出站 dial i/o timeout（2026-09-03 实测一天 1500+ 次超时）。
+/// 探测失败回退 en0（Mac Wi-Fi 默认网卡）。
+fn detect_default_interface() -> String {
+    if let Ok(out) = Command::new("/sbin/route")
+        .args(["-n", "get", "default"])
+        .output()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some(rest) = line.trim().strip_prefix("interface:") {
+                let ifname = rest.trim();
+                if !ifname.is_empty() {
+                    return ifname.to_string();
+                }
+            }
+        }
+    }
+    "en0".to_string()
+}
+
 impl MihomoManager {
     pub fn new() -> Self {
         let runtime_dir = dirs::config_dir()
@@ -203,24 +224,11 @@ impl MihomoManager {
             }
         }
 
-        // 2. 找 mihomo PID
-        let out = Command::new("/bin/ps")
-            .args(["-axo", "pid=,args="])
-            .output()
-            .map_err(|e| e.to_string())?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let conf_path = self.runtime_dir.join("mihomo.yaml");
-        let conf_str = conf_path.to_string_lossy().to_string();
-        let mut pid: Option<String> = None;
-        for line in text.lines() {
-            if line.contains("mihomo") && line.contains(&conf_str) {
-                pid = line.split_whitespace().next().map(|s| s.to_string());
-                break;
-            }
-        }
-        let Some(pid) = pid else {
+        // 2. 找 mihomo PID（pgrep -f 完整命令行匹配，不依赖会被截断的 ps 输出）
+        let Some(pid) = self.find_running_pid() else {
             return Err("未找到运行中的 mihomo 进程".to_string());
         };
+        let pid = pid.to_string();
 
         // 3. 提权发送 SIGHUP 重载配置
         let script = format!("do shell script \"/bin/kill -HUP {}\" with administrator privileges", pid);
@@ -326,44 +334,61 @@ impl MihomoManager {
 
     /// 按启动参数（runtime 下的 mihomo.yaml）查找运行中的 mihomo PID。
     /// App 重启后内存里的 PID 丢失，靠这个兜底才能停掉/重启代理。
+    ///
+    /// 注意：不能解析 `ps -axo args=`——macOS 的 ps 在非终端输出时会把长命令行截断
+    /// （runtime 完整路径 + 配置参数约 230 字符，配置路径部分必被截掉导致匹配不到，
+    /// 2026-09-03 实测关窗收尾因此落空）。改用 pgrep -f 匹配完整命令行，
+    /// 模式与特权控制器 mihomo-ctl.sh 的 PATTERN 同源：只匹配本 App 的 runtime
+    /// 常驻副本内核，绝不放宽成 "mihomo"（会误杀 FlClash/Clash Verge 等第三方内核）。
     fn find_running_pid(&self) -> Option<u32> {
-        let conf_path = self.runtime_dir.join("mihomo.yaml");
-        let conf_str = conf_path.to_string_lossy().to_string();
-        let out = Command::new("/bin/ps")
-            .args(["-axo", "pid=,args="])
+        const PATTERN: &str = "magic-agent/runtime/bin/mihomo";
+        let out = Command::new("/usr/bin/pgrep")
+            .arg("-f")
+            .arg(PATTERN)
             .output()
             .ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            if line.contains("mihomo") && line.contains(&conf_str) {
-                if let Some(pid_str) = line.split_whitespace().next() {
-                    if let Ok(pid) = pid_str.parse::<u32>() {
-                        return Some(pid);
-                    }
-                }
-            }
-        }
-        None
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok())
+            .next()
     }
 
     pub fn stop(&self) {
         // 首选：特权控制器零弹窗（已安装 sudoers 白名单时；沙箱/未安装则回退）
+        eprintln!("[mihomo] stop(): 开始（优先特权控制器）");
         if Self::ctl("stop").is_some() {
+            eprintln!("[mihomo] stop(): 特权控制器已执行 stop");
             *self.pid.lock().unwrap() = None;
             return;
         }
         // 内存 PID 优先；App 重启后 PID 丢失，退回按配置路径查找
         let pid_opt = self.pid.lock().unwrap().take().or_else(|| self.find_running_pid());
+        eprintln!("[mihomo] stop(): 目标 PID = {pid_opt:?}");
         if let Some(pid) = pid_opt {
             let _ = Command::new("/bin/kill").arg(pid.to_string()).output();
             // 等待进程退出，最多 10 秒
             for _ in 0..100 {
                 if !process_alive(pid) {
-                    break;
+                    eprintln!("[mihomo] stop(): PID {pid} 已退出");
+                    return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-       }
+            // 普通 kill 杀不掉 = root 内核（TUN 需要 root 启动）。
+            // 最后防线：提权 kill。绝不允许 stop() 静默失败留下孤儿内核继续
+            // 接管全机流量——这正是 2026-09-03「关了 App 代理还在跑」事故的根因之一。
+            eprintln!("[mihomo] stop(): PID {pid} 普通杀失败（root），提权 kill");
+            if process_alive(pid) {
+                let script = format!(
+                    "do shell script \"/bin/kill {}\" with administrator privileges",
+                    pid
+                );
+                let _ = Command::new("/usr/bin/osascript")
+                    .arg("-e")
+                    .arg(&script)
+                    .output();
+            }
+        }
     }
 
     /// 调用特权控制器（sudo -n，免弹窗）。返回 Some(stdout)=成功。
@@ -490,6 +515,9 @@ impl MihomoManager {
         let mut out = String::new();
         out.push_str(&format!("mixed-port: {}\n", self.port));
         out.push_str("mode: rule\n");
+        // 钉死出网接口（治 DIRECT dial i/o timeout 根因，见 detect_default_interface 注释）。
+        // 顶层 interface-name 管所有出站（节点+DIRECT）；TUN 段的 auto-detect 只管 TUN 路由。
+        out.push_str(&format!("interface-name: {}\n", detect_default_interface()));
         // TUN 只接管「该走代理」的流量，绝不碰直连流量：
         //   - auto-route: false —— 不再改系统默认路由，避免把所有流量（含 AI 助手的直连请求）
         //     兜进虚拟网卡再"进-出"一圈导致请求体被污染。
@@ -719,6 +747,8 @@ mod tests {
             ..Default::default()
         };
         let conf = m.build_conf(&cfg, &[], &[]);
+        // 出网接口必须被钉死（2026-09-03 修复：auto-detect 抓错接口致 DIRECT 超时）
+        assert!(conf.contains("interface-name: "), "必须钉死顶层 interface-name:\n{conf}");
         // PROXY 组必须是 fallback（自动故障转移），且不再有死代码 AUTO 组
         assert!(conf.contains("  - name: PROXY\n    type: fallback\n"));
         assert!(!conf.contains("url-test"));

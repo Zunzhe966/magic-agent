@@ -9,3 +9,7 @@ __pycache__/
 # Vite 临时文件
 ui/*.mjs
 *.timestamp-*.mjs
+
+# 工具产物 / 本地备份（不入库）
+graphify-out/
+backup/
