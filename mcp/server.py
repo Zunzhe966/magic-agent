@@ -70,6 +70,15 @@ SERVER_INSTRUCTIONS = """你是「魔法代理」这个本机代理软件的使�
 - 改动会影响全局（切节点、改域名分流规则），操作前想清楚，改动后可以用 doctor 或 status 确认。"""
 
 
+def _str_arg(args, key, default=''):
+    """健壮地取字符串参数：兼容客户端传入非字符串（数字/None/dict 等）。
+    直接 (args.get(k) or '').strip() 在遇到 int 时会 AttributeError。"""
+    v = (args or {}).get(key, default)
+    if v is None:
+        return default
+    return str(v).strip()
+
+
 def _project_resource_bin():
     """推导项目内资源内核路径，避免硬编码开发机绝对路径。
     依次尝试：环境变量 MAGIC_AGENT_RESOURCES -> 项目根 src-tauri/resources -> 打包 .app 的 Resources。"""
@@ -782,7 +791,7 @@ def download_proxy(args):
         'note': '两条路物理分开、死锁分流：proxy 端口无条件走节点，direct 端口无条件直连，'
                 'mihomo 不做国内外自动判断。请自行决定本次下载走哪条。',
     }
-    url = (args or {}).get('url', '').strip()
+    url = _str_arg(args, 'url')
     if url:
         # 仅给出「建议」，决策权仍在智能体
         try:
@@ -1037,7 +1046,7 @@ def probe_route(args):
     返回 example：{"url":..., "routes":[{"name":"火车/直连","port":7892,...},{"name":"飞机/代理","port":7893,...}],
                   "conclusion":"..."}
     """
-    url = (args or {}).get('url', '').strip()
+    url = _str_arg(args, 'url')
     if not url:
         return {'error': 'url 必填，如 probe_route {"url":"https://huggingface.co"}'}
     if not url.startswith(('http://', 'https://')):
@@ -1418,7 +1427,7 @@ def call_tool(name, args):
         cfg = read_config()
         if 'error' in cfg:
             return cfg
-        node_name = args.get('name', '')
+        node_name = _str_arg(args, 'name')
         if not any(n['name'] == node_name for n in cfg.get('nodes', [])):
             return {'error': f'节点不存在: {node_name}'}
         cfg['selectedNode'] = node_name
@@ -1444,8 +1453,8 @@ def call_tool(name, args):
         cfg = read_config()
         if 'error' in cfg:
             return cfg
-        app_id = args.get('id', '')
-        mode = args.get('mode', 'direct')
+        app_id = _str_arg(args, 'id')
+        mode = _str_arg(args, 'mode', 'direct')
         if not app_id:
             return {'error': '缺少 id 参数（要设置哪个 App）'}
         if mode not in ('proxy', 'direct'):
@@ -1473,8 +1482,8 @@ def call_tool(name, args):
         cfg = read_config()
         if 'error' in cfg:
             return cfg
-        domain = args.get('domain', '').strip()
-        target = args.get('target', 'proxy')
+        domain = _str_arg(args, 'domain')
+        target = _str_arg(args, 'target', 'proxy')
         if not domain:
             return {'error': 'domain is required'}
         # target 支持 proxy / direct / 节点名（走指定节点）
@@ -1483,7 +1492,7 @@ def call_tool(name, args):
             if target not in node_names:
                 return {'error': f'target 必须是 proxy、direct 或已有节点名，现有节点：{node_names}'}
         rules = cfg.get('domainRules', [])
-        reason = (args.get('reason') or '').strip()
+        reason = _str_arg(args, 'reason')
         for r in rules:
             if r['domain'] == domain:
                 r['target'] = target
@@ -1507,7 +1516,7 @@ def call_tool(name, args):
         cfg = read_config()
         if 'error' in cfg:
             return cfg
-        domain = args.get('domain', '').strip()
+        domain = _str_arg(args, 'domain')
         rules = cfg.get('domainRules', [])
         cfg['domainRules'] = [r for r in rules if r['domain'] != domain]
         write_config(cfg)
@@ -1515,7 +1524,7 @@ def call_tool(name, args):
             hot_reload_rules(cfg)
         return {'ok': True, 'message': f'域名规则已删除: {domain}'}
     elif name == 'fetch_subscription':
-        url = args.get('url', '')
+        url = _str_arg(args, 'url')
         if not url:
             return {'error': 'url is required'}
         nodes = fetch_subscription_from_url(url)
@@ -1539,7 +1548,7 @@ def call_tool(name, args):
         write_config(cfg)
         return {'ok': True, 'message': f'订阅拉取成功，新增 {added} 个节点，共 {len(existing)} 个'}
     elif name == 'test_node_delay':
-        node_name = args.get('name', '')
+        node_name = _str_arg(args, 'name')
         if not node_name:
             return {'error': 'name is required'}
         try:
@@ -1557,7 +1566,13 @@ def call_tool(name, args):
     elif name == 'list_free_models':
         return list_free_models_impl(args)
     elif name == 'list_connections':
-        limit = int((args or {}).get('limit', 50))
+        # 参数健壮化：limit 可能是字符串/null/非法值（智能体传参不可控），
+        # 直接 int() 会抛异常。兜底为默认 50，再夹到 1~500 防止超大值拖慢。
+        try:
+            limit = int((args or {}).get('limit', 50))
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, 500))
         try:
             return list_connections(limit)
         except Exception as e:
@@ -1577,7 +1592,13 @@ def call_tool(name, args):
     elif name == 'server_metrics':
         return server_metrics(args)
     elif name == 'ssh_exec':
-        return ssh_exec((args or {}).get('command', ''), int((args or {}).get('timeout_secs', 15)))
+        # 参数健壮化：timeout_secs 可能是字符串/非法值，直接 int() 会抛异常
+        try:
+            to = int((args or {}).get('timeout_secs', 15))
+        except (TypeError, ValueError):
+            to = 15
+        to = max(1, min(to, 120))
+        return ssh_exec(_str_arg(args, 'command'), to)
     elif name == 'guide':
         return {'guide': SERVER_INSTRUCTIONS}
     return {'error': f'unknown tool {name}'}
@@ -1590,7 +1611,7 @@ def list_free_models_impl(args):
         return {'error': '台账不存在，请先运行 scripts/openrouter_free_models.py 刷新'}
     with open(ledger) as f:
         snap = json.load(f)
-    vendor = (args or {}).get('vendor')
+    vendor = _str_arg(args, 'vendor') or None
     models = [m for m in snap.get('models', [])
               if not vendor or m['vendor'].lower() == vendor.lower()]
     return {
@@ -1616,7 +1637,11 @@ def handle_message(msg):
     if method == 'tools/call':
         params = msg.get('params', {})
         tool_name = params.get('name', '')
-        tool_args = params.get('arguments', {})
+        # 统一兜底：客户端可能传 "arguments": null（key 存在但值为 None），
+        # 此时 params.get('arguments', {}) 会返回 None，导致 call_tool 内 args.get 崩溃。
+        tool_args = params.get('arguments')
+        if not isinstance(tool_args, dict):
+            tool_args = {}
         try:
             result = call_tool(tool_name, tool_args)
         except Exception as e:

@@ -162,6 +162,22 @@
 
 **想法变化**：排查卡顿要**顺着"主线程会碰到的所有命令"逐一过筛**，不能只盯用户点的那一个——5 秒轮询的 `get_status` 是隐藏的周期性卡顿源。
 
+### 2026-09-19 · MCP 接口参数健壮化（mcp/server.py）
+
+| 提交 | 类型 | 做了什么 |
+|------|------|----------|
+| `pending` | fix | MCP 工具入参健壮化，防客户端传异常参数时崩溃 |
+
+**背景**：用户要求"确认 MCP 接口有没有阻塞问题"后逐行过筛。**结论：MCP 没有 UI 卡顿风险**（它是独立 Python 进程，与 Tauri 主线程无关）。但发现一批**入参健壮性 bug**：
+
+1. **`"arguments": null` 必崩**：`params.get('arguments', {})` 在 key 存在但值为 `null` 时返回 `None`（不是 `{}`），下游所有 `args.get(...)` 触发 `AttributeError`。→ 在 `tools/call` 入口统一兜底：非 dict 一律当 `{}`。
+2. **非字符串入参崩**：`args.get('domain', '').strip()` 若客户端传数字（`{"domain":123}`）→ `int` 没有 `.strip()` → 崩。涉及 `domain`/`url`/`name`/`id`/`mode`/`reason`/`vendor`。→ 新增 `_str_arg()` 辅助函数统一转换。
+3. **`int()` 非法值崩**：`list_connections` 的 `limit`、`probe_route` 的 `timeout`/`read_bytes`、`ssh_exec` 的 `timeout_secs` 直接 `int()`，传字符串/null 会崩。→ 全部 try/except 兜底 + 夹到合理范围（limit 1~500、timeout 1~120）。
+
+**为什么之前没暴露**：外层 `tools/call` 有 `try/except` 兜底，所以只会返回 error 不会崩服务——但智能体每次都拿到一个"未知错误"，体验差且难排查。
+
+**想法变化**：MCP 是"给不可控客户端调的接口"，**入参必须当作脏数据**——不能假设客户端会传正确类型。这条适用于所有工具入口。
+
 ---
 
 ## 各版本「增 / 删」总表
