@@ -184,7 +184,7 @@
 
 | 提交 | 类型 | 做了什么 |
 |------|------|----------|
-| `pending` | fix | MCP status/systemProxy 字段报假状态 + start/stop_proxy 系统代理联动缺失 |
+| `a7f457a` | fix | MCP status/systemProxy 字段报假状态 + start/stop_proxy 系统代理联动缺失 |
 
 **背景**：用户要求"跑一次完整回归测试"，覆盖 启动→开代理→连通性→仪表盘→改配置→停代理→稳定性 全链路。
 

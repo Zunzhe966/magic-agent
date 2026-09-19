@@ -27,6 +27,16 @@ App 已内置 updater（`tauri.conf.json` → `plugins.updater.active=true`，en
 
 **改代码后的完整闭环**：改代码 → `cargo test` 全绿 → `release.sh <新版本>` → 部署验证 → `git commit`。三处版本号 + latest.json 版本必须指向同一版本。
 
+## 2026-09-19 变更（v0.2.5 / 回归测试）
+
+- **架构红线：MCP 与 Rust 是同一软件的两个入口，同一功能的行为（含副作用）必须一致。**
+  - 原因：回归测试发现 MCP 侧 `start_proxy`/`stop_proxy` 不做系统代理联动，而 Rust 侧做 → 走 MCP 入口停代理后系统代理仍指向已关闭端口，用户断网。
+  - 规则：任何改变系统级状态的命令（启停代理、改系统代理），两侧实现必须同步核对。
+- **状态查询必须报「真实状态」，不能报「配置意图」。**
+  - 反面教材：`status.systemProxy` 曾读 `config.json` 的字段（意图），App 重启后 config 仍 true 但实际已关 → 误导智能体。改为读 `scutil --proxy`（真实值）。
+  - 用途：判断"代理是否在服务"用 `mihomo_running()`（进程**且** 控制 API 可响应），不要只看进程存在（孤儿内核会误判）。
+- **MCP 工具入参必须当脏数据**：`arguments: null` / 数字 / 字符串混传都不能崩。用 `_str_arg()` 取字符串，`int()` 一律 try/except + 范围夹取。
+
 ## 2026-09-19 变更（v0.2.3）
 
 - **架构红线：凡是可能阻塞的 IO，一律 `async fn` + `tauri::async_runtime::spawn_blocking`。**
