@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::config::AppConfig;
 
@@ -34,9 +34,12 @@ const PROTECTED_DIRECT_DOMAINS: &[&str] = &[
     "203.0.113.74",
 ];
 
+#[derive(Clone)]
 pub struct MihomoManager {
-    /// mihomo 以 root 权限启动（TUN 需要），无法作为普通子进程管理，记录 PID 即可
-    pub pid: Mutex<Option<u32>>,
+    /// mihomo 以 root 权限启动（TUN 需要），无法作为普通子进程管理，记录 PID 即可。
+    /// 用 Arc<Mutex<..>> 包裹 + derive(Clone)：clone 出来的是「同一份共享 PID 状态」，
+    /// 这样 get_status 可把实例 move 进阻塞线程池做端口探测，主线程持有的实例仍能读到 pid。
+    pub pid: Arc<Mutex<Option<u32>>>,
     pub port: u16,
     pub runtime_dir: PathBuf,
 }
@@ -77,7 +80,7 @@ impl MihomoManager {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("magic-agent")
             .join("runtime");
-        Self { pid: Mutex::new(None), port: 7891, runtime_dir }
+        Self { pid: Arc::new(Mutex::new(None)), port: 7891, runtime_dir }
     }
 
     pub fn status(&self) -> MihomoStatus {

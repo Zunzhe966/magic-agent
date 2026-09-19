@@ -291,19 +291,35 @@ struct AppState {
 }
 
 #[tauri::command]
-fn get_status(state: tauri::State<Arc<Mutex<AppState>>>, ssh: tauri::State<crate::ssh::SshManager>) -> AppStatus {
-    let g = state.lock().unwrap();
-    let m = g.mihomo.status();
-    let apps_count = g.apps_cache.lock().unwrap().len();
-    AppStatus {
-        proxy_running: m.running,
-        proxy_pid: m.pid,
-        proxy_port: m.port,
-        system_proxy: system_proxy::status().enabled,
-        apps_count,
-        nodes_count: g.config.nodes.len(),
-        ssh: ssh.status(),
-    }
+async fn get_status(state: tauri::State<'_, Arc<Mutex<AppState>>>, ssh: tauri::State<'_, crate::ssh::SshManager>) -> Result<AppStatus, String> {
+    // 同步命令跑主线程：内部 mihomo.status() 会 TcpStream::connect 探端口、
+    // system_proxy::status() 会 fork 子进程跑 scutil。被前端每 5 秒轮询，
+    // 任一环节慢（端口被防火墙 DROP / 子进程调度）都会让 UI 卡顿。
+    // 改 async + spawn_blocking，探测挪到线程池。
+    let (mihomo_state, apps_count, nodes_count) = {
+        let g = state.lock().unwrap();
+        let mihomo = g.mihomo.clone();
+        let apps_count = g.apps_cache.lock().unwrap().len();
+        let nodes_count = g.config.nodes.len();
+        (mihomo, apps_count, nodes_count)
+    };
+    // SshManager 内部全 Arc，直接 clone（clone 与 State 生命周期解耦）
+    let ssh: crate::ssh::SshManager = ssh.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let m = mihomo_state.status();
+        let sys = system_proxy::status();
+        AppStatus {
+            proxy_running: m.running,
+            proxy_pid: m.pid,
+            proxy_port: m.port,
+            system_proxy: sys.enabled,
+            apps_count,
+            nodes_count,
+            ssh: ssh.status(),
+        }
+    })
+    .await
+    .map_err(|e| format!("get_status 线程异常: {e}"))
 }
 
 #[tauri::command]
