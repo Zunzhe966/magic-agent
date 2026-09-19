@@ -202,11 +202,11 @@ def rotate_log(path, max_bytes=10 * 1024 * 1024):
         pass
 
 
-def api_get(path):
+def api_get(path, timeout=5):
     try:
         req = urllib.request.Request(API + path)
         _add_auth(req)
-        r = _OPENER.open(req, timeout=5)
+        r = _OPENER.open(req, timeout=timeout)
         return json.loads(r.read().decode())
     except Exception as e:
         return {'error': str(e)}
@@ -233,6 +233,61 @@ def _add_auth(req):
         req.add_header('Authorization', 'Bearer ' + s)
 
 
+def system_proxy_enabled():
+    """系统代理【真实】是否开启（与 Rust 侧 system_proxy.rs::status 一致，读 scutil --proxy）。
+    不要用 config.json 的 systemProxy 字段当真实状态——那只是"上次的意图"，
+    App 重启/外部改动后可能和现实不符。"""
+    try:
+        out = subprocess.run(['/usr/sbin/scutil', '--proxy'],
+                             capture_output=True, text=True, timeout=5).stdout
+        return 'HTTPEnable : 1' in out or 'SOCKSEnable : 1' in out
+    except Exception:
+        return False
+
+
+def set_system_proxy(enable, port=7891):
+    """开/关 macOS 系统代理（与 Rust 侧 system_proxy.rs::set_system_proxy 一致）。
+    enable=True 时把 HTTP/HTTPS/SOCKS 都指向 127.0.0.1:port 并开启；
+    enable=False 只关闭开关（不动已配置的地址，便于下次快速恢复）。
+    注意：networksetup 可能需要管理员权限，失败会抛异常。"""
+    # 网络服务列表（跳过蓝牙/USB/Thunderbolt 等虚拟口，避免误设）
+    out = subprocess.run(['/usr/sbin/networksetup', '-listallnetworkservices'],
+                         capture_output=True, text=True, timeout=10).stdout
+    services = []
+    for line in out.splitlines():
+        s = line.strip()
+        if not s or s.startswith('An asterisk'):
+            continue
+        low = s.lower()
+        if any(k in low for k in ('asterisk', 'bluetooth', 'iphone', 'thunderbolt', 'bridge')):
+            continue
+        services.append(s)
+    if not services:
+        raise RuntimeError('未检测到网络服务，无法设置系统代理')
+    port_str = str(port)
+    any_ok, first_err = False, ''
+    for svc in services:
+        if enable:
+            cmds = [['-setwebproxy', svc, '127.0.0.1', port_str],
+                    ['-setsecurewebproxy', svc, '127.0.0.1', port_str],
+                    ['-setsocksfirewallproxy', svc, '127.0.0.1', port_str],
+                    ['-setwebproxystate', svc, 'on'],
+                    ['-setsecurewebproxystate', svc, 'on'],
+                    ['-setsocksfirewallproxystate', svc, 'on']]
+        else:
+            cmds = [['-setwebproxystate', svc, 'off'],
+                    ['-setsecurewebproxystate', svc, 'off'],
+                    ['-setsocksfirewallproxystate', svc, 'off']]
+        for c in cmds:
+            p = subprocess.run(['/usr/sbin/networksetup'] + c, capture_output=True, text=True, timeout=15)
+            if p.returncode == 0:
+                any_ok = True
+            elif not first_err:
+                first_err = p.stderr.strip()
+    if not any_ok:
+        raise RuntimeError(f'设置系统代理失败（可能需管理员权限）：{first_err}')
+
+
 def read_config():
     try:
         with open(CONFIG_PATH) as f:
@@ -254,9 +309,20 @@ def write_config(cfg):
 
 
 def mihomo_running():
-    p = subprocess.run(['/usr/bin/pgrep', '-f', MIHOMO_PGREP_PATTERN],
-                       capture_output=True, text=True)
-    return bool(p.stdout.strip())
+    """内核是否【真正在服务】（与 Rust 侧 mihomo.rs::status 逻辑保持一致）。
+
+    旧实现只 pgrep 进程存在 → 会把"孤儿内核"（进程活着但端口/API 都没监听）
+    误判为"代理已在运行"，导致 start_proxy 直接返回"已在运行"而拒绝真正启动，
+    代理实际不工作。修复：要求 (进程存在 或 端口开放) 且 控制 API 可响应。
+    """
+    has_proc = bool(subprocess.run(
+        ['/usr/bin/pgrep', '-f', MIHOMO_PGREP_PATTERN],
+        capture_output=True, text=True).stdout.strip())
+    if not has_proc:
+        return False
+    # 进程在，但必须确认控制 API 真的能响应（端口已就绪），才算"在运行"
+    api = api_get('/version', timeout=2)
+    return 'error' not in api
 
 
 def stop_mihomo():
@@ -1404,17 +1470,37 @@ def call_tool(name, args):
         running = mihomo_running()
         cfg = read_config()
         selected = cfg.get('selectedNode', '') if 'error' not in cfg else '?'
+        # systemProxy 用【真实】系统状态（scutil），而非 config 里的意图字段，
+        # 否则 App 重启后 config 仍是 true 但实际代理已关，会误导调用方。
         return {'running': running, 'selectedNode': selected,
-                'systemProxy': cfg.get('systemProxy', False) if 'error' not in cfg else '?',
+                'systemProxy': system_proxy_enabled(),
                 'nodes': len(cfg.get('nodes', [])) if 'error' not in cfg else 0}
     elif name == 'start_proxy':
         if mihomo_running():
+            # 内核已在运行，但系统代理可能是关的（App 重启/外部改动）。
+            # 旧实现直接返回"已在运行"就不管了 → 用户以为开了实际没开。
+            if not system_proxy_enabled():
+                try:
+                    set_system_proxy(True)
+                    return {'ok': True, 'message': '内核已在运行，已补开系统代理'}
+                except Exception as e:
+                    return {'ok': False, 'message': f'内核在运行但开系统代理失败: {e}'}
             return {'ok': True, 'message': '代理已在运行'}
         regenerate_config()
         pid = start_mihomo()
+        try:
+            set_system_proxy(True)
+        except Exception as e:
+            return {'ok': True, 'pid': pid, 'message': f'代理内核已启动，但系统代理开启失败: {e}'}
         return {'ok': True, 'pid': pid, 'message': '代理已启动（需要管理员授权）'}
     elif name == 'stop_proxy':
         stop_mihomo()
+        # 与 Rust 侧 stop_proxy 保持一致：停内核后必须关系统代理，
+        # 否则系统代理仍指向已关闭的 7891，导致用户断网。
+        try:
+            set_system_proxy(False)
+        except Exception as e:
+            return {'ok': False, 'message': f'内核已停止，但关系统代理失败: {e}'}
         return {'ok': True, 'message': '代理已停止'}
     elif name == 'list_nodes':
         cfg = read_config()
