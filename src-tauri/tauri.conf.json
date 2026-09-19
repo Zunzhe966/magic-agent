@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "尊者魔法代理",
-  "version": "0.1.1",
+  "version": "0.2.2",
   "identifier": "com.magic.agent",
   "build": {
     "beforeDevCommand": "pnpm --dir ui dev",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "pnpm --dir ui build",
+    "beforeBuildCommand": "pnpm --dir \"/Volumes/A区/魔法代理/ui\" build",
     "frontendDist": "../ui/dist"
   },
   "app": {
@@ -36,6 +36,18 @@
       "resources/geo/geosite.dat": "geo/geosite.dat",
       "resources/geo/ASN.mmdb": "geo/ASN.mmdb",
       "resources/geo/geoip.metadb": "geo/geoip.metadb"
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "http://127.0.0.1:7878/latest.json"
+      ],
+      "dialog": false,
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYzNDM4REZDNDkyMzIwNzQKUldSMElDTkovSTFEODFBNUtlYmRxallORkE3bko1ZiszOHVIV0VsU2NGSTRLK1lGdUhyM2xSajgK",
+      "dangerousInsecureTransportProtocol": true
     }
   }
 }

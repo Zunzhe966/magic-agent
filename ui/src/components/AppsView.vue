@@ -4,7 +4,7 @@
       <div><h1>软件分流</h1><p>按软件精确控制流量走向，Chrome 走代理、Safari 直连</p></div>
       <div class="head-actions">
         <button class="btn" @click="$emit('refresh')">重新扫描</button>
-        <button class="btn primary" @click="save">保存并应用</button>
+        <button class="btn primary" :disabled="saving" @click="save">{{ saving ? '保存中…' : '保存并应用' }}</button>
       </div>
     </header>
     <div class="toolbar">
@@ -43,6 +43,9 @@ const props = defineProps({ apps: Array, nodes: Array });
 const emit = defineEmits(['change', 'refresh']);
 const q = ref('');
 const filter = ref('all');
+// 防连点：applyApps 走父组件 save_config 是异步秒级操作，连点会触发重复 IPC +
+// 重复规则热更新（reload_rules 走 osascript 提权）。disabled 期间锁住按钮。
+const saving = ref(false);
 const modes = [
   { value: 'all', label: '全部' }, { value: 'online', label: '联网中' }, { value: 'proxy', label: '走代理' }, { value: 'direct', label: '直连' }
 ];
@@ -77,6 +80,11 @@ function connClass(app) {
   return 'direct';
 }
 function save() {
+  if (saving.value) return;
+  saving.value = true;
   emit('change', props.apps);
+  // 父组件 applyApps 是 await save_config + refresh，无法直接 await；
+  // 给一个保守的 1.2s 锁定期，避免热更新未完成又被连点。
+  setTimeout(() => { saving.value = false; }, 1200);
 }
 </script>

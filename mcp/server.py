@@ -1108,6 +1108,15 @@ def _active_server():
         return servers[0]
     # 兼容旧字段
     host = cfg.get('sshHost')
+    # 没有显式 SSH 配置时，从选中的代理节点推导主机——
+    # 用户的代理节点就部署在云服务器上，SSH 和代理是同一台机器，
+    # 不再要求用户在 SSH 页面重新填一遍服务器地址。
+    if not host:
+        selected = cfg.get('selectedNode')
+        for n in cfg.get('nodes', []):
+            if n.get('name') == selected:
+                host = n.get('server')
+                break
     if host:
         return {'id': f'ssh-{host}', 'name': host, 'host': host,
                 'port': cfg.get('sshPort', 22), 'user': cfg.get('sshUser', 'root'),
@@ -1163,7 +1172,9 @@ def ssh_exec(command, timeout_secs=15):
                   '  -re "Are you sure.*" {{ send "yes\\r"; exp_continue }}\n'
                   '  eof {{ exit 1 }}\n'
                   '}}\n'
-                  'expect eof\n'.format(
+                  'expect eof\n'
+                  'set rc [lindex [wait] 3]\n'
+                  'exit $rc\n'.format(
                       t=timeout_secs, spawn_args=spawn_args, pw=_tcl_escape(pw)))
         try:
             p = subprocess.run(['/usr/bin/expect', '-f', '-'], input=script,

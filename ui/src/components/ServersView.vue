@@ -54,7 +54,7 @@
           <button class="btn small" @click="testDelay(node)">测延迟</button>
           <button class="btn small danger" @click="removeNode(i)">删除</button>
         </div>
-        <div v-if="delays[node.name]" class="delay-line" :class="delayClass(delays[node.name])">{{ delays[node.name] }} ms</div>
+        <div v-if="delays[node.name]" class="delay-line" :class="delayClass(delays[node.name])">{{ delays[node.name] > 0 ? delays[node.name] + ' ms' : '超时' }}</div>
       </div>
     </div>
 
@@ -89,11 +89,18 @@ const emit = defineEmits(['nav', 'update', 'select-server', 'delete-server']);
 const showAdd = ref(false);
 const editingIndex = ref(null); // null=新增，数字=编辑第 i 个节点
 const subUrl = ref(props.config?.subscriptionUrl || '');
+// dirty：用户编辑过 subUrl 后置 true，防止 App.vue 5 秒轮询 refresh() 替换 config
+// 触发 watch 把用户正在输入但尚未保存的订阅 URL 覆盖回旧值
+const subDirty = ref(false);
+watch(subUrl, () => { subDirty.value = true; });
 const form = ref({
   name: '', server: '', port: 443, uuid: '',
   flow: 'xtls-rprx-vision', sni: '', publicKey: '', shortId: '', fingerprint: 'chrome',
 });
-watch(() => props.config?.subscriptionUrl, v => { subUrl.value = v || ''; });
+watch(() => props.config?.subscriptionUrl, v => {
+  if (subDirty.value) return;
+  subUrl.value = v || '';
+});
 function saveSub() {
   emit('update', { subscriptionUrl: subUrl.value.trim() || null });
 }
@@ -153,9 +160,10 @@ function submitForm() {
     const nodes = [...(props.config?.nodes || [])];
     const i = editingIndex.value;
     const oldName = nodes[i]?.name;
+    const newName = form.value.name.trim() || oldName;
     nodes[i] = {
       ...nodes[i],
-      name: form.value.name.trim() || oldName,
+      name: newName,
       server: form.value.server.trim(),
       port: form.value.port || 443,
       uuid: form.value.uuid.trim(),
@@ -166,10 +174,24 @@ function submitForm() {
       sni: form.value.sni.trim(),
     };
     const patch = { nodes };
-    // 若改了节点名，且该节点是当前选中节点，同步更新 selectedNode，避免悬空
-    if (oldName && form.value.name.trim() && form.value.name.trim() !== oldName
-        && props.config?.selectedNode === oldName) {
-      patch.selectedNode = form.value.name.trim();
+    // 若改了节点名，必须同步迁移所有引用了旧名的位置——否则后端把 apps/domainRules
+    // 里指向旧节点名的规则当"节点已删除"处理，静默降级为 PROXY（fallback 组），
+    // 用户看到的现象是"明明设了走节点A，却走了当前选中节点"，且无任何提示。
+    if (oldName && newName && newName !== oldName) {
+      // 1) 当前选中节点
+      if (props.config?.selectedNode === oldName) {
+        patch.selectedNode = newName;
+      }
+      // 2) apps[].node：软件分流里指定了旧节点名的条目
+      const apps = (props.config?.apps || []).map(a =>
+        a.node === oldName ? { ...a, node: newName } : a
+      );
+      // 3) domainRules[].target：域名分流里指向旧节点名的规则
+      const domainRules = (props.config?.domainRules || []).map(r =>
+        r.target === oldName ? { ...r, target: newName } : r
+      );
+      patch.apps = apps;
+      patch.domainRules = domainRules;
     }
     emit('update', patch);
     cancelForm();

@@ -7,6 +7,7 @@ mod ssh;
 mod system_proxy;
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
@@ -33,44 +34,192 @@ pub struct ConflictInfo {
     pub messages: Vec<String>,
 }
 
+/// 第三方代理应用的特征（进程名关键字 → 显示名）。
+/// 用于启动魔法代理时识别需要清理的"其他代理"。
+/// 注意：只用足够具体的名字，绝不用宽泛的 "proxy"，避免误杀无关进程。
+const FOREIGN_PROXY_APPS: &[(&str, &str)] = &[
+    ("flclash", "FlClash"),
+    ("clash verge", "Clash Verge"),
+    ("clash-verge", "Clash Verge"),
+    ("clashverge", "Clash Verge"),
+    ("clash for windows", "Clash for Windows"),
+    ("clashx", "ClashX"),
+    ("clash-nyanpasu", "Clash Nyanpasu"),
+    ("clash.meta", "Clash.Meta"),
+    ("v2rayx", "V2RayX"),
+    ("v2rayu", "V2RayU"),
+    ("qv2ray", "Qv2ray"),
+    ("shadowsocksx", "ShadowsocksX"),
+    ("shadowsocks-ng", "Shadowsocks-NG"),
+    ("surge", "Surge"),
+    ("quantumult", "Quantumult"),
+    ("stash", "Stash"),
+    ("loon", "Loon"),
+    ("sing-box", "sing-box"),
+    ("singbox", "sing-box"),
+    ("trojan", "Trojan"),
+    ("naiveproxy", "NaiveProxy"),
+    ("hysteria", "Hysteria"),
+    ("xray", "Xray"),
+    ("v2ray", "V2Ray"),
+];
+
+/// 第三方代理的子进程名（内核进程，通常父进程被杀了它们还活着）。
+/// 这些是已知代理软件的"内核"可执行名，需要一并清理，否则代理仍在生效。
+/// 绝不放入宽泛的 "mihomo"——那会误杀本程序自己的内核。
+const FOREIGN_PROXY_CORES: &[&str] = &[
+    "flclashcore",
+    "clash-verge-service",
+    "clash-verge-service-ipc",
+    "verge-mihomo",
+    "clash-meta",
+    "clash-meta-core",
+    "sing-box",
+    "v2ray-core",
+    "xray-core",
+    "hysteria",
+    "naive",
+    "trojan-go",
+];
+
+/// 扫描并返回正在运行的第三方代理进程 (pid, 描述) 列表。
+/// 跳过本程序自己的进程和 runtime 目录下的内核。
+fn find_foreign_proxies() -> Vec<(u32, String)> {
+    let mut found: Vec<(u32, String)> = Vec::new();
+    let runtime = MihomoManager::new().runtime_dir;
+    let runtime_str = runtime.to_string_lossy().to_string();
+    let self_pid = std::process::id();
+
+    let ps = match std::process::Command::new("/bin/ps").args(["-axo", "pid=,args="]).output() {
+        Ok(o) => o,
+        Err(_) => return found,
+    };
+    let text = String::from_utf8_lossy(&ps.stdout);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let pid: u32 = match parts.next().and_then(|s| s.trim().parse().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+        let args = match parts.next() { Some(a) => a.trim(), None => continue };
+        if pid == self_pid { continue; }
+        // 跳过本程序自己的可执行文件
+        if args.contains("magic-agent") || args.contains("magic_probe") || args.contains("dump_conf") {
+            continue;
+        }
+        // 跳过本程序 runtime 目录下的内核（那是我们自己的）
+        if args.contains(&runtime_str) { continue; }
+
+        // 只取可执行文件路径部分做匹配（首个空格前的 token）。
+        // 绝不用整个命令行匹配：否则任何在参数里提到 "clash"/"v2ray" 字样的进程
+        // （grep、编辑器、脚本）都会被误杀。
+        let exe_path = args.split_whitespace().next().unwrap_or(args).to_lowercase();
+        let exe_name = exe_path.rsplit('/').next().unwrap_or(&exe_path).to_string();
+
+        // 匹配应用可执行名（如 /Applications/FlClash.app/Contents/MacOS/FlClash → flclash）
+        for (key, label) in FOREIGN_PROXY_APPS {
+            if exe_path.contains(key) || exe_name == *key {
+                found.push((pid, (*label).to_string()));
+                break;
+            }
+        }
+        // 匹配内核进程名
+        for core in FOREIGN_PROXY_CORES {
+            if exe_name.contains(core) {
+                if !found.iter().any(|(p, _)| *p == pid) {
+                    found.push((pid, format!("{} 内核", core)));
+                }
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// 启动魔法代理前，清理所有第三方代理：
+/// 1) 杀掉第三方代理进程（先温和 TERM，1.5 秒后仍在则 KILL）
+/// 2) 关闭系统代理设置，让网络回到"未设代理"的干净状态
+///
+/// 返回清理掉的进程描述列表（供 UI 提示）。
+fn cleanup_foreign_proxies() -> Vec<String> {
+    let victims = find_foreign_proxies();
+    let mut cleaned = Vec::new();
+    if victims.is_empty() {
+        // 没有第三方进程，但仍要确保系统代理是干净状态
+        let _ = system_proxy::set_system_proxy(false, 0);
+        return cleaned;
+    }
+
+    // 第一轮：SIGTERM（温和退出，让代理软件自己清理系统代理设置和防火墙规则）
+    for (pid, label) in &victims {
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .output();
+        cleaned.push(format!("{} (PID {})", label, pid));
+    }
+
+    // 等待进程退出，最多 1.5 秒
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
+    // 第二轮：仍在运行的升级为 SIGKILL
+    for (pid, _) in &victims {
+        let alive = std::process::Command::new("/bin/ps")
+            .args(["-p", &pid.to_string()])
+            .output()
+            .map(|o| !o.stdout.is_empty() && String::from_utf8_lossy(&o.stdout).lines().count() > 1)
+            .unwrap_or(false);
+        if alive {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-KILL", &pid.to_string()])
+                .output();
+        }
+    }
+
+    // 关闭系统代理，回到干净状态（第三方软件可能残留了代理指向）
+    let _ = system_proxy::set_system_proxy(false, 0);
+
+    cleaned
+}
+
 #[tauri::command]
 fn check_conflicts() -> ConflictInfo {
     let mut messages = Vec::new();
-    // 本程序自己启动的 mihomo 会带 runtime 目录参数，遇到时跳过，避免误报自身
-    let runtime = MihomoManager::new().runtime_dir;
-    let runtime_str = runtime.to_string_lossy().to_string();
     // 1) 检测正在运行的第三方代理程序（FlClash / Clash / 外部 mihomo）
-    if let Ok(ps) = std::process::Command::new("/bin/ps").args(["-axo", "args="]).output() {
-        let text = String::from_utf8_lossy(&ps.stdout);
-        let mut foreign = false;
-        for line in text.lines() {
-            let lower = line.to_lowercase();
-            let hit = lower.contains("mihomo") || lower.contains("clash") || lower.contains("flclash");
-            if !hit { continue; }
-            // 跳过本程序 runtime 目录启动的 mihomo
-            if line.contains(&runtime_str) {
-                continue;
-            }
-            foreign = true;
-        }
-        if foreign {
-            messages.push("检测到正在运行的第三方代理程序（FlClash/Clash/mihomo），请先关闭".to_string());
-        }
+    let foreign = find_foreign_proxies();
+    if !foreign.is_empty() {
+        let names: Vec<String> = foreign.iter().map(|(_, l)| l.clone()).collect();
+        messages.push(format!("检测到正在运行的第三方代理程序：{}", names.join("、")));
     }
-    // 2) 检测本程序要用的混合端口是否已被占用。
-    //    如果占用端口的是本程序 runtime 目录的 mihomo，不算冲突。
+    // 2) 检测本程序要用的混合端口是否已被占用（排除自己的 runtime 内核）
     let port = MihomoManager::new().port;
     if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        let runtime = MihomoManager::new().runtime_dir;
+        let runtime_str = runtime.to_string_lossy().to_string();
         let own = std::process::Command::new("/bin/ps")
             .args(["-axo", "args="])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
-        if !own.contains("mihomo") || !own.contains(&runtime_str) {
-            messages.push(format!("端口 {} 已被其他程序占用，请先关闭冲突程序", port));
+        if !own.contains(&runtime_str) {
+            messages.push(format!("端口 {} 已被其他程序占用", port));
         }
     }
     ConflictInfo { has_conflict: !messages.is_empty(), messages }
+}
+
+/// 供前端调用的「一键清理第三方代理」命令：
+/// 杀掉所有第三方代理进程 + 关闭系统代理，把系统恢复到干净状态。
+#[tauri::command]
+fn kill_foreign_proxies() -> Vec<String> {
+    cleanup_foreign_proxies()
+}
+
+/// 查询当前有哪些第三方代理在运行（供 UI 展示）。
+#[tauri::command]
+fn list_foreign_proxies() -> Vec<String> {
+    find_foreign_proxies().into_iter().map(|(p, l)| format!("{} (PID {})", l, p)).collect()
 }
 
 #[tauri::command]
@@ -113,13 +262,15 @@ fn fetch_subscription(url: String) -> Result<Vec<crate::config::ProxyNode>, Stri
 struct AppState {
     config: AppConfig,
     mihomo: MihomoManager,
-    ssh: crate::ssh::SshManager,
     /// 已安装 App 列表缓存（scan_apps 时更新，get_status 只读长度，避免重扫描卡界面）
     apps_cache: Mutex<Vec<crate::apps::AppEntry>>,
+    /// 用户是否期望代理在运行（start_proxy 置 true，stop_proxy 置 false）。
+    /// 看门狗线程据此判断 mihomo 崩溃后是否需要自动重启。
+    should_run: Arc<AtomicBool>,
 }
 
 #[tauri::command]
-fn get_status(state: tauri::State<Arc<Mutex<AppState>>>) -> AppStatus {
+fn get_status(state: tauri::State<Arc<Mutex<AppState>>>, ssh: tauri::State<crate::ssh::SshManager>) -> AppStatus {
     let g = state.lock().unwrap();
     let m = g.mihomo.status();
     let apps_count = g.apps_cache.lock().unwrap().len();
@@ -130,7 +281,7 @@ fn get_status(state: tauri::State<Arc<Mutex<AppState>>>) -> AppStatus {
         system_proxy: system_proxy::status().enabled,
         apps_count,
         nodes_count: g.config.nodes.len(),
-        ssh: g.ssh.status(),
+        ssh: ssh.status(),
     }
 }
 
@@ -155,8 +306,18 @@ fn proxy_api(
     method: Option<String>,
     body: Option<String>,
 ) -> Result<(u16, String), String> {
-    // 只允许绝对路径形式，防止被拼成任意 URL（如 http://attacker.com）
-    if !path.starts_with('/') || path.contains("://") {
+    // 路径必须以 / 开头，防止被拼成完整 URL（如 http://attacker.com）
+    // 但 mihomo delay 接口的 query 参数 url=http://... 含 ://，必须放行：
+    // 只检查问号前的路径段不含 ://，query 段允许含 ://。
+    if !path.starts_with('/') {
+        return Err("非法的 API 路径".to_string());
+    }
+    let path_part = path.split('?').next().unwrap_or("");
+    if path_part.contains("://") {
+        return Err("非法的 API 路径".to_string());
+    }
+    // 拒绝换行：path 直接拼进 HTTP 请求行，含 \r\n 会注入额外请求头/请求走私
+    if path.contains('\r') || path.contains('\n') {
         return Err("非法的 API 路径".to_string());
     }
     let secret = {
@@ -279,22 +440,44 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[tauri::command]
 fn save_config(state: tauri::State<Arc<Mutex<AppState>>>, config: AppConfig) -> Result<AppConfig, String> {
-    let mut g = state.lock().unwrap();
+    // 只在读取 secret/运行状态时短暂持锁；热更新要全机扫描 App + lsof（秒级），
+    // 全程持锁会堵死 get_status 轮询，表现为每次保存配置界面卡死数秒。
+    let (api_secret, running) = {
+        let g = state.lock().unwrap();
+        (g.config.api_secret.clone(), g.mihomo.status().running)
+    };
+    let mut config = config;
     // 前端拿不到 apiSecret（get_config 已置空），这里必须保留后端持有的原 secret，
     // 否则每次保存都会把 secret 覆盖成 None，导致控制 API 鉴权失效。
-    let mut config = config;
-    if config.api_secret.is_none() {
-        config.api_secret = g.config.api_secret.clone();
+    // 防御空串：前端若传 apiSecret: ""（空串而非 null），is_none 判 false 不会补回，
+    // secret 会被空串覆盖导致鉴权失效。None 或空串都视为「未提供」，补回旧 secret。
+    let secret_missing = config
+        .api_secret
+        .as_deref()
+        .map(|s| s.is_empty())
+        .unwrap_or(true);
+    if secret_missing {
+        config.api_secret = api_secret;
     }
-    g.config = config.clone();
-    config::save(&config)?;
+    // 安全：SSH 明文密码/私钥内容绝不落盘 config.json。
+    // 密码只存 Keychain；私钥内容只存 Keychain，config 里至多保留私钥「路径」。
+    config.ssh_password = None;
+    if config.ssh_private_key.as_deref().map(|k| k.contains('\n')).unwrap_or(false) {
+        config.ssh_private_key = None;
+    }
     // 如果代理正在运行，热更新 rules，让新保存的分流/域名规则立即生效（不重启、不弹授权框）
-    if g.mihomo.status().running {
+    let reload_err = if running {
         let app_rules = effective_app_rules(&config);
-        if let Err(e) = g.mihomo.reload_rules(&config, &app_rules) {
-            // 热更新失败不阻塞保存，但要把错误返回给前端提示
-            return Err(format!("配置已保存，但规则热更新失败：{}", e));
-        }
+        let m = MihomoManager::new();
+        m.reload_rules(&config, &app_rules).err()
+    } else {
+        None
+    };
+    state.lock().unwrap().config = config.clone();
+    config::save(&config)?;
+    if let Some(e) = reload_err {
+        // 热更新失败不阻塞保存，但要把错误返回给前端提示
+        return Err(format!("配置已保存，但规则热更新失败：{}", e));
     }
     // 返回给前端的 config 同样不能带 secret
     config.api_secret = None;
@@ -380,10 +563,15 @@ fn start_proxy(state: tauri::State<Arc<Mutex<AppState>>>) -> Result<MihomoStatus
         let m = MihomoManager::new();
         return Ok(m.status());
     }
-    // 检测第三方代理冲突：FlClash/mihomo 占用端口时直接提示，避免抢端口
-    let conflict = check_conflicts();
-    if conflict.has_conflict {
-        return Err(conflict.messages.join("；"));
+    // 启动前自动清理所有第三方代理：杀掉 FlClash/Clash 等进程 + 关闭系统代理，
+    // 让系统回到「未设代理」的干净状态，再启动本程序的代理。
+    // 这样用户点一次启动就能拿到干净的代理环境，不必手动去关别的软件。
+    // 只清理端口冲突和已知第三方代理；本程序自己的进程和内核会被跳过。
+    cleanup_foreign_proxies();
+    // 无节点时 mihomo 的 fallback 组 proxies 为空，mihomo -t 会拒绝整个配置，
+    // 给出晦涩的 YAML 校验错误。提前拦截，提示用户先加节点。
+    if cfg.nodes.is_empty() {
+        return Err("尚未添加任何代理节点，请先到「云服务器」页添加节点或拉取订阅".to_string());
     }
     let app_rules = effective_app_rules(&cfg);
     let mihomo = MihomoManager::new();
@@ -395,11 +583,15 @@ fn start_proxy(state: tauri::State<Arc<Mutex<AppState>>>) -> Result<MihomoStatus
     if let Some(pid) = status.pid {
         *state.lock().unwrap().mihomo.pid.lock().unwrap() = Some(pid);
     }
+    // 通知看门狗：用户期望代理在运行，mihomo 崩溃后应自动重启
+    state.lock().unwrap().should_run.store(true, Ordering::Relaxed);
     Ok(status)
 }
 
 #[tauri::command]
 fn stop_proxy(state: tauri::State<Arc<Mutex<AppState>>>) -> Result<(), String> {
+    // 通知看门狗：用户主动停止，不要自动重启
+    state.lock().unwrap().should_run.store(false, Ordering::Relaxed);
     let port = state.lock().unwrap().mihomo.port;
     // 锁外执行停止，避免阻塞状态轮询
     let mihomo = MihomoManager::new();
@@ -411,21 +603,46 @@ fn stop_proxy(state: tauri::State<Arc<Mutex<AppState>>>) -> Result<(), String> {
 
 #[tauri::command]
 fn set_system_proxy(state: tauri::State<Arc<Mutex<AppState>>>, enabled: bool) -> Result<crate::system_proxy::SystemProxyStatus, String> {
-    let g = state.lock().unwrap();
-    system_proxy::set_system_proxy(enabled, g.mihomo.port)
+    // networksetup 可能耗时，锁外执行避免阻塞状态轮询
+    let port = state.lock().unwrap().mihomo.port;
+    let status = system_proxy::set_system_proxy(enabled, port)?;
+    // 同步更新并持久化 config.system_proxy，使 UI 开关与 config 一致。
+    // 旧实现只调 networksetup 不改 config，导致 UI 开关后 start_proxy 仍按旧 config 判断，
+    // 重启后系统代理状态与用户上次选择脱节。
+    let cfg = {
+        let mut g = state.lock().unwrap();
+        g.config.system_proxy = enabled;
+        g.config.clone()
+    };
+    if let Err(e) = config::save(&cfg) {
+        eprintln!("[set_system_proxy] 持久化失败（不影响本次设置）: {e}");
+    }
+    Ok(status)
 }
 
 #[tauri::command]
-fn ssh_connect(state: tauri::State<Arc<Mutex<AppState>>>, host: String, port: u16, user: String, auth: String, password: Option<String>, key: Option<String>) -> Result<crate::ssh::SshSession, String> {
-    let mut g = state.lock().unwrap();
-    let session = g.ssh.connect(host.clone(), port, user.clone(), auth.clone(), password.clone(), key.clone())?;
+fn ssh_connect(state: tauri::State<Arc<Mutex<AppState>>>, ssh: tauri::State<crate::ssh::SshManager>, host: String, port: u16, user: String, auth: String, password: Option<String>, key: Option<String>) -> Result<crate::ssh::SshSession, String> {
+    // 连接+认证验证在锁外进行（最长十余秒），全程持锁会卡死状态轮询。
+    // connect 内部已验证登录结果：认证失败会返回 Err，下面的 Keychain/配置写入不会执行，
+    // 错误密码/私钥因此永远不会被存进 Keychain 污染后续连接。
+    let session = ssh.connect(host.clone(), port, user.clone(), auth.clone(), password.clone(), key.clone())?;
 
-    // 密码/私钥内容安全存入 Keychain，config 不落明文
+    // 密码/私钥内容安全存入 Keychain，config 不落明文。
+    // 注意：SSH 会话此时已经成功建立（ssh.connect 已通过认证）。
+    // Keychain 存储是「持久化凭据」的副作用，不能让它把整个 ssh_connect 拉成 Err
+    // ——否则用户会看到"连接失败"，但后台 session 已 live，下次 connect 才被 disconnect
+    // 清理，期间会变成孤儿会话。Keychain 写失败时只标记 password_saved=false，
+    // 让用户在 UI 上看到「已连接但凭据未保存」，而不是误报连接失败。
     let password_saved = if auth == "password" {
         match password {
             Some(p) if !p.trim().is_empty() => {
-                keychain::store(&crate::ssh::SshManager::password_account(&host, &user), &p)?;
-                true
+                match keychain::store(&crate::ssh::SshManager::password_account(&host, &user), &p) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        eprintln!("[ssh] 保存密码到 Keychain 失败（不影响本次连接）: {e}");
+                        false
+                    }
+                }
             }
             _ => keychain::exists(&crate::ssh::SshManager::password_account(&host, &user)),
         }
@@ -437,8 +654,13 @@ fn ssh_connect(state: tauri::State<Arc<Mutex<AppState>>>, host: String, port: u1
             Some(k) if !k.trim().is_empty() => {
                 // 如果是路径，不存内容；如果是私钥内容（多行），存 Keychain
                 if k.contains('\n') {
-                    keychain::store(&crate::ssh::SshManager::key_account(&host, &user), k)?;
-                    true
+                    match keychain::store(&crate::ssh::SshManager::key_account(&host, &user), k) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            eprintln!("[ssh] 保存私钥到 Keychain 失败（不影响本次连接）: {e}");
+                            false
+                        }
+                    }
                 } else {
                     false // 路径形式，直接引用路径
                 }
@@ -450,6 +672,7 @@ fn ssh_connect(state: tauri::State<Arc<Mutex<AppState>>>, host: String, port: u1
     };
 
     // 更新 servers 列表
+    let mut g = state.lock().unwrap();
     let id = format!("ssh-{}@{}", user, host);
     let info = crate::config::ServerInfo {
         id: id.clone(),
@@ -476,7 +699,11 @@ fn ssh_connect(state: tauri::State<Arc<Mutex<AppState>>>, host: String, port: u1
     g.config.ssh_auth = Some(auth);
     g.config.ssh_password = None;
     g.config.ssh_private_key = None;
-    let _ = config::save(&g.config);
+    // config 持久化失败不应让已成功的连接变成"失败"（session 已建立），
+    // 但也不能静默吞掉——内存有服务器、磁盘没有，重启后消失且 Keychain 留孤儿凭据。
+    if let Err(e) = config::save(&g.config) {
+        eprintln!("[ssh_connect] config 持久化失败（不影响本次连接）: {e}");
+    }
     Ok(session)
 }
 
@@ -498,12 +725,23 @@ fn select_ssh_server(state: tauri::State<Arc<Mutex<AppState>>>, server_id: Strin
 }
 
 #[tauri::command]
-fn delete_ssh_server(state: tauri::State<Arc<Mutex<AppState>>>, server_id: String) -> Result<(), String> {
+fn delete_ssh_server(state: tauri::State<Arc<Mutex<AppState>>>, ssh: tauri::State<crate::ssh::SshManager>, server_id: String) -> Result<(), String> {
     let mut g = state.lock().unwrap();
     let idx = g.config.servers.iter().position(|s| s.id == server_id).ok_or("服务器不存在")?;
     let server = g.config.servers.remove(idx);
     keychain::delete(&crate::ssh::SshManager::password_account(&server.host, &server.user));
     keychain::delete(&crate::ssh::SshManager::key_account(&server.host, &server.user));
+    // 若删的正是当前激活服务器，且 SSH 交互式会话还连着它，必须同步断开——
+    // 否则用户删完服务器在「控制台」页依然看到"已连接"，且底层 ssh 进程仍持有
+    // 该服务器凭据的会话，与"已删除"语义矛盾，存在凭据残留风险。
+    let is_active = g.config.active_server_id.as_deref() == Some(server.id.as_str());
+    if is_active {
+        // session.id 形如 "ssh-<user>@<host>"，与 server.id 同形，直接比对即可
+        let sid = ssh.session.lock().unwrap().as_ref().map(|s| s.id.clone());
+        if sid.as_deref() == Some(server.id.as_str()) {
+            ssh.disconnect();
+        }
+    }
     if g.config.active_server_id.as_deref() == Some(server.id.as_str()) {
         if let Some(next) = g.config.servers.first().cloned() {
             g.config.active_server_id = Some(next.id.clone());
@@ -528,21 +766,18 @@ fn delete_ssh_server(state: tauri::State<Arc<Mutex<AppState>>>, server_id: Strin
 }
 
 #[tauri::command]
-fn ssh_write(state: tauri::State<Arc<Mutex<AppState>>>, data: Vec<u8>) -> Result<(), String> {
-    let g = state.lock().unwrap();
-    g.ssh.write(data)
+fn ssh_write(ssh: tauri::State<crate::ssh::SshManager>, data: Vec<u8>) -> Result<(), String> {
+    ssh.write(data)
 }
 
 #[tauri::command]
-fn ssh_read(state: tauri::State<Arc<Mutex<AppState>>>) -> Result<Vec<u8>, String> {
-    let g = state.lock().unwrap();
-    g.ssh.read()
+fn ssh_read(ssh: tauri::State<crate::ssh::SshManager>) -> Result<Vec<u8>, String> {
+    ssh.read()
 }
 
 #[tauri::command]
-fn ssh_disconnect(state: tauri::State<Arc<Mutex<AppState>>>) -> Result<(), String> {
-    let g = state.lock().unwrap();
-    g.ssh.disconnect();
+fn ssh_disconnect(ssh: tauri::State<crate::ssh::SshManager>) -> Result<(), String> {
+    ssh.disconnect();
     Ok(())
 }
 
@@ -750,14 +985,66 @@ pub fn stop_proxy_standalone() -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let should_run = Arc::new(AtomicBool::new(false));
     let state = Arc::new(Mutex::new(AppState {
         config: config::load(),
         mihomo: MihomoManager::new(),
-        ssh: crate::ssh::SshManager::new(),
         apps_cache: Mutex::new(Vec::new()),
+        should_run: should_run.clone(),
     }));
+
+    // mihomo 看门狗：每 30s 检查一次。用户启动代理后 should_run=true，
+    // 若 mihomo 崩溃（端口探测失败）则自动拉起——但只走特权控制器零弹窗路径
+    // （ctl("start")），不弹 osascript 反复骚扰用户。重启失败则关掉系统代理，
+    // 避免 mihomo 死了但系统代理仍指向 127.0.0.1:7891 导致全机断网。
+    let watchdog_state = state.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            if !should_run.load(Ordering::Relaxed) { continue; }
+            let mihomo = MihomoManager::new();
+            if mihomo.status().running { continue; }
+            eprintln!("[watchdog] mihomo 已停止但 should_run=true，尝试自动重启...");
+            if let Some(pid_str) = MihomoManager::ctl("start") {
+                if pid_str == "already-running" || pid_str.parse::<u32>().is_ok() {
+                    if mihomo.wait_api() {
+                        eprintln!("[watchdog] mihomo 自动重启成功");
+                        if let Ok(pid) = pid_str.parse::<u32>() {
+                            *watchdog_state.lock().unwrap().mihomo.pid.lock().unwrap() = Some(pid);
+                        }
+                        continue;
+                    }
+                }
+            }
+            // 重启失败：关掉系统代理，避免死代理端口导致全机断网
+            eprintln!("[watchdog] mihomo 自动重启失败，关闭系统代理以恢复直连");
+            let port = watchdog_state.lock().unwrap().mihomo.port;
+            let _ = system_proxy::set_system_proxy(false, port);
+        }
+    });
+
+    // 启动时自动清理第三方代理：App 一打开就把系统里其他代理（FlClash/Clash 等）
+    // 全部关掉，并把系统代理恢复为「未设置」，让网络回到最初干净状态。
+    // 这样用户打开本软件即成为系统唯一代理，不会有多个代理抢流量/抢端口。
+    // 放在后台线程执行，避免阻塞窗口显示（清理含 1.5 秒等待）。
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let cleaned = cleanup_foreign_proxies();
+        if !cleaned.is_empty() {
+            eprintln!("[startup] 已清理第三方代理: {}", cleaned.join("、"));
+        }
+    });
+
     tauri::Builder::default()
         .manage(state)
+        // SSH 会话单独管理：连接验证（最长十余秒）与终端读写不经过配置大锁，
+        // 避免连接期间/终端高频 IO 卡住 get_status 轮询
+        .manage(crate::ssh::SshManager::new())
+        // 自动更新：updater 下载 .app.tar.gz + Ed25519 验签 + 整体覆盖；
+        // dialog 用于弹「发现新版本」原生对话框；process 用于安装后 relaunch 重启
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             get_status,
             get_config,
@@ -776,6 +1063,8 @@ pub fn run() {
             delete_ssh_server,
             self_test,
             check_conflicts,
+            kill_foreign_proxies,
+            list_foreign_proxies,
             fetch_subscription,
             proxy_api
         ])
@@ -788,11 +1077,15 @@ pub fn run() {
             // 接管全机流量，劫持其他应用（WorkBuddy 中转站请求被掐成 ECONNRESET）。
             // RunEvent::Exit 在所有退出路径（关窗、Cmd+Q、app.exit()、系统注销）必经。
             if let tauri::RunEvent::Exit = event {
-                eprintln!("[magic-agent] RunEvent::Exit：开始收尾（停内核+关系统代理）");
+                eprintln!("[magic-agent] RunEvent::Exit：开始收尾（停内核+断SSH+关系统代理）");
                 let state = app.state::<Arc<Mutex<AppState>>>();
                 // 锁可能被毒化（其他线程持锁 panic），退出路径绝不能再 panic
                 let g = state.lock().unwrap_or_else(|e| e.into_inner());
+                // 先通知看门狗停止，避免退出时它检测到 mihomo 已死又自动拉起
+                g.should_run.store(false, Ordering::Relaxed);
                 g.mihomo.stop();
+                // 断开 SSH 会话：不断开则 ssh/expect 子进程变孤儿，继续占着远端连接
+                app.state::<crate::ssh::SshManager>().disconnect();
                 let _ = system_proxy::set_system_proxy(false, g.mihomo.port);
                 eprintln!("[magic-agent] RunEvent::Exit：收尾完成");
             }

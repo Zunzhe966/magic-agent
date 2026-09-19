@@ -13,3 +13,7 @@ ui/*.mjs
 # 工具产物 / 本地备份（不入库）
 graphify-out/
 backup/
+
+# 发版产物（release.sh 生成，不入库；40MB 级 tar.gz 属构建产物）
+scripts/updater-feed/
+.trae/

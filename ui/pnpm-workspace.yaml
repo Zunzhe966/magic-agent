@@ -1,2 +1,3 @@
-onlyBuiltDependencies:
-  - esbuild
+allowBuilds:
+  # esbuild 的平台二进制走 optionalDependencies(@esbuild/darwin-arm64)，postinstall 无需执行
+  esbuild: false

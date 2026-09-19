@@ -131,12 +131,37 @@ fn process_name_matches(p: &str, c: &str) -> bool {
 /// 用 lsof -nP -iTCP -sTCP:ESTABLISHED 拿「进程名 PID 远端IP」。
 fn scan_network_connections() -> std::collections::HashMap<String, Vec<String>> {
     let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    let Ok(out) = std::process::Command::new("/usr/sbin/lsof")
+    // lsof 扫全机 ESTABLISHED 连接：连接多时可能耗时 1-3 秒。
+    // 加 2.5 秒硬超时——超时就放弃联网标记（online/remote_ips 降级为空），
+    // 绝不因为 lsof 卡住而阻塞整个 App 扫描和 UI 交互。
+    let mut child = match std::process::Command::new("/usr/sbin/lsof")
         .args(["-nP", "-iTCP", "-sTCP:ESTABLISHED"])
-        .output()
-    else {
-        return map;
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return map,
     };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2500);
+    let out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break child.wait_with_output().ok(),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return map; // 超时：放弃联网标记
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                return map;
+            }
+        }
+    };
+    let Some(out) = out else { return map };
     if !out.status.success() {
         return map;
     }
@@ -459,13 +484,18 @@ fn scan_running_processes() -> Vec<RunningProcess> {
         // 取到 .app 目录（形如 /Applications/xxx.app/）
         let app_dir = &args[..pos + marker.len()];
         let bundle_id = bundle_id_for_path(app_dir);
-        // app_path 仅作去重/展示用：可执行文件路径可能含空格（如 "Google Chrome"），
+        // app_path 仅作展示用：可执行文件路径可能含空格（如 "Google Chrome"），
         // ps 输出又不加重引号，静态层面无法可靠区分"路径内空格"与"参数分隔空格"，
         // 因此这里不强求精确路径——真正的"运行中"判定在 scan_macos_apps 里
         // 靠 bundle_id 匹配（Info.plist 读取，不受空格影响）完成。
         // 取首个 token 作近似路径即可，含空格主程序由 bundle_id 兜底。
         let app_path = args.split_whitespace().next().unwrap_or(args).trim().to_string();
-        if !seen.insert(app_path.clone()) { continue; }
+        // 去重键优先用 bundle_id（更稳定，不受 args 空格截断影响）；
+        // bundle_id 为空（极少见，Info.plist 读不到）才退回 app_path。
+        // 此前用 app_path 去重，含空格的路径被截断到首个 token，
+        // 多个不同进程首 token 相同会被误并为一个，丢失真实运行进程。
+        let dedup_key = if !bundle_id.is_empty() { bundle_id.clone() } else { app_path.clone() };
+        if !seen.insert(dedup_key) { continue; }
         out.push(RunningProcess { app_path, bundle_id });
     }
     out

@@ -9,6 +9,9 @@
     </header>
     <section class="panel ssh-panel">
       <div class="ssh-form" v-if="!connected">
+        <div v-if="nodeServer" class="muted" style="margin-bottom: 12px; padding: 8px 12px; background: var(--bg-soft, #f5f5f5); border-radius: 6px;">
+          已从代理节点「{{ nodeServer.name }}」自动匹配服务器: <b class="mono">{{ nodeServer.server }}</b>（SSH 与代理是同一台机器，主机已自动填入）
+        </div>
         <div class="field"><label>主机</label><input v-model="form.host" placeholder="例: 203.0.113.10" /></div>
         <div class="field"><label>端口</label><input v-model.number="form.port" type="number" /></div>
         <div class="field"><label>用户名</label><input v-model="form.user" /></div>
@@ -27,7 +30,7 @@
   </div>
 </template>
 <script setup>
-import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue';
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
@@ -45,7 +48,8 @@ const props = defineProps({ config: Object });
 const emit = defineEmits(['saved']);
 const termEl = ref(null);
 const connected = ref(false);
-let term, fit, timer, decoder = new TextDecoder();
+const connecting = ref(false);
+let term, fit, timer, inputTimer, decoder = new TextDecoder();
 const form = ref({
   host: props.config?.sshHost || '',
   port: props.config?.sshPort || 22,
@@ -54,9 +58,24 @@ const form = ref({
   password: props.config?.sshPassword || '',
   key: props.config?.sshPrivateKey || '',
 });
+// dirty：用户开始编辑 form 后置 true，之后 props.config 的变化不再覆盖 form。
+// 防止 App.vue 每 5 秒 refresh() 替换 config 引用触发 watch，把用户正在输入的
+// host/port/user/password/key 重置回旧值（immediate 同步在 dirty 置 true 之前完成）。
+const dirty = ref(false);
+// 从选中的代理节点自动推导 SSH 主机：用户的代理节点就部署在云服务器上，
+// SSH 和代理是同一台机器，不需要在两个地方填同一台服务器地址。
+const nodeServer = computed(() => {
+  const selected = props.config?.selectedNode;
+  if (!selected || !props.config?.nodes) return null;
+  const node = props.config.nodes.find(n => n.name === selected);
+  return node ? { name: node.name, server: node.server } : null;
+});
+watch(form, () => { dirty.value = true; }, { deep: true });
 watch(() => props.config, c => {
-  if (!c) return;
-  form.value.host = c.sshHost || form.value.host;
+  if (!c || dirty.value) return;
+  // 主机优先从选中的代理节点推导，其次旧配置，最后保留当前值
+  const ns = c.nodes?.find(n => n.name === c.selectedNode)?.server;
+  form.value.host = ns || c.sshHost || form.value.host;
   form.value.port = c.sshPort || form.value.port;
   form.value.user = c.sshUser || form.value.user;
   form.value.auth = c.sshAuth || form.value.auth;
@@ -73,7 +92,7 @@ onMounted(async () => {
   term.writeln('输入连接信息后点击“连接”。');
   // 输入缓冲：合并 30ms 内的按键，避免每次击键都发一次 IPC
   let inputBuf = '';
-  let inputTimer = null;
+  inputTimer = null;
   term.onData(d => {
     if (!connected.value) return;
     inputBuf += d;
@@ -95,7 +114,7 @@ async function poll() {
     if (data && data.length) term.write(decoder.decode(new Uint8Array(data)));
   } catch (e) {
     connected.value = false;
-    term.writeln('\\r\\n连接已断开: ' + e);
+    term.writeln('\r\n连接已断开: ' + e);
   }
 }
 async function runQuickCommand(command) {
@@ -103,10 +122,13 @@ async function runQuickCommand(command) {
   try {
     await invoke('ssh_write', { data: Array.from(new TextEncoder().encode(command)) });
   } catch (e) {
-    term.writeln('\\r\\n命令发送失败: ' + e);
+    term.writeln('\r\n命令发送失败: ' + e);
   }
 }
 async function connect() {
+  if (connecting.value) return;
+  connecting.value = true;
+  term.writeln('正在连接并验证登录（最多约 12 秒）…');
   try {
     await invoke('ssh_connect', {
       host: form.value.host, port: form.value.port, user: form.value.user,
@@ -117,7 +139,8 @@ async function connect() {
       sshPort: form.value.port,
       sshUser: form.value.user,
       sshAuth: form.value.auth,
-      sshPassword: form.value.password || null,
+      // 密码只进 Keychain（后端验证通过后存储），绝不进 config——否则下次任意保存会明文落盘
+      sshPassword: null,
       sshPrivateKey: form.value.key || null,
     });
     connected.value = true;
@@ -125,19 +148,24 @@ async function connect() {
     term.writeln('已连接。');
   } catch (e) {
     term.writeln('\r\n连接失败: ' + e);
+  } finally {
+    connecting.value = false;
   }
 }
 async function disconnect() {
   try {
     await invoke('ssh_disconnect');
+    connected.value = false;
+    term.writeln('\r\n已断开。');
   } catch (e) {
     term.writeln('\r\n断开失败: ' + e);
   }
-  connected.value = false;
-  term.writeln('\r\n已断开。');
 }
 onUnmounted(async () => {
   clearInterval(timer);
+  clearTimeout(inputTimer);
   if (connected.value) await invoke('ssh_disconnect').catch(() => {});
+  // xterm Terminal 实例必须 dispose，否则切换页面后其内部定时器与 DOM 监听泄漏
+  if (term) { term.dispose(); term = null; }
 });
 </script>

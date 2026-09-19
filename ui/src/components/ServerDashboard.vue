@@ -15,10 +15,10 @@
     <section v-if="!hasServer" class="panel">
       <div class="panel-head"><h2>尚未配置云服务器</h2></div>
       <p class="muted">
-        先到「云服务器」页添加 SSH 连接（host / 端口 / 用户名 / 密码），
-        之后这里就能实时显示服务器的 CPU、内存、磁盘、网络状态。
+        添加代理节点后，SSH 主机会自动从节点匹配（代理和 SSH 是同一台服务器）。
+        请到「服务器控制台」配置 SSH 用户名和密码/私钥，之后这里就能实时显示服务器状态。
       </p>
-      <button class="btn primary" @click="$emit('goto-servers')">去配置云服务器</button>
+      <button class="btn primary" @click="$emit('goto-servers')">去配置 SSH 凭据</button>
     </section>
 
     <template v-else>
@@ -74,7 +74,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue';
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from '../toast.js';
 
@@ -88,7 +88,12 @@ const lastProbe = ref('');
 
 const hasServer = computed(() => {
   const s = props.config?.servers || [];
-  return s.length > 0 || props.config?.sshHost;
+  if (s.length > 0 || props.config?.sshHost) return true;
+  // 没有显式 SSH 配置时，如果有选中的代理节点，后端会自动推导 SSH 主机
+  // （代理节点就部署在云服务器上，SSH 和代理是同一台机器）
+  const selected = props.config?.selectedNode;
+  const nodes = props.config?.nodes || [];
+  return !!(selected && nodes.some(n => n.name === selected));
 });
 
 const netInterfaces = computed(() => {
@@ -144,6 +149,15 @@ onMounted(() => {
   if (hasServer.value) {
     probe();
     timer = setInterval(probe, 10000); // 每 10 秒自动刷新
+  }
+});
+// 修复：App.vue config 初始为 null，refresh 异步加载完成前 hasServer=false，
+// onMounted 不启动 probe/timer。config 加载后 hasServer 变 true 但 onMounted 已执行过，
+// 定时器永不启动——UI 显示仪表盘却无数据。watch 补偿：hasServer 变 true 时启动。
+watch(hasServer, v => {
+  if (v && !timer) {
+    probe();
+    timer = setInterval(probe, 10000);
   }
 });
 onUnmounted(() => clearInterval(timer));

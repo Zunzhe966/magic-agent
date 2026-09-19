@@ -11,6 +11,21 @@
       </div>
       <div v-if="proxyError" class="proxy-error" role="alert">{{ proxyError }}</div>
     </header>
+    <!-- 第三方代理清理：启动魔法代理前，把系统里其他代理全部关掉，回到干净状态 -->
+    <section class="panel" v-if="foreignProxies.length || cleanedNotice">
+      <div class="panel-head">
+        <h2>第三方代理</h2>
+        <button class="btn small" :disabled="cleaning" @click="refreshForeign">{{ cleaning ? '清理中…' : '重新检测' }}</button>
+      </div>
+      <p class="muted" v-if="cleanedNotice">✓ {{ cleanedNotice }}</p>
+      <template v-if="foreignProxies.length">
+        <p class="muted">检测到以下第三方代理正在运行，启动时会自动关闭它们，让系统回到干净状态：</p>
+        <ul class="foreign-list">
+          <li v-for="(p, i) in foreignProxies" :key="i">{{ p }}</li>
+        </ul>
+        <button class="btn primary" :disabled="cleaning" @click="cleanNow">立即清理并恢复干净状态</button>
+      </template>
+    </section>
     <div class="stat-grid">
       <div class="stat-card">
         <div class="stat-label">代理内核</div>
@@ -26,7 +41,7 @@
         <div class="stat-label">系统代理</div>
         <div class="stat-value" :class="{ good: status?.systemProxy }">{{ status?.systemProxy ? '已开启' : '未开启' }}</div>
         <div class="stat-sub">macOS networksetup</div>
-        <button class="btn small" @click="$emit('toggle-system-proxy', !status?.systemProxy)">{{ status?.systemProxy ? '关闭系统代理' : '开启系统代理' }}</button>
+        <button class="btn small" :disabled="proxyBusy" @click="$emit('toggle-system-proxy', !status?.systemProxy)">{{ status?.systemProxy ? '关闭系统代理' : '开启系统代理' }}</button>
       </div>
       <div class="stat-card">
         <div class="stat-label">已识别软件</div>
@@ -57,6 +72,10 @@
   </div>
 </template>
 <script setup>
+import { ref, onMounted } from 'vue';
+import { invoke } from '@tauri-apps/api/core';
+import { toast } from '../toast.js';
+
 const props = defineProps({
   status: Object,
   config: Object,
@@ -64,4 +83,34 @@ const props = defineProps({
   proxyError: String,
 });
 const emit = defineEmits(['start', 'stop', 'toggle-system-proxy']);
+
+// 第三方代理检测与清理
+const foreignProxies = ref([]);
+const cleaning = ref(false);
+const cleanedNotice = ref('');
+
+async function refreshForeign() {
+  try {
+    foreignProxies.value = await invoke('list_foreign_proxies');
+  } catch (e) {
+    console.error('list foreign proxies failed', e);
+  }
+}
+async function cleanNow() {
+  if (cleaning.value) return;
+  cleaning.value = true;
+  try {
+    const cleaned = await invoke('kill_foreign_proxies');
+    cleanedNotice.value = cleaned.length
+      ? `已关闭 ${cleaned.length} 个第三方代理进程，系统代理已恢复为未设置`
+      : '未发现第三方代理，系统代理已恢复为未设置';
+    toast(cleanedNotice.value, 'success');
+    await refreshForeign();
+  } catch (e) {
+    toast('清理失败：' + e, 'error');
+  } finally {
+    cleaning.value = false;
+  }
+}
+onMounted(refreshForeign);
 </script>

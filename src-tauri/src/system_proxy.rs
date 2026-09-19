@@ -47,7 +47,10 @@ pub fn set_system_proxy(enable: bool, port: u16) -> Result<SystemProxyStatus, St
             }
         }
     }
-    if !any_success && !services.is_empty() {
+    if services.is_empty() {
+        return Err("未检测到网络服务，无法设置系统代理".to_string());
+    }
+    if !any_success {
         return Err(format!("设置系统代理失败（可能需要管理员权限或授权）：{}", first_err));
     }
     Ok(SystemProxyStatus { enabled: enable, http_port: port, socks_port: port })

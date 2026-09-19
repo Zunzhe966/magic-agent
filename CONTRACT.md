@@ -8,6 +8,33 @@
 - 分流设计（README 钉死）：系统代理 + 进程级分流；TUN 仅按规则拉「该走代理」的流量（auto-route: false, strict-route: true）；两条死锁端口 7893(无条件 PROXY)/7892(无条件 DIRECT)。
 - 回归基线：`cd src-tauri && cargo test` 全绿（含 `generated_conf_is_valid_mihomo_yaml` 用 `mihomo -t` 真校验配置）。
 
+## 发版流程铁律（2026-09-19 起，**这是唯一正确的发布方式**）
+
+**禁止手工 `cp` 覆盖 `/Applications` 来"发版"。** 必须走 `scripts/release.sh`：
+
+```bash
+cd "/Volumes/A区/魔法代理" && bash scripts/release.sh <版本号>
+```
+
+它做三件事，缺一不可：
+1. 同步三处版本号（`tauri.conf.json` / `Cargo.toml` / `ui/package.json`）——必须始终一致。
+2. 构建 + 用 `~/.tauri/magic-agent.key` 签名，产出 `尊者魔法代理.app.tar.gz` + `.sig`。
+3. 生成 `scripts/updater-feed/latest.json`（updater 更新源）。
+
+App 已内置 updater（`tauri.conf.json` → `plugins.updater.active=true`，endpoint `http://127.0.0.1:7878/latest.json`，`App.vue::checkForUpdateQuiet` 启动时静默检查）。**升级用户走自动更新，不重新下载安装包。**
+
+本地更新源：`cd scripts/updater-feed && python3 -m http.server 7878 --bind 127.0.0.1`。
+
+**改代码后的完整闭环**：改代码 → `cargo test` 全绿 → `release.sh <新版本>` → 部署验证 → `git commit`。三处版本号 + latest.json 版本必须指向同一版本。
+
+## 2026-09-19 变更（v0.2.2）
+
+- **启动即清理第三方代理**：App 启动 800ms 后 + `start_proxy` 时，自动杀第三方代理进程（FlClash/Clash Verge/ClashX/V2Ray/Xray/Surge/sing-box 等）并关闭系统代理，让系统回到干净状态后再启动本程序代理。实现：`lib.rs::cleanup_foreign_proxies/find_foreign_proxies`，前端 `Dashboard.vue` 面板 + `kill_foreign_proxies/list_foreign_proxies` 命令。
+  - **铁律**：只匹配可执行文件路径，**绝不匹配整个命令行**（否则 grep/编辑器里含 "clash" 字样会被误杀）；绝不匹配宽泛的 "proxy"/"mihomo"；跳过自身进程及 runtime 目录下自己的内核。
+- **`start_proxy` 不再因端口冲突拒绝启动**，改为先清理再启动。
+- **卡顿修复**：`apps.rs::scan_network_connections` 的 `lsof` 加 2.5s 硬超时；`App.vue::onMounted` 的 `refreshApps()` 改后台异步（不 await），首屏只拉轻量状态+配置。
+- **MCP server**：`_active_server()` 增加从选中代理节点推导 SSH 主机（与 Rust 端 `config.rs::active_server` 对齐）；`ssh_exec` 密码分支 expect 脚本结尾加 `set rc [lindex [wait] 3]; exit $rc` 透传远端退出码。
+
 ## 2026-09-03 事故与修复（v0.1.1）
 
 事故：App 关闭后 root mihomo 成为孤儿进程，以 TUN + 8 条切分路由接管全机流量，DIRECT 出站一天 1500+ 次 dial i/o timeout，WorkBuddy 等应用流量被劫持（ECONNRESET/502）。当日已手动处置：杀内核、清路由、MCP 自启项改名 .disabled。

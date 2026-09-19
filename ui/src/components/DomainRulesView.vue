@@ -32,14 +32,27 @@
   </div>
 </template>
 <script setup>
-import { ref, watch } from 'vue';
+import { ref, watch, nextTick } from 'vue';
 const props = defineProps({ config: Object });
 const emit = defineEmits(['update']);
 const rules = ref((props.config?.domainRules || []).map(r => ({ ...r })));
 const savedTip = ref('');
+// dirty：用户编辑过 rules 后置 true，防止 App.vue 5 秒轮询 refresh() 替换 config
+// 触发 watch 覆盖用户正在编辑但尚未保存的域名规则
+const dirty = ref(false);
+// ignoreWatch：save() 用规范化后的 list 替换 rules 会触发 rules 的 deep watch，
+// 而 watch 的回调（flush:'pre' microtask）在 dirty.value=false 之后才执行，
+// 会把 dirty 重置回 true——导致 save_config 失败时 config watch 因 dirty=true
+// 直接 return，rules 不回滚，UI 显示"已保存"但后端仍是旧值。
+// save() 内置 ignoreWatch=true 阻止这一次 watch 回调，nextTick 后恢复。
+const ignoreWatch = ref(false);
+watch(rules, () => {
+  if (ignoreWatch.value) return;
+  dirty.value = true;
+}, { deep: true });
 watch(() => props.config?.domainRules, v => {
+  if (!v || dirty.value) return;
   rules.value = (v || []).map(r => ({ ...r }));
-  savedTip.value = '';
 });
 function normalizeDomain(d) {
   let s = (d || '').trim().toLowerCase();
@@ -61,7 +74,16 @@ function save() {
     seen.add(domain);
     list.push({ domain, target: r.target, reason: (r.reason || '').trim() });
   }
+  // 用规范化后的 list 替换本地 rules，让 UI 立即反映去重/normalize 后的状态，
+  // 同时把 dirty 置回 false——下一次后端或外部更新 domainRules 时，
+  // watch 才能把新值同步进来（dirty=true 会阻塞 watch）。
+  // ignoreWatch 阻止 rules 替换触发的 deep watch 把 dirty 重置回 true。
+  ignoreWatch.value = true;
+  rules.value = list.map(r => ({ ...r }));
+  dirty.value = false;
+  nextTick(() => { ignoreWatch.value = false; });
   emit('update', { domainRules: list });
   savedTip.value = '已保存 ' + list.length + ' 条规则';
+  setTimeout(() => { savedTip.value = ''; }, 5000);
 }
 </script>

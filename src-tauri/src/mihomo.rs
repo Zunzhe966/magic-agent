@@ -432,10 +432,13 @@ impl MihomoManager {
         self.bin_path()
     }
 
-    /// 等待控制 API 端口就绪，最多 15 秒
-    fn wait_api(&self) -> bool {
+    /// 等待控制 API 端口（API_PORT=19091）就绪，最多 15 秒。
+    /// 注意：必须等 API_PORT 而非混合端口 self.port——ctl("start") 返回后，
+    /// 混合端口可能先于控制 API 开放；若只等 self.port 就判定就绪，
+    /// 紧接着的 proxy_api 调用会连不上 19091 而失败。
+    pub fn wait_api(&self) -> bool {
         for _ in 0..150 {
-            if std::net::TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
+            if std::net::TcpStream::connect(("127.0.0.1", API_PORT)).is_ok() {
                 return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -540,7 +543,9 @@ impl MihomoManager {
         out.push_str("external-controller: 127.0.0.1:19091\n");
         // 控制 API 鉴权：本机任意进程/网页 CSRF 都可能打这个端口，必须带 secret
         if let Some(s) = cfg.api_secret.as_deref().filter(|s| !s.is_empty()) {
-            out.push_str(&format!("secret: {}\n", s));
+            // 用 yaml_quote 包裹：secret 正常是 hex，但用户可能手改 config.json
+            // 填入含冒号/空格/特殊字符的值，裸写会破坏 YAML 结构。
+            out.push_str(&format!("secret: \"{}\"\n", yaml_quote(s)));
         }
         out.push_str("geo-auto-update: false\n");
         out.push_str("geodata-mode: false\n");

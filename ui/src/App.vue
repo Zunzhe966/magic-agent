@@ -30,12 +30,16 @@
       <DomainRulesView v-else-if="view === 'domain-rules'" :config="config" @update="saveConfig" />
       <ConnectionsView v-else-if="view === 'connections'" :config="config" />
       <SshView v-else-if="view === 'ssh'" :config="config" @saved="onSshSaved" />
+      <SettingsView v-else-if="view === 'settings'" ref="settingsView" />
     </main>
   </div>
 </template>
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
+import { check } from '@tauri-apps/plugin-updater';
+import { ask } from '@tauri-apps/plugin-dialog';
+import { relaunch } from '@tauri-apps/plugin-process';
 import { toast } from './toast.js';
 import Dashboard from './components/Dashboard.vue';
 import AppsView from './components/AppsView.vue';
@@ -44,6 +48,9 @@ import ServerDashboard from './components/ServerDashboard.vue';
 import DomainRulesView from './components/DomainRulesView.vue';
 import ConnectionsView from './components/ConnectionsView.vue';
 import SshView from './components/SshView.vue';
+import SettingsView from './components/SettingsView.vue';
+
+const settingsView = ref(null);
 
 const view = ref('dashboard');
 const status = ref(null);
@@ -59,6 +66,7 @@ const navs = [
   { id: 'servers', label: '云服务器', icon: '⛁' },
   { id: 'server-dashboard', label: '服务器仪表盘', icon: '▤' },
   { id: 'ssh', label: '控制台', icon: '❯' },
+  { id: 'settings', label: '设置', icon: '⚙' },
 ];
 
 async function refresh() {
@@ -73,7 +81,19 @@ async function refresh() {
 }
 async function refreshApps() {
   try {
-    apps.value = await invoke('scan_apps');
+    const fresh = await invoke('scan_apps');
+    // 只刷新运行状态，保留用户正在编辑但尚未保存的 mode/node/confirmed，
+    // 避免 5 秒轮询把用户刚切换的下拉框值冲回旧值
+    const byId = new Map(apps.value.map(a => [a.id, a]));
+    apps.value = fresh.map(f => {
+      const old = byId.get(f.id);
+      if (old) {
+        f.mode = old.mode;
+        f.node = old.node;
+        f.confirmed = old.confirmed;
+      }
+      return f;
+    });
   } catch (e) {
     console.error('scan apps failed', e);
   }
@@ -126,13 +146,23 @@ async function applyApps(list) {
     confirmed: a.mode === 'proxy' || prevConfirmed.has(a.id),
     node: a.node || null,
   }));
-  await invoke('save_config', { config: config.value });
+  try {
+    await invoke('save_config', { config: config.value });
+    toast('已保存并应用分流规则');
+  } catch (e) {
+    toast('保存失败：' + e, 'error');
+  }
   await refresh();
 }
 async function saveConfig(patch) {
   if (!config.value) return;
   config.value = { ...config.value, ...patch };
-  await invoke('save_config', { config: config.value });
+  try {
+    await invoke('save_config', { config: config.value });
+  } catch (e) {
+    // 后端返回 Err（如规则热更新失败）必须让用户看到，否则用户以为已保存
+    toast('保存失败：' + e, 'error');
+  }
   await refresh();
 }
 function onSshSaved(next) {
@@ -165,15 +195,39 @@ async function deleteSshServer(serverId) {
     toast('删除服务器失败：' + e, 'error');
   }
 }
+// 启动时静默检查更新：有新版弹原生对话框，用户确认后下载安装+重启
+// 失败静默吞掉，不打扰用户；手动检查走设置页 SettingsView 自己的 UI 流程
+async function checkForUpdateQuiet() {
+  try {
+    const update = await check();
+    if (!update) return;
+    const ok = await ask(
+      `发现新版本 v${update.version}，立即更新？`,
+      { title: '软件更新', kind: 'info' }
+    );
+    if (!ok) return;
+    toast('正在下载更新…');
+    await update.downloadAndInstall();
+    toast('更新已安装，即将重启…');
+    await relaunch();
+  } catch (e) {
+    console.error('update check failed', e);
+  }
+}
+
 onMounted(async () => {
+  // 先只拉轻量数据（状态+配置），让界面立刻可用可点击。
+  // scan_apps 是重操作（扫全盘 App + lsof 全机连接），绝不阻塞首屏交互。
   await refresh();
-  // App 扫描只加载一次，之后用户手动点"重新扫描"才刷新
-  await refreshApps();
+  // App 扫描放后台异步跑，不 await：用户点导航/按钮时不会被扫描卡住
+  refreshApps();
   // 定时器只做轻量状态轮询；只有停留在软件分流页时才刷新 App 运行状态
   timer = setInterval(() => {
     refresh();
     if (view.value === 'apps') refreshApps();
   }, 5000);
+  // 启动静默检查更新（不打扰，失败静默吞掉）
+  checkForUpdateQuiet();
 });
 onUnmounted(() => clearInterval(timer));
 </script>

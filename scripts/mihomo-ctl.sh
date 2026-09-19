@@ -18,10 +18,15 @@ ERR="$RUNTIME/mihomo.err.log"
 PATTERN='magic-agent/runtime/bin/mihomo'
 
 ensure_bin() {
-  SRC='/Applications/魔法代理.app/Contents/Resources/bin/mihomo'
+  # App 安装名可能是「尊者魔法代理.app」或「魔法代理.app」，逐个探测（曾写死后者导致找不到）
+  SRC=''
+  for c in "/Applications/尊者魔法代理.app/Contents/Resources/bin/mihomo" \
+           "/Applications/魔法代理.app/Contents/Resources/bin/mihomo"; do
+    if [ -f "$c" ]; then SRC="$c"; break; fi
+  done
   if [ ! -f "$BIN" ]; then
     mkdir -p "$RUNTIME/bin"
-    if [ -f "$SRC" ]; then cp "$SRC" "$BIN"; fi
+    if [ -n "$SRC" ]; then cp "$SRC" "$BIN"; fi
     chmod 755 "$BIN" 2>/dev/null
   fi
 }

@@ -140,7 +140,15 @@ impl AppConfig {
             return Some(s.clone());
         }
         // 旧字段兼容
-        let host = self.ssh_host.clone()?;
+        let host = self.ssh_host.clone()
+            .or_else(|| {
+                // SSH 主机未配置时，从选中的代理节点推导——
+                // 用户的代理节点就部署在云服务器上，SSH 和代理是同一台机器，
+                // 不再要求用户在 SSH 页面重新填一遍服务器地址。
+                let selected = self.selected_node.as_ref()?;
+                let node = self.nodes.iter().find(|n| &n.name == selected)?;
+                Some(node.server.clone())
+            })?;
         Some(ServerInfo {
             id: format!("ssh-{}", host),
             name: host.clone(),
@@ -222,13 +230,15 @@ pub fn save(cfg: &AppConfig) -> Result<(), String> {
     let tmp = p.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
-    // 配置含 apiSecret 与节点密钥，收紧为仅当前用户可读写
+    // 配置含 apiSecret 与节点 UUID/公钥，必须收紧为 0600。
+    // 关键：chmod 必须在 rename 之前——若先 rename 再 chmod，rename 完成到
+    // chmod 执行之间会有一个可被其他用户读取 secret 的短窗口（tmp 默认 0644）。
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
+    std::fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -436,15 +446,23 @@ pub fn guess_region(name: &str) -> String {
 
 /// 简易 URL 百分号解码（%XX）
 fn url_decode(s: &str) -> String {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        // 只按字节判断，绝不切片 str：
+        // 旧实现 `&s[i+1..i+2]` 在 "%" 后随多字节 UTF-8（如 "%中"）时会按字节切进
+        // 字符内部，直接 panic——畸形订阅链接即可让 App 崩溃。
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Ok(h), Ok(l)) = (
-                u8::from_str_radix(&s[i + 1..i + 2], 16),
-                u8::from_str_radix(&s[i + 2..i + 3], 16),
-            ) {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
                 out.push(h * 16 + l);
                 i += 3;
                 continue;
@@ -460,6 +478,17 @@ fn url_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_decode_never_panics_on_multibyte() {
+        // 回归："%" 后随多字节 UTF-8 曾按字节切 str 直接 panic
+        assert_eq!(url_decode("%中"), "%中");
+        assert_eq!(url_decode("%E4%B8%AD"), "中");
+        assert_eq!(url_decode("%4"), "%4");
+        assert_eq!(url_decode("100%"), "100%");
+        assert_eq!(url_decode("%41%42"), "AB");
+        assert_eq!(url_decode("%zz"), "%zz");
+    }
 
     #[test]
     fn validate_public_host_blocks_private() {
@@ -541,5 +570,85 @@ mod tests {
         assert_eq!(s.port, 22022);
         assert_eq!(s.auth, "key");
         assert_eq!(s.key_path.as_deref(), Some("~/.ssh/example_ed25519"));
+    }
+
+    #[test]
+    fn active_server_derives_from_selected_node() {
+        // 没有显式 SSH 配置（servers 空、sshHost 空）时，
+        // active_server 应从选中的代理节点推导 SSH 主机地址。
+        let cfg = AppConfig {
+            nodes: vec![ProxyNode {
+                name: "示例节点".into(),
+                server: "1.1.1.1".into(),
+                port: 443,
+                uuid: "test-uuid".into(),
+                flow: "xtls-rprx-vision".into(),
+                network: "tcp".into(),
+                tls: true,
+                udp: true,
+                fingerprint: "chrome".into(),
+                public_key: "pk".into(),
+                short_id: "sid".into(),
+                sni: String::new(),
+                source: "manual".into(),
+                region: String::new(),
+            }],
+            selected_node: Some("示例节点".into()),
+            servers: vec![],
+            ssh_host: None,
+            ssh_port: Some(22022),
+            ssh_user: Some("root".into()),
+            ssh_auth: Some("key".into()),
+            ssh_private_key: Some("~/.ssh/example_ed25519".into()),
+            ..Default::default()
+        };
+        let s = cfg.active_server().expect("active_server 应从节点推导");
+        // 主机应等于节点的 server，不是 None
+        assert_eq!(s.host, "1.1.1.1");
+        // SSH 端口来自 sshPort（与代理端口 443 不同）
+        assert_eq!(s.port, 22022);
+        assert_eq!(s.user, "root");
+        assert_eq!(s.auth, "key");
+    }
+
+    #[test]
+    fn active_server_prefers_explicit_over_node() {
+        // 有显式 servers 配置时，优先用 servers，不从节点推导
+        let cfg = AppConfig {
+            nodes: vec![ProxyNode {
+                name: "node-a".into(),
+                server: "1.2.3.4".into(),
+                port: 443,
+                uuid: "u".into(),
+                flow: "xtls-rprx-vision".into(),
+                network: "tcp".into(),
+                tls: true,
+                udp: true,
+                fingerprint: "chrome".into(),
+                public_key: "pk".into(),
+                short_id: "sid".into(),
+                sni: String::new(),
+                source: "manual".into(),
+                region: String::new(),
+            }],
+            selected_node: Some("node-a".into()),
+            servers: vec![ServerInfo {
+                id: "explicit-server".into(),
+                name: "显式配置".into(),
+                host: "5.6.7.8".into(),
+                port: 22,
+                user: "admin".into(),
+                auth: "password".into(),
+                password_saved: true,
+                private_key_saved: false,
+                key_path: None,
+            }],
+            active_server_id: Some("explicit-server".into()),
+            ..Default::default()
+        };
+        let s = cfg.active_server().expect("active_server 应返回显式配置");
+        // 应该用显式配置的 5.6.7.8，不是节点的 1.2.3.4
+        assert_eq!(s.host, "5.6.7.8");
+        assert_eq!(s.user, "admin");
     }
 }
