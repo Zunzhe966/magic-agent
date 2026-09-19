@@ -20,6 +20,7 @@
 | v0.2.0 | 2026-08-31 | `v0.2.0` | `154083a` | 云服务器管理与双路探测 |
 | v0.1.1 | 2026-09-03 | `v0.1.1` | `2e7aa82` | 修复 mihomo 孤儿进程劫持全机流量事故 |
 | v0.2.2 | 2026-09-19 | `v0.2.2` | `45ac703` | 启动即清理第三方代理 + 卡顿修复 + 规范发版流程 |
+| v0.2.3 | 2026-09-19 | `v0.2.3` | `f9a0a50` | 全部慢命令 async 化，根治点仪表盘彩色转圈 |
 
 > 版本号以 `tauri.conf.json` 为准。v0.2.1 只改过内部版本号、未单独发版。
 
@@ -124,6 +125,24 @@
 
 **想法变化**：文档从"散落多份、有重复"收敛为"**少数权威文档**"——README（用法）、CONTRACT（红线）、HISTORY（历史）、docs/设计（设计）、docs/免费模型（模型数据）。
 
+### 2026-09-19 · v0.2.3 根治仪表盘卡顿
+
+| 提交 | 类型 | 做了什么 |
+|------|------|----------|
+| `f9a0a50` | fix/perf | 全部慢命令 async 化，点仪表盘不再彩色转圈 |
+
+**根因**：Tauri 的 `#[tauri::command]` 默认**同步命令跑在主线程**。点「云服务器仪表盘」触发 `server_metrics`，它内部做 SSH 连接 + 执行命令（最长 20s 超时），阻塞了主线程 → macOS 出彩色转圈（应用无响应）。同类命令还有 `lsof` 全机扫描、`ps` 扫描、`networksetup` 改系统代理等。
+
+**修复**：把 13 个慢命令全部改为 `async fn` + `tauri::async_runtime::spawn_blocking`，阻塞 IO 挪到线程池，主线程只负责界面：
+`server_metrics`、`ssh_exec`、`ssh_connect`、`fetch_subscription`、`start_proxy`、`stop_proxy`、`set_system_proxy`、`save_config`、`scan_apps`、`proxy_api`、`check_conflicts`、`kill_foreign_proxies`、`list_foreign_proxies`。
+
+**配套改动**：
+- `SshManager` 改 `#[derive(Clone)]` + 内部字段全 `Arc<Mutex<..>>`，支持 `ssh_connect` 跨线程共享同一会话
+- `effective_app_rules_with` 复用 `apps_cache`，保存配置/启动代理时不再全盘扫描 App
+- 前端首屏只 `await refresh()`，`scan_apps` 改后台异步，不再阻塞首屏
+
+**想法变化**：性能问题不能靠"少点几下"绕过——**凡是可能阻塞主线程的 IO，一律 async + spawn_blocking**。这条已作为架构红线写进 `CONTRACT.md`。
+
 ---
 
 ## 各版本「增 / 删」总表
@@ -139,6 +158,7 @@
 | v0.2.0 | 云服务器管理、双路探测、新图标/更名 | — |
 | v0.1.1 | 退出清理钩子、提权兜底 | 孤儿内核隐患 |
 | v0.2.2 | 第三方代理清理、卡顿修复、release.sh 流程、看门狗 | 老的"拒绝启动"逻辑、手工 cp 流程 |
+| v0.2.3 | 13 个慢命令 async 化、SshManager 可 Clone、apps_cache 复用 | 同步命令阻塞主线程的写法 |
 | 文档整理 | docs/设计.md、docs/免费模型.md | 3 份旧产品文档、2 份旧模型文档、过期计划 |
 
 ---

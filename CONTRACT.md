@@ -27,6 +27,16 @@ App 已内置 updater（`tauri.conf.json` → `plugins.updater.active=true`，en
 
 **改代码后的完整闭环**：改代码 → `cargo test` 全绿 → `release.sh <新版本>` → 部署验证 → `git commit`。三处版本号 + latest.json 版本必须指向同一版本。
 
+## 2026-09-19 变更（v0.2.3）
+
+- **架构红线：凡是可能阻塞的 IO，一律 `async fn` + `tauri::async_runtime::spawn_blocking`。**
+  - 原因：Tauri 的 `#[tauri::command]` 默认**同步执行在主线程**，任何 SSH 连接、`lsof`/`ps` 扫描、`networksetup`、`curl` 都会冻住整个 UI → macOS 彩色转圈（应用无响应）。
+  - 反面教材：点「云服务器仪表盘」触发 `server_metrics`（内部 SSH 最长 20s），界面直接卡死。
+- 已 async 化的命令（改回同步 = 重演卡顿）：`server_metrics`、`ssh_exec`、`ssh_connect`、`fetch_subscription`、`start_proxy`、`stop_proxy`、`set_system_proxy`、`save_config`、`scan_apps`、`proxy_api`、`check_conflicts`、`kill_foreign_proxies`、`list_foreign_proxies`。
+  - 注意：async 命令**必须返回 `Result`**（Tauri 硬性要求），如 `scan_apps -> Result<Vec<AppEntry>, String>`。
+- `SshManager` 已 `#[derive(Clone)]` + 内部字段全 `Arc<Mutex<..>>`：跨线程共享同一 SSH 会话。取共享实例用 `ssh.inner().clone()`（`State` Deref），不要用 `(*ssh).clone()`。
+- `effective_app_rules_with(config, cached)` 复用 `apps_cache`，保存配置/启动代理时不再全盘扫描 App；`effective_app_rules(config)` 保留为无缓存便捷入口。
+
 ## 2026-09-19 变更（v0.2.2）
 
 - **启动即清理第三方代理**：App 启动 800ms 后 + `start_proxy` 时，自动杀第三方代理进程（FlClash/Clash Verge/ClashX/V2Ray/Xray/Surge/sing-box 等）并关闭系统代理，让系统回到干净状态后再启动本程序代理。实现：`lib.rs::cleanup_foreign_proxies/find_foreign_proxies`，前端 `Dashboard.vue` 面板 + `kill_foreign_proxies/list_foreign_proxies` 命令。
