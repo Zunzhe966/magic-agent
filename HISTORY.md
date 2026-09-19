@@ -21,6 +21,7 @@
 | v0.1.1 | 2026-09-03 | `v0.1.1` | `2e7aa82` | 修复 mihomo 孤儿进程劫持全机流量事故 |
 | v0.2.2 | 2026-09-19 | `v0.2.2` | `45ac703` | 启动即清理第三方代理 + 卡顿修复 + 规范发版流程 |
 | v0.2.3 | 2026-09-19 | `v0.2.3` | `f9a0a50` | 全部慢命令 async 化，根治点仪表盘彩色转圈 |
+| v0.2.4 | 2026-09-19 | `v0.2.4` | `56e02ee` | get_status 也 async 化，根治 5 秒轮询卡顿 |
 
 > 版本号以 `tauri.conf.json` 为准。v0.2.1 只改过内部版本号、未单独发版。
 
@@ -143,6 +144,24 @@
 
 **想法变化**：性能问题不能靠"少点几下"绕过——**凡是可能阻塞主线程的 IO，一律 async + spawn_blocking**。这条已作为架构红线写进 `CONTRACT.md`。
 
+### 2026-09-19 · v0.2.4 清掉最后一个主线程阻塞源
+
+| 提交 | 类型 | 做了什么 |
+|------|------|----------|
+| `56e02ee` | fix/perf | `get_status` 也 async 化；`MihomoManager` 改可 Clone |
+
+**根因**：`get_status` 是**同步命令**（跑主线程），被前端**每 5 秒轮询一次**。它内部做两件慢事：
+1. `mihomo.status()` → 对混合端口 + 控制 API 各做一次 `TcpStream::connect`（端口被防火墙 DROP 时会阻塞到超时）
+2. `system_proxy::status()` → fork 子进程跑 `scutil --proxy`
+
+这解释了用户"点服务器时转一下彩色圈"里除了 SSH 探针之外的**第二个卡顿源**——界面 5 秒一次的周期性微顿。
+
+**修复**：
+- `get_status` 改 `async fn` + `spawn_blocking`（返回 `Result<AppStatus, String>`），探测全挪到线程池。
+- `MihomoManager` 改 `#[derive(Clone)]` + `pid` 字段改 `Arc<Mutex<Option<u32>>>`：clone 出的是**同一份共享 PID 状态**，实例可 move 进线程池而主线程仍能读到 pid。
+
+**想法变化**：排查卡顿要**顺着"主线程会碰到的所有命令"逐一过筛**，不能只盯用户点的那一个——5 秒轮询的 `get_status` 是隐藏的周期性卡顿源。
+
 ---
 
 ## 各版本「增 / 删」总表
@@ -159,6 +178,7 @@
 | v0.1.1 | 退出清理钩子、提权兜底 | 孤儿内核隐患 |
 | v0.2.2 | 第三方代理清理、卡顿修复、release.sh 流程、看门狗 | 老的"拒绝启动"逻辑、手工 cp 流程 |
 | v0.2.3 | 13 个慢命令 async 化、SshManager 可 Clone、apps_cache 复用 | 同步命令阻塞主线程的写法 |
+| v0.2.4 | get_status async 化、MihomoManager 可 Clone | 5 秒轮询里残留的同步阻塞 |
 | 文档整理 | docs/设计.md、docs/免费模型.md | 3 份旧产品文档、2 份旧模型文档、过期计划 |
 
 ---

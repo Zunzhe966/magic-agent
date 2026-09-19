@@ -32,9 +32,11 @@ App 已内置 updater（`tauri.conf.json` → `plugins.updater.active=true`，en
 - **架构红线：凡是可能阻塞的 IO，一律 `async fn` + `tauri::async_runtime::spawn_blocking`。**
   - 原因：Tauri 的 `#[tauri::command]` 默认**同步执行在主线程**，任何 SSH 连接、`lsof`/`ps` 扫描、`networksetup`、`curl` 都会冻住整个 UI → macOS 彩色转圈（应用无响应）。
   - 反面教材：点「云服务器仪表盘」触发 `server_metrics`（内部 SSH 最长 20s），界面直接卡死。
-- 已 async 化的命令（改回同步 = 重演卡顿）：`server_metrics`、`ssh_exec`、`ssh_connect`、`fetch_subscription`、`start_proxy`、`stop_proxy`、`set_system_proxy`、`save_config`、`scan_apps`、`proxy_api`、`check_conflicts`、`kill_foreign_proxies`、`list_foreign_proxies`。
-  - 注意：async 命令**必须返回 `Result`**（Tauri 硬性要求），如 `scan_apps -> Result<Vec<AppEntry>, String>`。
+- 已 async 化的命令（改回同步 = 重演卡顿）：`get_status`、`server_metrics`、`ssh_exec`、`ssh_connect`、`fetch_subscription`、`start_proxy`、`stop_proxy`、`set_system_proxy`、`save_config`、`scan_apps`、`proxy_api`、`check_conflicts`、`kill_foreign_proxies`、`list_foreign_proxies`。
+  - 特别注意 **`get_status`**：它被前端**每 5 秒轮询**，内部会 `TcpStream::connect` 探端口 + `scutil` 子进程；同步化 = 界面周期性微顿。这类「高频轮询命令」尤其不能阻塞主线程。
+  - 注意：async 命令**必须返回 `Result`**（Tauri 硬性要求），如 `scan_apps -> Result<Vec<AppEntry>, String>`、`get_status -> Result<AppStatus, String>`。
 - `SshManager` 已 `#[derive(Clone)]` + 内部字段全 `Arc<Mutex<..>>`：跨线程共享同一 SSH 会话。取共享实例用 `ssh.inner().clone()`（`State` Deref），不要用 `(*ssh).clone()`。
+- `MihomoManager` 已 `#[derive(Clone)]` + `pid: Arc<Mutex<Option<u32>>>`：clone 出的是同一份共享 PID 状态，实例可 move 进阻塞线程池。
 - `effective_app_rules_with(config, cached)` 复用 `apps_cache`，保存配置/启动代理时不再全盘扫描 App；`effective_app_rules(config)` 保留为无缓存便捷入口。
 
 ## 2026-09-19 变更（v0.2.2）
