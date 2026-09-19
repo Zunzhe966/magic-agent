@@ -16,20 +16,25 @@ pub struct SshSession {
     pub status: String,
 }
 
+/// SSH 会话管理器。
+/// 所有可变字段都用 Arc<Mutex<..>> 包裹 + derive(Clone)，这样 clone 出来的是
+/// 「同一份共享状态」——ssh_connect 可把实例 move 进阻塞线程池，同时主线程的
+/// ssh_write/ssh_read/ssh_disconnect 能操作到同一会话。
+#[derive(Clone)]
 pub struct SshManager {
-    pub child: Mutex<Option<Child>>,
-    pub stdin: Mutex<Option<ChildStdin>>,
+    pub child: Arc<Mutex<Option<Child>>>,
+    pub stdin: Arc<Mutex<Option<ChildStdin>>>,
     pub buffer: Arc<Mutex<Vec<u8>>>,
-    pub session: Mutex<Option<SshSession>>,
+    pub session: Arc<Mutex<Option<SshSession>>>,
 }
 
 impl SshManager {
     pub fn new() -> Self {
         Self {
-            child: Mutex::new(None),
-            stdin: Mutex::new(None),
+            child: Arc::new(Mutex::new(None)),
+            stdin: Arc::new(Mutex::new(None)),
             buffer: Arc::new(Mutex::new(Vec::new())),
-            session: Mutex::new(None),
+            session: Arc::new(Mutex::new(None)),
         }
     }
 

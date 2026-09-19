@@ -184,7 +184,14 @@ fn cleanup_foreign_proxies() -> Vec<String> {
 }
 
 #[tauri::command]
-fn check_conflicts() -> ConflictInfo {
+async fn check_conflicts() -> ConflictInfo {
+    // 内部跑 ps + TCP 连接探测，改 async 避免卡主线程
+    tauri::async_runtime::spawn_blocking(check_conflicts_blocking)
+        .await
+        .unwrap_or(ConflictInfo { has_conflict: false, messages: vec![] })
+}
+
+fn check_conflicts_blocking() -> ConflictInfo {
     let mut messages = Vec::new();
     // 1) 检测正在运行的第三方代理程序（FlClash / Clash / 外部 mihomo）
     let foreign = find_foreign_proxies();
@@ -212,18 +219,32 @@ fn check_conflicts() -> ConflictInfo {
 /// 供前端调用的「一键清理第三方代理」命令：
 /// 杀掉所有第三方代理进程 + 关闭系统代理，把系统恢复到干净状态。
 #[tauri::command]
-fn kill_foreign_proxies() -> Vec<String> {
-    cleanup_foreign_proxies()
+async fn kill_foreign_proxies() -> Vec<String> {
+    // 杀进程含 SIGTERM→等待→SIGKILL，最多约 1.5 秒，改 async 避免卡主线程
+    tauri::async_runtime::spawn_blocking(cleanup_foreign_proxies)
+        .await
+        .unwrap_or_default()
 }
 
 /// 查询当前有哪些第三方代理在运行（供 UI 展示）。
 #[tauri::command]
-fn list_foreign_proxies() -> Vec<String> {
-    find_foreign_proxies().into_iter().map(|(p, l)| format!("{} (PID {})", l, p)).collect()
+async fn list_foreign_proxies() -> Vec<String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        find_foreign_proxies().into_iter().map(|(p, l)| format!("{} (PID {})", l, p)).collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 #[tauri::command]
-fn fetch_subscription(url: String) -> Result<Vec<crate::config::ProxyNode>, String> {
+async fn fetch_subscription(url: String) -> Result<Vec<crate::config::ProxyNode>, String> {
+    // 必须是 async：内部用 curl 拉订阅（最长 15 秒），同步命令会卡死主线程。
+    tauri::async_runtime::spawn_blocking(move || fetch_subscription_blocking(url))
+        .await
+        .map_err(|e| format!("fetch_subscription 线程异常: {e}"))?
+}
+
+fn fetch_subscription_blocking(url: String) -> Result<Vec<crate::config::ProxyNode>, String> {
     // 只允许 http/https，防止 curl 访问 file:// 等本地协议造成敏感信息外泄
     let trimmed = url.trim();
     if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
@@ -300,8 +321,25 @@ fn get_config(state: tauri::State<Arc<Mutex<AppState>>>) -> AppConfig {
 /// method 目前支持 "GET"（默认）与 "PUT"。
 /// 返回 (http_status, body_string)。
 #[tauri::command]
-fn proxy_api(
-    state: tauri::State<Arc<Mutex<AppState>>>,
+async fn proxy_api(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    path: String,
+    method: Option<String>,
+    body: Option<String>,
+) -> Result<(u16, String), String> {
+    // 同步命令会卡主线程：内部是 TCP 直连 mihomo API（read timeout 15s），
+    // 且被前端高频调用（延迟测试/连接列表轮询）。改 async + 线程池。
+    let secret = {
+        let g = state.lock().unwrap();
+        g.config.api_secret.clone().unwrap_or_default()
+    };
+    tauri::async_runtime::spawn_blocking(move || proxy_api_blocking(secret, path, method, body))
+        .await
+        .map_err(|e| format!("proxy_api 线程异常: {e}"))?
+}
+
+fn proxy_api_blocking(
+    secret: String,
     path: String,
     method: Option<String>,
     body: Option<String>,
@@ -320,10 +358,7 @@ fn proxy_api(
     if path.contains('\r') || path.contains('\n') {
         return Err("非法的 API 路径".to_string());
     }
-    let secret = {
-        let g = state.lock().unwrap();
-        g.config.api_secret.clone().unwrap_or_default()
-    };
+    // secret 由 async 包装从 state 读出后传入（见 proxy_api）
     let method = method.unwrap_or_else(|| "GET".to_string()).to_uppercase();
     if method != "GET" && method != "PUT" {
         return Err("不支持的方法".to_string());
@@ -439,12 +474,14 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 #[tauri::command]
-fn save_config(state: tauri::State<Arc<Mutex<AppState>>>, config: AppConfig) -> Result<AppConfig, String> {
-    // 只在读取 secret/运行状态时短暂持锁；热更新要全机扫描 App + lsof（秒级），
-    // 全程持锁会堵死 get_status 轮询，表现为每次保存配置界面卡死数秒。
-    let (api_secret, running) = {
+async fn save_config(state: tauri::State<'_, Arc<Mutex<AppState>>>, config: AppConfig) -> Result<AppConfig, String> {
+    // 同步命令会卡主线程：热更新要调 mihomo API（秒级）。改 async + spawn_blocking。
+    let (api_secret, running, apps_cache) = {
         let g = state.lock().unwrap();
-        (g.config.api_secret.clone(), g.mihomo.status().running)
+        let secret = g.config.api_secret.clone();
+        let running = g.mihomo.status().running;
+        let cache = g.apps_cache.lock().unwrap().clone();
+        (secret, running, cache)
     };
     let mut config = config;
     // 前端拿不到 apiSecret（get_config 已置空），这里必须保留后端持有的原 secret，
@@ -465,11 +502,17 @@ fn save_config(state: tauri::State<Arc<Mutex<AppState>>>, config: AppConfig) -> 
     if config.ssh_private_key.as_deref().map(|k| k.contains('\n')).unwrap_or(false) {
         config.ssh_private_key = None;
     }
-    // 如果代理正在运行，热更新 rules，让新保存的分流/域名规则立即生效（不重启、不弹授权框）
+    // 如果代理正在运行，热更新 rules，让新保存的分流/域名规则立即生效（不重启、不弹授权框）。
+    // 慢操作（规则生成 + mihomo API 调用）放线程池，界面不卡。
     let reload_err = if running {
-        let app_rules = effective_app_rules(&config);
-        let m = MihomoManager::new();
-        m.reload_rules(&config, &app_rules).err()
+        let cfg_for_reload = config.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let app_rules = effective_app_rules_with(&cfg_for_reload, Some(&apps_cache));
+            let m = MihomoManager::new();
+            m.reload_rules(&cfg_for_reload, &app_rules).err()
+        })
+        .await
+        .map_err(|e| format!("save_config 线程异常: {e}"))?
     } else {
         None
     };
@@ -485,28 +528,56 @@ fn save_config(state: tauri::State<Arc<Mutex<AppState>>>, config: AppConfig) -> 
 }
 
 #[tauri::command]
-fn scan_apps(state: tauri::State<Arc<Mutex<AppState>>>) -> Vec<crate::apps::AppEntry> {
-    let mut list = crate::apps::scan_macos_apps();
-    let g = state.lock().unwrap();
-    for app in list.iter_mut() {
-        if let Some(setting) = g.config.apps.iter().find(|s| s.id == app.id) {
-            app.mode = setting.mode.clone();
-            app.confirmed = setting.confirmed;
-            app.node = setting.node.clone();
+async fn scan_apps(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<crate::apps::AppEntry>, String> {
+    // 同步命令会卡主线程：全盘扫描 App + lsof（秒级）。改 async + 线程池。
+    let settings = {
+        let g = state.lock().unwrap();
+        g.config.apps.clone()
+    };
+    let list = tauri::async_runtime::spawn_blocking(move || {
+        let mut list = crate::apps::scan_macos_apps();
+        for app in list.iter_mut() {
+            if let Some(setting) = settings.iter().find(|s| s.id == app.id) {
+                app.mode = setting.mode.clone();
+                app.confirmed = setting.confirmed;
+                app.node = setting.node.clone();
+            }
         }
-    }
-    // 更新缓存，供 get_status 轻量读取数量
-    *g.apps_cache.lock().unwrap() = list.clone();
-    list
+        list
+    })
+    .await
+    .map_err(|e| format!("scan_apps 线程异常: {e}"))?;
+    // 更新缓存，供 get_status 轻量读取数量 / start_proxy 复用
+    state.lock().unwrap().apps_cache.lock().unwrap().clone_from(&list);
+    Ok(list)
 }
 
 /// 生成生效的软件分流规则：只处理用户已确认（confirmed）的条目。
 /// 返回 (路径前缀列表, 目标) 列表；目标 = DIRECT | NODE-<节点名> | PROXY(当前选中节点)。
+///
+/// 性能：优先复用 AppState.apps_cache，避免每次保存配置/启动代理都全盘扫描 App
+/// （scan_macos_apps 含全盘扫描 + lsof，秒级；缓存为空时才回退真扫描）。
 fn effective_app_rules(config: &AppConfig) -> Vec<(Vec<String>, String)> {
-    let apps = crate::apps::scan_macos_apps();
+    effective_app_rules_with(config, None)
+}
+
+/// 带可选缓存版本：cached 为 Some 时直接用（不再扫描）。
+fn effective_app_rules_with(
+    config: &AppConfig,
+    cached: Option<&[crate::apps::AppEntry]>,
+) -> Vec<(Vec<String>, String)> {
     let mut by_id = std::collections::HashMap::new();
-    for a in apps {
-        by_id.insert(a.id, a.rule_paths);
+    match cached {
+        Some(list) if !list.is_empty() => {
+            for a in list {
+                by_id.insert(a.id.clone(), a.rule_paths.clone());
+            }
+        }
+        _ => {
+            for a in crate::apps::scan_macos_apps() {
+                by_id.insert(a.id, a.rule_paths);
+            }
+        }
     }
     // 现存节点名集合：软件分流的 node 引用已删除节点时降级为 PROXY
     let valid_nodes: std::collections::HashSet<String> =
@@ -552,34 +623,41 @@ pub fn settings_to_app_rules(
 }
 
 #[tauri::command]
-fn start_proxy(state: tauri::State<Arc<Mutex<AppState>>>) -> Result<MihomoStatus, String> {
-    // 只在读取配置时短暂持锁；启动本身（停旧进程+等API）可达数十秒，
-    // 全程持锁会卡死 get_status 轮询，表现为界面"按了没反应"。
-    let (cfg, already_running) = {
+async fn start_proxy(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<MihomoStatus, String> {
+    // 同步命令会卡死主线程（启动可达数十秒：停旧进程 + cleanup + 等 API）。
+    // 改为 async + spawn_blocking，主线程立即返回，界面不卡。
+    let (cfg, already_running, apps_cache) = {
         let g = state.lock().unwrap();
-        (g.config.clone(), g.mihomo.status().running)
+        let cfg = g.config.clone();
+        let running = g.mihomo.status().running;
+        let cache = g.apps_cache.lock().unwrap().clone();
+        (cfg, running, cache)
     };
     if already_running {
         let m = MihomoManager::new();
         return Ok(m.status());
     }
-    // 启动前自动清理所有第三方代理：杀掉 FlClash/Clash 等进程 + 关闭系统代理，
-    // 让系统回到「未设代理」的干净状态，再启动本程序的代理。
-    // 这样用户点一次启动就能拿到干净的代理环境，不必手动去关别的软件。
-    // 只清理端口冲突和已知第三方代理；本程序自己的进程和内核会被跳过。
-    cleanup_foreign_proxies();
-    // 无节点时 mihomo 的 fallback 组 proxies 为空，mihomo -t 会拒绝整个配置，
-    // 给出晦涩的 YAML 校验错误。提前拦截，提示用户先加节点。
-    if cfg.nodes.is_empty() {
-        return Err("尚未添加任何代理节点，请先到「云服务器」页添加节点或拉取订阅".to_string());
-    }
-    let app_rules = effective_app_rules(&cfg);
-    let mihomo = MihomoManager::new();
-    let status = mihomo.start(&cfg, &[], &app_rules)?;
-    if cfg.system_proxy {
-        let _ = system_proxy::set_system_proxy(true, mihomo.port);
-    }
-    // 把 PID 记回共享状态（status() 靠端口探测兜底，这里仅保持一致性）
+    // 启动的慢操作整体挪到线程池
+    let status = tauri::async_runtime::spawn_blocking(move || -> Result<MihomoStatus, String> {
+        // 启动前自动清理所有第三方代理：杀掉 FlClash/Clash 等进程 + 关闭系统代理，
+        // 让系统回到「未设代理」的干净状态，再启动本程序的代理。
+        cleanup_foreign_proxies();
+        // 无节点时 mihomo 的 fallback 组 proxies 为空，配置校验会失败且错误晦涩。提前拦截。
+        if cfg.nodes.is_empty() {
+            return Err("尚未添加任何代理节点，请先到「云服务器」页添加节点或拉取订阅".to_string());
+        }
+        // 复用 App 扫描缓存，避免启动时全盘扫描
+        let app_rules = effective_app_rules_with(&cfg, Some(&apps_cache));
+        let mihomo = MihomoManager::new();
+        let status = mihomo.start(&cfg, &[], &app_rules)?;
+        if cfg.system_proxy {
+            let _ = system_proxy::set_system_proxy(true, mihomo.port);
+        }
+        Ok(status)
+    })
+    .await
+    .map_err(|e| format!("start_proxy 线程异常: {e}"))??;
+    // 回到状态（这里只做极短的锁写入）
     if let Some(pid) = status.pid {
         *state.lock().unwrap().mihomo.pid.lock().unwrap() = Some(pid);
     }
@@ -589,23 +667,32 @@ fn start_proxy(state: tauri::State<Arc<Mutex<AppState>>>) -> Result<MihomoStatus
 }
 
 #[tauri::command]
-fn stop_proxy(state: tauri::State<Arc<Mutex<AppState>>>) -> Result<(), String> {
+async fn stop_proxy(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
     // 通知看门狗：用户主动停止，不要自动重启
-    state.lock().unwrap().should_run.store(false, Ordering::Relaxed);
-    let port = state.lock().unwrap().mihomo.port;
-    // 锁外执行停止，避免阻塞状态轮询
-    let mihomo = MihomoManager::new();
-    mihomo.stop();
+    let port = {
+        let g = state.lock().unwrap();
+        g.should_run.store(false, Ordering::Relaxed);
+        g.mihomo.port
+    };
+    // 停进程 + 关系统代理（慢操作）放线程池
+    tauri::async_runtime::spawn_blocking(move || {
+        let mihomo = MihomoManager::new();
+        mihomo.stop();
+        let _ = system_proxy::set_system_proxy(false, port);
+    })
+    .await
+    .map_err(|e| format!("stop_proxy 线程异常: {e}"))?;
     *state.lock().unwrap().mihomo.pid.lock().unwrap() = None;
-    let _ = system_proxy::set_system_proxy(false, port);
     Ok(())
 }
 
 #[tauri::command]
-fn set_system_proxy(state: tauri::State<Arc<Mutex<AppState>>>, enabled: bool) -> Result<crate::system_proxy::SystemProxyStatus, String> {
-    // networksetup 可能耗时，锁外执行避免阻塞状态轮询
+async fn set_system_proxy(state: tauri::State<'_, Arc<Mutex<AppState>>>, enabled: bool) -> Result<crate::system_proxy::SystemProxyStatus, String> {
+    // networksetup 可能耗时数秒，同步命令会卡主线程 → 改 async + spawn_blocking
     let port = state.lock().unwrap().mihomo.port;
-    let status = system_proxy::set_system_proxy(enabled, port)?;
+    let status = tauri::async_runtime::spawn_blocking(move || system_proxy::set_system_proxy(enabled, port))
+        .await
+        .map_err(|e| format!("set_system_proxy 线程异常: {e}"))??;
     // 同步更新并持久化 config.system_proxy，使 UI 开关与 config 一致。
     // 旧实现只调 networksetup 不改 config，导致 UI 开关后 start_proxy 仍按旧 config 判断，
     // 重启后系统代理状态与用户上次选择脱节。
@@ -621,11 +708,17 @@ fn set_system_proxy(state: tauri::State<Arc<Mutex<AppState>>>, enabled: bool) ->
 }
 
 #[tauri::command]
-fn ssh_connect(state: tauri::State<Arc<Mutex<AppState>>>, ssh: tauri::State<crate::ssh::SshManager>, host: String, port: u16, user: String, auth: String, password: Option<String>, key: Option<String>) -> Result<crate::ssh::SshSession, String> {
-    // 连接+认证验证在锁外进行（最长十余秒），全程持锁会卡死状态轮询。
+async fn ssh_connect(state: tauri::State<'_, Arc<Mutex<AppState>>>, ssh: tauri::State<'_, crate::ssh::SshManager>, host: String, port: u16, user: String, auth: String, password: Option<String>, key: Option<String>) -> Result<crate::ssh::SshSession, String> {
+    // 连接+认证验证最长十余秒，同步命令会卡死主线程 → 改 async + spawn_blocking。
     // connect 内部已验证登录结果：认证失败会返回 Err，下面的 Keychain/配置写入不会执行，
     // 错误密码/私钥因此永远不会被存进 Keychain 污染后续连接。
-    let session = ssh.connect(host.clone(), port, user.clone(), auth.clone(), password.clone(), key.clone())?;
+    let session = {
+        let (h, u, a, p, k) = (host.clone(), user.clone(), auth.clone(), password.clone(), key.clone());
+        let ssh: crate::ssh::SshManager = ssh.inner().clone(); // clone 共享内部 Arc 状态
+        tauri::async_runtime::spawn_blocking(move || ssh.connect(h, port, u, a, p, k))
+            .await
+            .map_err(|e| format!("ssh_connect 线程异常: {e}"))??
+    };
 
     // 密码/私钥内容安全存入 Keychain，config 不落明文。
     // 注意：SSH 会话此时已经成功建立（ssh.connect 已通过认证）。
@@ -783,29 +876,40 @@ fn ssh_disconnect(ssh: tauri::State<crate::ssh::SshManager>) -> Result<(), Strin
 
 /// 在「当前激活的云服务器」上非交互式执行一条命令，返回 (stdout, stderr, exit_code)。
 /// 智能体 / 前端仪表盘用来远程探测服务器状态（CPU/内存/磁盘/带宽），不污染交互式终端。
+///
+/// 注意：必须是 async 命令。Tauri 的同步命令运行在主线程上，SSH 建立连接+执行
+/// 最长可达数十秒，会卡死主线程 → macOS 显示"彩色转圈"（应用无响应）。
+/// 这里用 spawn_blocking 把阻塞 IO 挪到线程池，主线程立即返回。
 #[tauri::command]
-fn ssh_exec(state: tauri::State<Arc<Mutex<AppState>>>, command: String, timeout_secs: Option<u64>) -> Result<(String, String, i32), String> {
+async fn ssh_exec(state: tauri::State<'_, Arc<Mutex<AppState>>>, command: String, timeout_secs: Option<u64>) -> Result<(String, String, i32), String> {
     let (host, port, user, auth, key_path) = {
         let g = state.lock().unwrap();
         let s = g.config.active_server().ok_or("尚未配置云服务器：请先在「云服务器」页添加 SSH 连接")?;
         (s.host.clone(), s.port, s.user.clone(), s.auth.clone(), s.key_path.clone())
     };
     let timeout = timeout_secs.unwrap_or(15).clamp(5, 60);
-    // 锁外执行（SSH 可能耗时数秒，避免卡住状态轮询）
-    let ssh = crate::ssh::SshManager::new();
-    ssh.exec(host, port, user, auth, command, timeout, key_path)
+    // 阻塞 IO 放到独立线程，绝不占用主线程
+    tauri::async_runtime::spawn_blocking(move || {
+        let ssh = crate::ssh::SshManager::new();
+        ssh.exec(host, port, user, auth, command, timeout, key_path)
+    })
+    .await
+    .map_err(|e| format!("ssh_exec 线程异常: {e}"))?
 }
 
 /// 云服务器一键探针：采集 CPU、内存、磁盘、网络带宽、负载、在线时长。
 /// 返回结构化 JSON 给前端仪表盘 / 智能体（MCP 也走同一逻辑）。
+///
+/// 注意：必须是 async 命令 + spawn_blocking。同步命令跑在主线程上，这个探针
+/// 会 SSH 连服务器执行命令（最长 20 秒超时），期间主线程被占 → 点仪表盘时
+/// macOS 显示"彩色转圈"（应用无响应）。挪到线程池后交互不再卡顿。
 #[tauri::command]
-fn server_metrics(state: tauri::State<Arc<Mutex<AppState>>>) -> Result<serde_json::Value, String> {
+async fn server_metrics(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<serde_json::Value, String> {
     let (host, port, user, auth, key_path) = {
         let g = state.lock().unwrap();
         let s = g.config.active_server().ok_or("尚未配置云服务器")?;
         (s.host.clone(), s.port, s.user.clone(), s.auth.clone(), s.key_path.clone())
     };
-    let ssh = crate::ssh::SshManager::new();
     let cmd = r#"
 echo '---CPU---'; top -bn1 | grep 'Cpu(s)' || echo 'n/a'
 echo '---MEM---'; free -m | grep -E 'Mem|内存' || echo 'n/a'
@@ -814,11 +918,16 @@ echo '---LOAD---'; cat /proc/loadavg 2>/dev/null || sysctl -n vm.loadavg 2>/dev/
 echo '---UPTIME---'; uptime | sed 's/^ *//' || echo 'n/a'
 echo '---NET---'; cat /proc/net/dev | grep -E 'eth0|ens|enp' | head -5 || echo 'n/a'
 "#;
-    let (out, _err, code) = ssh.exec(host.clone(), port, user.clone(), auth.clone(), cmd.to_string(), 20, key_path)?;
-    if code != 0 {
-        return Err(format!("探针执行失败 (exit {code}): {}", _err));
-    }
-    Ok(parse_server_metrics(&out))
+    tauri::async_runtime::spawn_blocking(move || {
+        let ssh = crate::ssh::SshManager::new();
+        let (out, err, code) = ssh.exec(host, port, user, auth, cmd.to_string(), 20, key_path)?;
+        if code != 0 {
+            return Err(format!("探针执行失败 (exit {code}): {err}"));
+        }
+        Ok(parse_server_metrics(&out))
+    })
+    .await
+    .map_err(|e| format!("server_metrics 线程异常: {e}"))?
 }
 
 /// 解析探针原始输出为结构化 JSON（前端/智能体直接消费）。
@@ -1038,7 +1147,9 @@ pub fn run() {
     tauri::Builder::default()
         .manage(state)
         // SSH 会话单独管理：连接验证（最长十余秒）与终端读写不经过配置大锁，
-        // 避免连接期间/终端高频 IO 卡住 get_status 轮询
+        // 避免连接期间/终端高频 IO 卡住 get_status 轮询。
+        // 用 Arc 包住：ssh_connect 需把共享实例 move 进 spawn_blocking 线程，
+        // 若各自 new() 会导致会话存不到共享状态，后续 ssh_write/disconnect 找不到会话。
         .manage(crate::ssh::SshManager::new())
         // 自动更新：updater 下载 .app.tar.gz + Ed25519 验签 + 整体覆盖；
         // dialog 用于弹「发现新版本」原生对话框；process 用于安装后 relaunch 重启
