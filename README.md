@@ -167,3 +167,38 @@ src-tauri/      Rust 后端（Tauri 2）
 - 所有敏感信息（真实 IP、VLESS 凭据、用户名）在仓库中均已脱敏为占位值。
 - 本地配置存 `~/Library/Application Support`，不上传任何云端。
 - 详细设计见 `docs/设计.md`；架构红线见 `CONTRACT.md`；版本历史见 `HISTORY.md`。
+
+---
+
+## 十一、开源协议
+
+本项目自研代码以 **MIT License** 发布，详见根目录 [`LICENSE`](./LICENSE)。
+
+**为什么选 MIT**：本项目定位是「工具型桌面软件」，希望别人能自由使用、学习、修改、二次开发，
+MIT 是最简洁、限制最少、兼容性最好的选择，也便于与上下游生态（Tauri / Vue 等均为 MIT）保持一致。
+
+### 协议兼容性说明
+
+本项目的第三方依赖许可证情况（详见 [`THIRD_PARTY.md`](./THIRD_PARTY.md)）：
+
+| 依赖 | 许可证 | 与本项目 MIT 的关系 |
+|---|---|---|
+| mihomo（代理内核） | GPL-3.0 | ⚠️ **以独立进程方式调用，不做源码链接**，因此不传染本项目代码；但分发其二进制时须随附 GPL-3.0 许可证 |
+| geoip / geosite 数据 | GPL-3.0 等 | 作为**数据文件**随包分发，非代码链接 |
+| Tauri / Vue / Vite / xterm 等 | MIT / Apache-2.0 | ✅ 与 MIT 完全兼容 |
+
+---
+
+## 十二、致谢（站在巨人的肩膀上）
+
+本软件不是从零造轮子，而是把优秀开源项目组装成解决具体问题的工具。特别感谢：
+
+- **[mihomo](https://github.com/MetaCubeX/mihomo)**（MetaCubeX）—— 稳定强大的代理内核，本项目只写「配置生成 + 进程管理」，把转发交给久经考验的实现
+- **[Tauri](https://tauri.app/)**（Tauri Apps）—— 让 Rust + WebView 的轻量桌面应用成为可能
+- **[Vue.js](https://vuejs.org/)** / **[Vite](https://vitejs.dev/)** —— 前端框架与构建工具
+- **[xterm.js](https://xtermjs.org/)** —— 内置 SSH 终端的终端模拟器
+- **[v2fly/domain-list-community](https://github.com/v2fly/domain-list-community)** / **[Loyalsoldier/geoip](https://github.com/Loyalsoldier/geoip)** —— 国内域名与 IP 清单
+- **[XTLS / Reality](https://github.com/XTLS/REALITY)** —— VLESS + Reality + XTLS Vision 协议方案
+- **[Anthropic MCP](https://modelcontextprotocol.io/)** —— 让 AI 客户端能标准化地控制本软件
+
+完整清单与许可证见 [`THIRD_PARTY.md`](./THIRD_PARTY.md)。
