@@ -5,7 +5,7 @@
 ## 是什么
 
 MCP（Model Context Protocol）是 AI 客户端与外部工具之间的标准协议。
-本 server 通过 stdio 与 AI 客户端通信，暴露 24 个工具，AI 可以：
+本 server 通过 stdio 与 AI 客户端通信，暴露 23 个工具，AI 可以：
 
 - 查看代理状态、启动/停止代理
 - 列出节点、切换节点、测试节点延迟

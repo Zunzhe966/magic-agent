@@ -35,7 +35,10 @@
       "resources/geo/geoip.dat": "geo/geoip.dat",
       "resources/geo/geosite.dat": "geo/geosite.dat",
       "resources/geo/ASN.mmdb": "geo/ASN.mmdb",
-      "resources/geo/geoip.metadb": "geo/geoip.metadb"
+      "resources/geo/geoip.metadb": "geo/geoip.metadb",
+      "resources/licenses/GPL-3.0.txt": "licenses/GPL-3.0.txt",
+      "resources/licenses/MIT.txt": "licenses/MIT.txt",
+      "resources/licenses/THIRD-PARTY-NOTICES.txt": "licenses/THIRD-PARTY-NOTICES.txt"
     },
     "createUpdaterArtifacts": true
   },

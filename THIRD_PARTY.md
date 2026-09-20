@@ -104,12 +104,22 @@
 - [x] 未修改 mihomo 源码，仅以独立进程调用 → 自身代码不被 GPL 传染
 - [x] Tauri 系双许可选择 MIT 分支，与主许可一致
 
-### 分发二进制时须补充 ⚠️
+### 分发二进制时须补充 ✅
 
-- [ ] 随包附带 **mihomo 的 GPL-3.0 许可证全文**，并提供其源码获取地址
-- [ ] 随包附带上表所列 **geo 数据来源说明**及各自许可证
-- [ ] 若包含 MaxMind GeoLite2 数据，须遵守其 EULA（含署名要求）
-- [ ] 附带本 `THIRD_PARTY.md`
+以下均随包分发，位于 App 内 `Resources/licenses/` 目录
+（源文件见仓库 `src-tauri/resources/licenses/`）：
+
+- [x] 随包附带 **mihomo 的 GPL-3.0 许可证全文**，并提供其源码获取地址
+      → `licenses/GPL-3.0.txt` + `licenses/THIRD-PARTY-NOTICES.txt`（含源码地址）
+- [x] 随包附带上表所列 **geo 数据来源说明**及各自许可证
+      → `licenses/THIRD-PARTY-NOTICES.txt` 第 2 节
+- [x] 若包含 MaxMind GeoLite2 数据，须遵守其 EULA（含署名要求）
+      → `licenses/THIRD-PARTY-NOTICES.txt` 第 3 节（含 MaxMind 要求的英文署名原文）
+- [x] 附带本 `THIRD_PARTY.md` 的等价声明
+      → `licenses/THIRD-PARTY-NOTICES.txt` 为随包版本，内容覆盖本文件要点
+
+> 技术实现：上述文件通过在 `tauri.conf.json` 的 `bundle.resources` 中登记，
+> 由 Tauri 打包时自动复制进 `.app/Contents/Resources/licenses/`。
 
 ### 无需处理 🟢
 
