@@ -183,9 +183,12 @@ MIT 是最简洁、限制最少、兼容性最好的选择，也便于与上下�
 
 | 依赖 | 许可证 | 与本项目 MIT 的关系 |
 |---|---|---|
-| mihomo（代理内核） | GPL-3.0 | ⚠️ **以独立进程方式调用，不做源码链接**，因此不传染本项目代码；但分发其二进制时须随附 GPL-3.0 许可证 |
-| geoip / geosite 数据 | GPL-3.0 等 | 作为**数据文件**随包分发，非代码链接 |
-| Tauri / Vue / Vite / xterm 等 | MIT / Apache-2.0 | ✅ 与 MIT 完全兼容 |
+| mihomo（代理内核） | **GPL-3.0** + 附加命名条款 | ⚠️ **以独立进程方式调用，不做源码链接**，因此不传染本项目代码；但分发其二进制时须随附 GPL-3.0 许可证。其附加条款要求下游项目名不含 "mihomo" 字样（本项目已满足） |
+| geoip / geosite / ASN 数据 | **GPL-3.0**（含 MaxMind 数据条款） | 作为**数据文件**随包分发，非代码链接；MaxMind GeoLite2 部分另受其 EULA 约束 |
+| Tauri 系 | **Apache-2.0 OR MIT**（双许可） | ✅ 本项目选 MIT 分支，完全兼容 |
+| Vue / Vite / xterm 等 | MIT | ✅ 完全兼容 |
+| XTLS/REALITY | MPL-2.0 | ✅ 仅采用协议设计，未复制源码 |
+| MCP 规范 | Apache-2.0 / CC-BY-4.0 / MIT（过渡态） | ✅ 仅实现协议，未复制代码或文档 |
 
 ---
 
@@ -197,8 +200,8 @@ MIT 是最简洁、限制最少、兼容性最好的选择，也便于与上下�
 - **[Tauri](https://tauri.app/)**（Tauri Apps）—— 让 Rust + WebView 的轻量桌面应用成为可能
 - **[Vue.js](https://vuejs.org/)** / **[Vite](https://vitejs.dev/)** —— 前端框架与构建工具
 - **[xterm.js](https://xtermjs.org/)** —— 内置 SSH 终端的终端模拟器
-- **[v2fly/domain-list-community](https://github.com/v2fly/domain-list-community)** / **[Loyalsoldier/geoip](https://github.com/Loyalsoldier/geoip)** —— 国内域名与 IP 清单
-- **[XTLS / Reality](https://github.com/XTLS/REALITY)** —— VLESS + Reality + XTLS Vision 协议方案
-- **[Anthropic MCP](https://modelcontextprotocol.io/)** —— 让 AI 客户端能标准化地控制本软件
+- **[MetaCubeX/meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat)** / **[v2fly/domain-list-community](https://github.com/v2fly/domain-list-community)** —— 国内域名与 IP 清单
+- **[XTLS / REALITY](https://github.com/XTLS/REALITY)** —— VLESS + Reality 协议方案
+- **[Model Context Protocol](https://modelcontextprotocol.io/)**（Anthropic）—— 让 AI 客户端能标准化地控制本软件
 
 完整清单与许可证见 [`THIRD_PARTY.md`](./THIRD_PARTY.md)。
