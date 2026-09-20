@@ -167,6 +167,7 @@ src-tauri/      Rust 后端（Tauri 2）
 - 所有敏感信息（真实 IP、VLESS 凭据、用户名）在仓库中均已脱敏为占位值。
 - 本地配置存 `~/Library/Application Support`，不上传任何云端。
 - 详细设计见 `docs/设计.md`；架构红线见 `CONTRACT.md`；版本历史见 `HISTORY.md`。
+- 开源/私密资产边界见 [`OPEN_SOURCE_INVENTORY.md`](./OPEN_SOURCE_INVENTORY.md)。
 
 ---
 
