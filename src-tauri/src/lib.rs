@@ -5,6 +5,7 @@ mod keychain;
 pub mod mihomo;
 mod ssh;
 mod system_proxy;
+mod updater;
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1193,7 +1194,11 @@ pub fn run() {
             kill_foreign_proxies,
             list_foreign_proxies,
             fetch_subscription,
-            proxy_api
+            proxy_api,
+            updater::get_update_channel,
+            updater::set_update_channel,
+            updater::check_channel_update,
+            updater::install_channel_update
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -37,7 +37,6 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
-import { check } from '@tauri-apps/plugin-updater';
 import { ask } from '@tauri-apps/plugin-dialog';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { toast } from './toast.js';
@@ -197,17 +196,21 @@ async function deleteSshServer(serverId) {
 }
 // 启动时静默检查更新：有新版弹原生对话框，用户确认后下载安装+重启
 // 失败静默吞掉，不打扰用户；手动检查走设置页 SettingsView 自己的 UI 流程
+//
+// 关键：必须走后端 check_channel_update / install_channel_update，
+// 不能直接调 plugin-updater 的 check()——后者的端点编译期固定，
+// 无法跟随用户在设置页选择的更新通道（本地测试 / GitHub 发布）。
 async function checkForUpdateQuiet() {
   try {
-    const update = await check();
-    if (!update) return;
+    const res = await invoke('check_channel_update');
+    if (!res || !res.available) return;
     const ok = await ask(
-      `发现新版本 v${update.version}，立即更新？`,
+      `发现新版本 v${res.version}，立即更新？`,
       { title: '软件更新', kind: 'info' }
     );
     if (!ok) return;
     toast('正在下载更新…');
-    await update.downloadAndInstall();
+    await invoke('install_channel_update');
     toast('更新已安装，即将重启…');
     await relaunch();
   } catch (e) {

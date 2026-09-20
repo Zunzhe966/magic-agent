@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "pnpm --dir ui dev",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "pnpm --dir \"/Volumes/A区/魔法代理/ui\" build",
+    "beforeBuildCommand": "pnpm --dir ui build",
     "frontendDist": "../ui/dist"
   },
   "app": {
@@ -43,7 +43,7 @@
     "updater": {
       "active": true,
       "endpoints": [
-        "http://127.0.0.1:7878/latest.json"
+        "https://github.com/Zunzhe966/magic-agent/releases/latest/download/latest.json"
       ],
       "dialog": false,
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYzNDM4REZDNDkyMzIwNzQKUldSMElDTkovSTFEODFBNUtlYmRxallORkE3bko1ZiszOHVIV0VsU2NGSTRLK1lGdUhyM2xSajgK",

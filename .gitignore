@@ -15,5 +15,7 @@ graphify-out/
 backup/
 
 # 发版产物（release.sh 生成，不入库；40MB 级 tar.gz 属构建产物）
+# 本地测试 feed 与 GitHub 发布 feed 都是构建产物，不入库
 scripts/updater-feed/
+scripts/updater-feed-publish/
 .trae/

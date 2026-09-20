@@ -95,6 +95,11 @@ pub struct AppConfig {
     /// 缺失时在 load() 自动生成并持久化，防止本机任意进程/网页 CSRF 操控代理。
     #[serde(default)]
     pub api_secret: Option<String>,
+    /// 更新通道：`local`（本地开发测试，127.0.0.1:7878）
+    /// 或 `github`（GitHub Releases，面向真实用户）。
+    /// None / 未知值一律按 github 处理（面向用户更安全）。
+    #[serde(default)]
+    pub update_channel: Option<String>,
     // 兼容旧配置：仍保留这几个字段，但新逻辑不再把明文写进 config.json
     pub ssh_host: Option<String>,
     pub ssh_port: Option<u16>,
@@ -118,6 +123,8 @@ impl Default for AppConfig {
             active_server_id: None,
             domain_rules: vec![],
             api_secret: None,
+            // 缺省 GitHub 通道：开源版面向真实用户
+            update_channel: Some("github".to_string()),
             ssh_host: None,
             ssh_port: Some(22),
             ssh_user: Some("root".to_string()),

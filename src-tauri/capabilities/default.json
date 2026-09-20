@@ -5,6 +5,8 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:window:allow-start-dragging",
+    "core:event:allow-listen",
     "updater:default",
     "dialog:default",
     "process:default"
