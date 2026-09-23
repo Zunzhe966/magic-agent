@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::process::Command;
 
 /// networksetup 可执行路径（与 MCP 侧 /usr/sbin/networksetup 一致）
@@ -193,7 +193,7 @@ fn get_proxy_detail(svc: &str, flag: &str, want_port: u16, expect_on: bool, erro
 /// 单个服务在某一代理通道上的【完整原值】（P1-2 账本快照用）。
 /// 与 ServiceProxyState 的"达标"语义不同：这里如实记录 enabled/server/port，
 /// 回放时才能把系统恢复成接管前的样子，而不是恢复成"达标"。
-#[derive(Debug, Serialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyChannelRaw {
     pub enabled: bool,
@@ -202,7 +202,7 @@ pub struct ProxyChannelRaw {
 }
 
 /// 一个网络服务三条通道的完整原值快照。
-#[derive(Debug, Serialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceSnapshot {
     pub service: String,

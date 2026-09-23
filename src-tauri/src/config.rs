@@ -116,6 +116,10 @@ pub struct AppConfig {
     pub ssh_password: Option<String>,
     #[serde(alias = "ssh_private_key")]
     pub ssh_private_key: Option<String>,
+    /// P1-3 确认模式：启动代理前先列示网络混乱源，用户过目后才执行接管。
+    /// false（默认）= 快速模式，沿用直接接管行为。
+    #[serde(default, alias = "confirm_takeover")]
+    pub confirm_takeover: bool,
 }
 
 impl Default for AppConfig {
@@ -140,6 +144,7 @@ impl Default for AppConfig {
             ssh_auth: Some("password".to_string()),
             ssh_password: None,
             ssh_private_key: None,
+            confirm_takeover: false,
         }
     }
 }

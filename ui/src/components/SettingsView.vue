@@ -52,6 +52,18 @@
     </section>
 
     <section class="panel">
+      <h2>接管方式</h2>
+      <p class="muted">控制点击「启动代理」时如何接管系统网络。接管动作始终会记账，失败时自动还原系统代理设置。</p>
+      <label class="channel-item" :class="{ active: confirmModel }">
+        <input type="checkbox" v-model="confirmModel" />
+        <div class="channel-body">
+          <div class="channel-name">接管前确认（确认模式）</div>
+          <div class="channel-desc">启动前先做只读网络体检，列出将被关闭的第三方代理等混乱源，经你确认后才执行接管。关闭则为快速模式：直接体检→记账→清理→启动。</div>
+        </div>
+      </label>
+    </section>
+
+    <section class="panel">
       <h2>关于</h2>
       <p class="muted">尊者魔法代理 / Magic Agent</p>
       <p class="muted">macOS Tauri 2 桌面代理软件 · Rust + Vue3</p>
@@ -66,6 +78,17 @@ import { getVersion } from '@tauri-apps/api/app';
 import { updaterState, checkUpdate, refreshChannel, selectChannel } from '../updater.js';
 
 const version = ref('');
+
+// ── 接管方式（P1-3 确认模式） ─────────────────────────────
+// 开关持久化在 config.confirmTakeover，保存走 App.vue 的 saveConfig 通道；
+// 保存失败时父组件回退 config，本组件的 get 自动反映回退态（同更新通道模式）。
+const props = defineProps({ config: Object });
+const emit = defineEmits(['update']);
+
+const confirmModel = computed({
+  get: () => !!props.config?.confirmTakeover,
+  set: (v) => emit('update', { confirmTakeover: v }),
+});
 
 // ── 更新通道 ──────────────────────────────────────────────
 // local  = 本地开发测试（自己用：本机起 http.server 7878）

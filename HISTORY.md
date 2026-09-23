@@ -299,6 +299,24 @@
 
 ---
 
+### 2026-09-23（交接会话）· P1-3 归序流程编排落地
+
+> 交接说明：上一会话额度耗尽时 P1-3 代码已全部写完但停在未提交状态（8 文件 +422 行）。
+> 本会话接手：复核全部改动 → 四道自检重跑全绿 → 落账提交。
+
+| 类型 | 做了什么 |
+|------|----------|
+| feat(P1-3) | **回滚原语 `ledger.rs::rollback_session`**：把当前 open 会话的 system_proxy 条目按 before 逐服务回放原值后结账。process 项不可逆绝不进回放（如实承认"回不来"）；before 解析失败的条目跳过并点名（凭 unknown 瞎写比重置失败更危险）；回放有失败也结账——接管已结束，失败项由调用方如实上报。可注入回放函数版本供单测 mock，绝不真动本机系统代理。`system_proxy.rs` 的 `ProxyChannelRaw`/`ServiceSnapshot` 补 Deserialize（回放需从账本 JSON 反序列化）。Rust +4 单测（回放+结账/跳过 process/容忍损坏快照/无账如实 false）。 |
+| feat | **`start_proxy` 编排升级（Rust + MCP 同语义）**：系统代理设置后逐服务对账不达标 = 半套秩序 → 宁可不启：停内核 + 按账本回放系统代理原值 + 结账 + 报错。错误信息按账本实况分层如实声明——有账可回/无账可回、回放失败项逐条点名、账本含不可逆 process 项才提示"第三方进程不会自动复活"（绝不空喊吓用户，也绝不隐瞒）。MCP 侧 `ledger_rollback` + `start_proxy` 失败回滚同步实现（CONTRACT 双入口一致性红线）。Python +4 回归（回滚回放原值/写失败点名/无账 false/端到端 ok:False+rolledBack）。 |
+| feat | **确认模式（UI 侧编排入口）**：config 新增 `confirmTakeover`（默认 false=快速模式沿用现行为）。开启后点「启动代理」先调 `takeover_plan`（新 Tauri 命令：只读归序前体检，复用 auditor::audit，传真实内核 PID 防 kernel_up 误报），有混乱源弹原生对话框逐项列示"将关闭谁/将清理什么"+体检结论，用户确认才接管；体检失败不拦启动但 toast 点名"没体检成"。设置页新增「接管方式」面板开关（经 saveConfig 通道持久化）。 |
+| 验证 | 接手复跑：Rust 75 全绿（71→75）、Python 25 全绿（21→25）、parity 0、vite build 过、dialog 插件依赖与 capabilities 权限核对齐。真机状态核查：本机无 ledger.json（从未发生真实接管），无异常残留。 |
+
+**未做（有意为之）**：确认模式的列示放在 UI（start_proxy 内部不阻塞等确认），快速模式清理逻辑保持原样（防误杀铁律在 CONTRACT）；route/dns 层级混乱源目前仅列示不处置（P1-4 之后视需求扩展）。
+
+**下一步**：P1-4 一键还原 `restore_network`（消费 rollback_session/restore_service_snapshot）+ 看门狗漂移巡检（每 5 分钟抽验账本关键项现值）。
+
+---
+
 ## 各版本「增 / 删」总表
 
 | 版本 | 新增 | 删除 |

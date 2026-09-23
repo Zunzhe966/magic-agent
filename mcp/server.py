@@ -572,6 +572,70 @@ def ledger_settle(reason):
     return done
 
 
+def _restore_channel(svc, flag, state_flag, raw):
+    """按快照原值恢复单通道（与 Rust restore_channel 同语义）。返回错误串或 None。"""
+    try:
+        if raw.get('enabled'):
+            server = raw.get('server') or '127.0.0.1'
+            port = str(raw.get('port') or 0)
+            p = subprocess.run(['/usr/sbin/networksetup', flag, svc, server, port],
+                               capture_output=True, text=True, timeout=15)
+            if p.returncode != 0:
+                return f'{flag} {svc}: {p.stderr.strip()}'
+            p2 = subprocess.run(['/usr/sbin/networksetup', state_flag, svc, 'on'],
+                                capture_output=True, text=True, timeout=15)
+            if p2.returncode != 0:
+                return f'{state_flag} {svc}: {p2.stderr.strip()}'
+        else:
+            p = subprocess.run(['/usr/sbin/networksetup', state_flag, svc, 'off'],
+                               capture_output=True, text=True, timeout=15)
+            if p.returncode != 0:
+                return f'{state_flag} {svc}: {p.stderr.strip()}'
+        return None
+    except Exception as e:
+        return f'{flag} {svc}: {e}'
+
+
+def restore_service_snapshot(snap):
+    """回放一个服务（HTTP→HTTPS→SOCKS，与 Rust 同序）。快照不完整跳过并如实报告。"""
+    if snap.get('errors'):
+        return [f"{snap.get('service')}: 快照不完整（{'；'.join(snap['errors'])}），跳过还原"]
+    errs = []
+    for key, flag, state_flag in (
+            ('http', '-setwebproxy', '-setwebproxystate'),
+            ('https', '-setsecurewebproxy', '-setsecurewebproxystate'),
+            ('socks', '-setsocksfirewallproxy', '-setsocksfirewallproxystate')):
+        e = _restore_channel(snap['service'], flag, state_flag, snap.get(key) or {})
+        if e:
+            errs.append(e)
+    return errs
+
+
+def ledger_rollback(reason):
+    """P1-3 回滚原语：当前 open 会话的 system_proxy 条目按 before 逐服务回放，
+    然后结账。返回 (回放错误清单, 是否有账可回, 账本是否含不可逆 process 项)。
+    与 Rust rollback_session 同语义：process 项回不来，如实声明不假装。"""
+    session = ledger_open_session()
+    if session is None:
+        return [], False, False
+    errs = []
+    had_procs = False
+    for entry in session.get('entries', []):
+        if entry.get('kind') != 'system_proxy':
+            had_procs = True
+            continue
+        before = entry.get('before')
+        if not isinstance(before, dict) or 'service' not in before:
+            errs.append(f"{entry.get('key')}: 快照解析失败，跳过还原")
+            continue
+        errs.extend(restore_service_snapshot(before))
+    try:
+        ledger_settle(reason)
+    except Exception as e:
+        errs.append(f'结账失败：{e}')
+    return errs, True, had_procs
+
+
 def ledger_open_session():
     """当前未结账本（dict 或 None）。损坏保全 note 同样如实打日志。"""
     ledger, note = _ledger_load()
@@ -2168,6 +2232,9 @@ def call_tool(name, args):
         # 否则 App 重启后 config 仍是 true 但实际代理已关，会误导调用方。
         result = {'running': running, 'selectedNode': selected,
                   'systemProxy': system_proxy_enabled(),
+                  # P1-3：如实暴露接管状态——未结账本（异常退出残留）与确认模式开关
+                  'openLedger': ledger_open_session() is not None,
+                  'confirmTakeover': bool(cfg.get('confirmTakeover')) if 'error' not in cfg else False,
                   'nodes': len(cfg.get('nodes', [])) if 'error' not in cfg else 0}
         # P0-1：verify=true 时做逐服务读回对账（默认关，避免轮询放大 networksetup 开销）。
         # 达标口径：系统代理开着 → 应精确指向 127.0.0.1:7891；关着 → 应全部 Enabled:No。
@@ -2224,11 +2291,32 @@ def call_tool(name, args):
         # TUN 模式下不开（TUN 已接管全局，再开系统代理是双开冗余）。
         cfg2 = read_config()
         if cfg2.get('systemProxy'):
+            # 与 Rust 侧同语义（P1-3 编排）：设置系统代理后逐服务对账，
+            # 不达标 = 半套秩序——宁可不启：停内核 + 按账本回放原值 + 结账 + 如实报错。
+            # 已知不可逆项（cleanup 杀的第三方进程）绝不假装恢复。
+            restore_note = ''
             try:
-                set_system_proxy(True)
+                result = set_system_proxy(True)
+                if not result.get('allOk'):
+                    mismatch = result.get('mismatched') or []
+                    raise RuntimeError(
+                        f"系统代理设置未全部达标：{'、'.join(mismatch) if mismatch else '原因见对账明细'}")
             except Exception as e:
-                return {'ok': True, 'pid': pid, 'message': f'代理内核已启动，但系统代理开启失败: {e}'}
-            return {'ok': True, 'pid': pid, 'message': '代理已启动，系统代理已开（需要管理员授权）'}
+                stop_mihomo()
+                try:
+                    errs, had_ledger, had_procs = ledger_rollback(f'mcp:start_proxy 对账不达标，自动回滚：{e}')
+                    parts = [f'内核已停止']
+                    parts.append('系统代理已按账本还原为接管前原值' if had_ledger
+                                 else '账本无未结账目，系统代理未能还原原值（请手动检查网络设置）')
+                    if errs:
+                        parts.append('还原存在失败项：' + '；'.join(errs))
+                    if had_procs:
+                        parts.append('接管时关闭的第三方代理进程不会自动复活')
+                    return {'ok': False, 'message': f'{e}。已自动回滚：' + '；'.join(parts), 'rolledBack': True}
+                except Exception as le:
+                    restore_note = f'；且自动回滚异常：{le}'
+                return {'ok': False, 'message': f'代理启动失败：{e}{restore_note}', 'rolledBack': False}
+            return {'ok': True, 'pid': pid, 'message': '代理已启动，系统代理已开并通过对账（需要管理员授权）'}
         return {'ok': True, 'pid': pid, 'message': '代理已启动（TUN 模式，系统代理保持关闭）'}
     elif name == 'stop_proxy':
         stop_mihomo()

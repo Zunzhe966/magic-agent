@@ -490,3 +490,85 @@ def test_ledger_schema_camel_case_contract_with_rust(tmp_path, monkeypatch):
     # 权限：接管账本含网络配置原值，必须 0600
     import stat
     assert stat.S_IMODE(pathlib.Path(path).stat().st_mode) == 0o600
+
+
+# ── P1-3 回滚原语（与 Rust rollback_session 同口径） ──
+
+def test_ledger_rollback_restores_original_values(tmp_path, monkeypatch):
+    """回滚 = 把 before 快照逐服务回放回系统 + 结账；错误如实返回不假装成功。"""
+    path = str(tmp_path / 'ledger.json')
+    monkeypatch.setattr(server, 'LEDGER_PATH', path)
+    monkeypatch.setattr(server.subprocess, 'run', _fake_ledger_networksetup(webproxy_on=True, port=7890))
+    server.ledger_begin('rollback-test')
+
+    calls = []
+
+    def recorder(cmd, **kw):
+        # 回放阶段的 networksetup 调用全部记录（含写命令参数）
+        calls.append(list(cmd))
+        return _Proc()
+    monkeypatch.setattr(server.subprocess, 'run', recorder)
+
+    errs, had, had_procs = server.ledger_rollback('verify 不达标')
+    assert had and not had_procs
+    assert errs == []
+    # Wi-Fi 原值开着指向 7890，回放必须按原值恢复而不是关成直连
+    wifi_restore = [c for c in calls if '-setwebproxy' in c]
+    assert any('Wi-Fi' in c and '7890' in c for c in wifi_restore), wifi_restore
+    assert any('-setwebproxystate' in c and 'on' in c for c in calls), '开着的原值必须恢复为 on'
+    # 回滚即结账
+    assert server.ledger_open_session() is None
+
+
+def test_ledger_rollback_reports_write_errors_not_swallowed(tmp_path, monkeypatch):
+    """回放写命令失败 → 错误如实返回（绝不假装还原成功），且仍然结账。"""
+    path = str(tmp_path / 'ledger.json')
+    monkeypatch.setattr(server, 'LEDGER_PATH', path)
+    monkeypatch.setattr(server.subprocess, 'run', _fake_ledger_networksetup())
+    server.ledger_begin('rollback-fail')
+
+    def failer(cmd, **kw):
+        return _Proc(stderr='denied', rc=1)
+    monkeypatch.setattr(server.subprocess, 'run', failer)
+
+    errs, had, _ = server.ledger_rollback('boom')
+    assert had
+    assert errs, '写失败必须逐条点名'
+    assert server.ledger_open_session() is None  # 有失败也结账——接管已结束
+
+
+def test_ledger_rollback_without_session(tmp_path, monkeypatch):
+    """无未结账本 → (空, False)：如实报告"没账可回"，不假装还原成功。"""
+    path = str(tmp_path / 'ledger.json')
+    monkeypatch.setattr(server, 'LEDGER_PATH', path)
+    errs, had, had_procs = server.ledger_rollback('nothing')
+    assert errs == [] and had is False and had_procs is False
+
+
+def test_start_proxy_rolls_back_when_system_proxy_verify_fails(tmp_path, monkeypatch):
+    """端到端（MCP 分派层）：系统代理对账不达标 → 停内核 + 回滚 + ok:False。"""
+    path = str(tmp_path / 'ledger.json')
+    monkeypatch.setattr(server, 'LEDGER_PATH', path)
+    # 准备：config 有节点且 systemProxy=true
+    saved_config = {'nodes': [{'name': 'n1', 'server': '1.2.3.4', 'port': 443, 'uuid': 'u',
+                               'network': 'tcp', 'tls': True, 'udp': True, 'flow': '',
+                               'fingerprint': 'chrome', 'publicKey': '', 'shortId': '', 'sni': ''}],
+                    'selectedNode': 'n1', 'systemProxy': True, 'apps': [], 'domainRules': []}
+    monkeypatch.setattr(server, 'read_config', lambda: dict(saved_config))
+    monkeypatch.setattr(server, 'write_config', lambda cfg: None)
+    monkeypatch.setattr(server, 'mihomo_running', lambda: False)
+    monkeypatch.setattr(server, 'regenerate_config', lambda: None)
+    monkeypatch.setattr(server, 'start_mihomo', lambda: 4242)
+    stop_calls = []
+    monkeypatch.setattr(server, 'stop_mihomo', lambda: stop_calls.append(1))
+    # 系统代理"设置成功但对账不达标"（allOk False）
+    monkeypatch.setattr(server, 'set_system_proxy',
+                        lambda enable=True, port=7891: {'enabled': enable, 'allOk': False,
+                                                        'mismatched': ['Wi-Fi'], 'services': []})
+    # 回滚本身用真账本（tmp_path 已隔离）
+    r = server.call_tool('start_proxy', {})
+    assert r['ok'] is False
+    assert r['rolledBack'] is True
+    assert stop_calls == [1], '内核必须被停掉'
+    assert 'Wi-Fi' in r['message'] and '回滚' in r['message']
+    assert server.ledger_open_session() is None, '回滚后不得留未结账本'

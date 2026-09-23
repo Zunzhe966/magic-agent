@@ -30,13 +30,14 @@
       <DomainRulesView v-else-if="view === 'domain-rules'" :config="config" @update="saveDomainRules" />
       <ConnectionsView v-else-if="view === 'connections'" :config="config" />
       <SshView v-else-if="view === 'ssh'" :config="config" @saved="onSshSaved" />
-      <SettingsView v-else-if="view === 'settings'" />
+      <SettingsView v-else-if="view === 'settings'" :config="config" @update="saveConfig" />
     </main>
   </div>
 </template>
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
+import { ask } from '@tauri-apps/plugin-dialog';
 import { toast } from './toast.js';
 
 import Dashboard from './components/Dashboard.vue';
@@ -100,6 +101,25 @@ async function refreshApps() {
 }
 async function startProxy() {
   if (proxyBusy.value) return;
+  // P1-3 确认模式：开关开启时，先跑【只读】归序前体检，把"接下来要动什么"
+  // 列给用户过目，确认后才真正接管（记账+清理+启动）。关闭时沿用快速模式。
+  if (config.value?.confirmTakeover) {
+    try {
+      const plan = await invoke('takeover_plan');
+      if (plan.hasSources) {
+        const lines = plan.foreign.map((f) => `• 将关闭：${f}`).join('\n');
+        const stale = plan.staleProxy ? '\n• 将清理：系统代理残留（指向已停止的端口）' : '';
+        const ok = await ask(
+          `检测到以下网络混乱源，启动代理将接管并清理它们：\n${lines}${stale}\n\n体检结论：${plan.summary}\n\n注意：被关闭的第三方代理进程不会自动复活（系统代理设置会记账、失败时自动还原）。确认继续？`,
+          { title: '接管确认', kind: 'warning' },
+        );
+        if (!ok) return;
+      }
+    } catch (e) {
+      // 体检失败不拦启动（它是辅助信息），但必须让用户知道没体检成
+      toast('接管前体检失败：' + e + '（将直接启动）', 'warn');
+    }
+  }
   proxyBusy.value = true;
   proxyError.value = '';
   try {

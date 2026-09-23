@@ -274,6 +274,39 @@ fn check_conflicts_blocking() -> ConflictInfo {
     }
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TakeoverPlan {
+    pub has_sources: bool,
+    pub foreign: Vec<String>,
+    pub stale_proxy: bool,
+    pub summary: String,
+}
+
+/// P1-3 归序前体检：只读采集，供确认模式弹窗列示混乱源清单。
+/// 不记账不清理，纯给 UI 看"接下来要动什么"。
+/// our_pids 必须传真实内核 PID——空数组会让"内核在跑+系统代理指 7891"
+/// 的正常状态被误报成死端口残留（kernel_up 判定口径，见 CONTRACT）。
+#[tauri::command]
+async fn takeover_plan() -> Result<TakeoverPlan, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let m = MihomoManager::new();
+        let own_ports: Vec<u16> = vec![m.port, mihomo::PROXY_PORT, mihomo::DIRECT_PORT];
+        let our_pids: Vec<u32> = m.find_running_pid().into_iter().collect();
+        let report = auditor::audit(&own_ports, &our_pids);
+        let foreign = report.foreign_procs.clone();
+        let stale = report.stale_proxy.detected;
+        Ok(TakeoverPlan {
+            has_sources: !foreign.is_empty() || stale,
+            foreign,
+            stale_proxy: stale,
+            summary: report.summary,
+        })
+    })
+    .await
+    .map_err(|e| format!("takeover_plan 线程异常: {e}"))?
+}
+
 /// P1-2 显式接管入口（带账清理）：用户主动发起的"把系统交给我管"才走这里。
 /// 顺序即正确性：先 begin_takeover 快照【动手前】的逐服务原值，再执行清理，
 /// 最后把被杀进程入账（不可逆项 reversible=false）。
@@ -882,11 +915,50 @@ async fn start_proxy(
             }
         };
         if cfg.system_proxy {
-            // P0-1：启动后设置系统代理并逐服务回读。部分服务没设上不会断网
-            // （那些服务退化为直连），但必须如实记日志，杜绝"报成功实际半套"。
-            match system_proxy::set_system_proxy(true, mihomo.port) {
-                Ok(r) => log_proxy_set_result("start", &r),
-                Err(e) => eprintln!("[start_proxy] 系统代理设置失败: {e}"),
+            // P0-1 对账 + P1-3 编排：启动后设置系统代理并逐服务回读，
+            // 不达标 = 半套秩序（部分网络走代理部分裸奔），这正是"报假账"要消灭的
+            // 状态——宁可不启：停内核 + 按账本回放系统代理原值 + 结账，并向用户报错。
+            // 已知不可逆项如实声明：cleanup 杀掉的第三方进程不会自动复活。
+            let verify = match system_proxy::set_system_proxy(true, mihomo.port) {
+                Ok(r) => {
+                    log_proxy_set_result("start", &r);
+                    if r.all_ok {
+                        None
+                    } else {
+                        Some(format!(
+                            "系统代理设置未全部达标：{} 等 {} 个服务",
+                            if r.mismatched.is_empty() { "原因见对账明细".to_string() } else { r.mismatched.join("、") },
+                            r.mismatched.len().max(1)
+                        ))
+                    }
+                }
+                Err(e) => Some(format!("系统代理设置失败：{e}")),
+            };
+            if let Some(why) = verify {
+                eprintln!("[start_proxy] {why}，自动回滚本次接管（宁可不启，不留半套秩序）");
+                mihomo.stop();
+                // 回滚前先读账本：是否含不可逆 process 项决定提示口径（绝不空喊"进程
+                // 不会复活"吓用户，也绝不隐瞒真杀了进程的事实）
+                let had_procs = ledger::LedgerFile::default()
+                    .open_session()
+                    .map(|s| s.entries.iter().any(|e| e.kind == "process"))
+                    .unwrap_or(false);
+                let (restore_errs, had_ledger) = ledger::LedgerFile::default()
+                    .rollback_session("start_proxy 对账不达标，自动回滚")
+                    .unwrap_or_else(|e| (vec![format!("账本操作失败：{e}")], false));
+                let mut msg = format!("{why}。已自动回滚：内核已停止");
+                msg.push_str(if had_ledger {
+                    "，系统代理已按账本还原为接管前原值"
+                } else {
+                    "，但账本无未结账目，系统代理未能还原原值（请手动检查网络设置）"
+                });
+                if !restore_errs.is_empty() {
+                    msg.push_str(&format!("；还原存在失败项：{}", restore_errs.join("；")));
+                }
+                if had_procs {
+                    msg.push_str("。注意：接管时关闭的第三方代理进程不会自动复活，需要的话请手动重开。");
+                }
+                return Err(msg);
             }
         }
         Ok(status)
@@ -1579,6 +1651,7 @@ pub fn run() {
             check_conflicts,
             kill_foreign_proxies,
             list_foreign_proxies,
+            takeover_plan,
             audit_network,
             fetch_subscription,
             proxy_api,

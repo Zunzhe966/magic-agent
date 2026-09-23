@@ -219,6 +219,41 @@ impl LedgerFile {
         }
         Ok(done)
     }
+
+    /// P1-3 回滚原语：把【当前 open 会话】里所有 system_proxy 条目按 before
+    /// 逐服务回放回接管前的原值，然后结账。verify 不达标时 start_proxy 调用它
+    /// ——宁可不启，不留半套秩序。
+    /// 返回 (回放错误清单, 是否有账可回)。before 解析失败的条目跳过并点名
+    /// （凭 unknown 瞎写比重置失败更危险）。
+    pub fn rollback_session(&self, reason: &str) -> Result<(Vec<String>, bool), String> {
+        self.rollback_session_with(reason, crate::system_proxy::restore_service_snapshot)
+    }
+
+    /// 可注入回放函数的版本（单测用 mock，绝不真动本机系统代理）。
+    pub fn rollback_session_with(
+        &self,
+        reason: &str,
+        mut restore: impl FnMut(&crate::system_proxy::ServiceSnapshot) -> Vec<String>,
+    ) -> Result<(Vec<String>, bool), String> {
+        let session = match self.open_session() {
+            Some(s) => s,
+            None => return Ok((vec![], false)),
+        };
+        let mut errs = Vec::new();
+        for entry in &session.entries {
+            if entry.kind != "system_proxy" {
+                continue; // process 项不可逆，账本如实承认"回不来"
+            }
+            match serde_json::from_value::<crate::system_proxy::ServiceSnapshot>(entry.before.clone()) {
+                Ok(snap) => errs.extend(restore(&snap)),
+                Err(e) => errs.push(format!("{}: 快照解析失败（{e}），跳过还原", entry.key)),
+            }
+        }
+        // 有账可回就结账（无论回放是否全成）：结账=接管结束，回放失败的项
+        // 由调用方如实上报，绝不假装恢复成功
+        let _ = self.settle_open(reason);
+        Ok((errs, true))
+    }
 }
 
 #[cfg(test)]
@@ -376,6 +411,90 @@ mod tests {
         for bad in ["\"started_ts\"", "\"settled_ts\"", "\"isReversible\""] {
             assert!(!text.contains(bad), "账本 JSON 出现非契约键 {bad}");
         }
+        cleanup(&l.path);
+    }
+
+    /// P1-3 回滚：逐服务回放 before 原值 + 结账；回放错误如实返回不假装。
+    #[test]
+    fn rollback_restores_each_snapshot_then_settles() {
+        let l = tmp_ledger("rollback");
+        l.begin_takeover(
+            "start_proxy",
+            vec![snap("Wi-Fi", true, 7890), snap("USB 10/100 LAN", false, 0)],
+        )
+        .unwrap();
+        let mut calls: Vec<(String, bool, u16)> = Vec::new();
+        let (errs, had) = l
+            .rollback_session_with("verify 不达标", |s| {
+                calls.push((s.service.clone(), s.http.enabled, s.http.port));
+                if s.service == "USB 10/100 LAN" {
+                    return vec!["mock 写失败".to_string()];
+                }
+                vec![]
+            })
+            .unwrap();
+        assert!(had);
+        // 两个服务都按 before 原值回放：Wi-Fi 开着指 7890（不是接管后的 7891）
+        assert_eq!(calls.len(), 2);
+        assert!(calls.contains(&("Wi-Fi".to_string(), true, 7890)));
+        // 回放失败项如实返回
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("mock 写失败"));
+        // 回滚即结账（接管结束），且 reason 可追溯
+        assert!(l.open_session().is_none());
+        let session = &l.load().0.sessions[0];
+        assert_eq!(session.status, "settled");
+        assert!(session.settled_reason.as_deref().unwrap().contains("verify 不达标"));
+        cleanup(&l.path);
+    }
+
+    #[test]
+    fn rollback_skips_irreversible_process_entries() {
+        let l = tmp_ledger("rollback-proc");
+        l.begin_takeover("start_proxy", vec![snap("Wi-Fi", false, 0)]).unwrap();
+        l.record_killed_procs(&["FlClash (PID 1)".into()]).unwrap();
+        let mut restored_keys = Vec::new();
+        let (errs, had) = l
+            .rollback_session_with("stop", |s| {
+                restored_keys.push(s.service.clone());
+                vec![]
+            })
+            .unwrap();
+        assert!(had);
+        assert!(errs.is_empty());
+        assert_eq!(restored_keys, vec!["Wi-Fi".to_string()], "process 项绝不进回放");
+        cleanup(&l.path);
+    }
+
+    /// 快照 before 损坏（非对象）→ 跳过该服务并点名，绝不凭 unknown 瞎写网络配置
+    #[test]
+    fn rollback_tolerates_corrupt_snapshot_entry() {
+        let l = tmp_ledger("rollback-corrupt");
+        l.begin_takeover("start_proxy", vec![snap("Wi-Fi", false, 0)]).unwrap();
+        // 手工把 before 改坏
+        let (mut ledger, _) = l.load();
+        ledger.sessions[0].entries[0].before = serde_json::json!({"garbage": 1});
+        l.save(&ledger).unwrap();
+        let mut called = 0usize;
+        let (errs, had) = l
+            .rollback_session_with("stop", |_| {
+                called += 1;
+                vec![]
+            })
+            .unwrap();
+        assert!(had);
+        assert_eq!(called, 0, "解析失败不得调用回放");
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("快照解析失败"));
+        cleanup(&l.path);
+    }
+
+    #[test]
+    fn rollback_without_open_session_reports_no_ledger() {
+        let l = tmp_ledger("rollback-none");
+        let (errs, had) = l.rollback_session_with("stop", |_| vec![]).unwrap();
+        assert!(!had, "无账可回必须如实返回 false");
+        assert!(errs.is_empty());
         cleanup(&l.path);
     }
 }
