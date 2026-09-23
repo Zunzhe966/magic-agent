@@ -48,6 +48,18 @@ pub struct PortConflict {
     pub ours: bool,
 }
 
+/// 本程序端口绑在非回环地址（局域网可达）的暴露项。
+/// 与 MCP 侧 audit_network 的 ownPortLanExposed 元素【同形】：{command, pid, port}。
+/// GUI 消费的是 Rust 序列化结果，字段名/大小写漂移 = 前端渲染崩溃
+/// （2026-09-23 v0.3.0 体检卡黑屏事故：前端引用 ownPortLanExposed 而 Rust 无此字段）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExposedPort {
+    pub command: String,
+    pub pid: u32,
+    pub port: u16,
+}
+
 /// 网关路由采集结果。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,6 +112,10 @@ pub struct NetworkAuditReport {
     /// P1-2 账本视角：未结的接管账本摘要（None = 无未结账本）。
     /// 与 MCP 侧 audit_network 的 openLedger 字段同源同语义。
     pub open_ledger: Option<serde_json::Value>,
+    /// 本程序端口（7891/7892/7893）中绑在非回环地址的 = 局域网可达。
+    /// 前端体检卡直接消费此字段（v0.3.0 曾因缺它整页白屏崩溃）。
+    /// 与 MCP 侧 ownPortLanExposed 同形。
+    pub own_port_lan_exposed: Vec<ExposedPort>,
     pub route: RouteState,
     pub tun_interfaces: Vec<String>,
     pub dns: DnsState,
@@ -454,6 +470,17 @@ pub fn audit(own_ports: &[u16], our_pids: &[u32]) -> NetworkAuditReport {
         .map(|d| d.as_secs().to_string())
         .unwrap_or_default();
 
+    // 本程序端口绑在非回环 = 局域网可达（P0-2 钉回环的现值复核，与 MCP 同口径）
+    let own_port_lan_exposed: Vec<ExposedPort> = listen_sockets
+        .iter()
+        .filter(|s| own_ports.contains(&s.port) && s.lan_exposed)
+        .map(|s| ExposedPort {
+            command: s.command.clone(),
+            pid: s.pid,
+            port: s.port,
+        })
+        .collect();
+
     NetworkAuditReport {
         ts,
         foreign_procs,
@@ -461,6 +488,7 @@ pub fn audit(own_ports: &[u16], our_pids: &[u32]) -> NetworkAuditReport {
         listen_sockets,
         stale_proxy,
         open_ledger,
+        own_port_lan_exposed,
         route,
         tun_interfaces,
         dns,
@@ -670,5 +698,41 @@ good 42 u f T D S TCP 127.0.0.1:9999 (LISTEN)\n";
         assert!(run_capped("/usr/bin/true", &[], 1000).is_ok());
         assert!(run_capped("/usr/bin/false", &[], 1000).is_err());
         assert!(run_capped("/nonexistent/bin", &[], 1000).is_err());
+    }
+
+    /// 前端契约锁：Dashboard 体检卡直接消费 audit.ownPortLanExposed /
+    /// audit.staleProxy.detected / audit.pacEnabled 等键——v0.3.0 曾因 Rust 报告
+    /// 缺 ownPortLanExposed 且前端无防护，点「开始体检」渲染崩溃整页黑屏。
+    /// 报告 JSON 键集合必须与前端引用逐一对应，改字段名 = 崩 GUI，必须有测试挡。
+    /// （前端侧同时已加可选链防御，双保险；本锁保"字段存在"这半边。）
+    #[test]
+    fn report_json_keys_match_frontend_contract() {
+        let r = NetworkAuditReport {
+            ts: "0".into(),
+            foreign_procs: vec![],
+            port_conflicts: vec![],
+            listen_sockets: vec![],
+            stale_proxy: StaleProxyState { detected: false, detail: String::new() },
+            open_ledger: None,
+            own_port_lan_exposed: vec![ExposedPort { command: "mihomo".into(), pid: 1, port: 7891 }],
+            route: RouteState { state: Triage::Yes, gateway: String::new(), interface: "en0".into(), tun_interface: false },
+            tun_interfaces: vec![],
+            dns: DnsState { state: Triage::Yes, nameservers: vec![], note: String::new() },
+            pac_enabled: Triage::No,
+            env_proxy: EnvProxyHints { vars: vec![], shell_profile_hits: vec![] },
+            summary: String::new(),
+            degraded: vec![],
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        for key in [
+            "foreignProcs", "portConflicts", "listenSockets", "staleProxy",
+            "openLedger", "ownPortLanExposed", "route", "tunInterfaces",
+            "dns", "pacEnabled", "envProxy", "summary", "degraded",
+        ] {
+            assert!(v.get(key).is_some(), "体检报告缺前端契约键 {key}（GUI 会白屏）");
+        }
+        // 嵌套消费点：前端直接读 staleProxy.detected / ownPortLanExposed[].port
+        assert!(v["staleProxy"].get("detected").is_some());
+        assert_eq!(v["ownPortLanExposed"][0]["port"], serde_json::json!(7891));
     }
 }

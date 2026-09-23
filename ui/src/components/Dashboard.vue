@@ -48,15 +48,15 @@
       <p class="muted">只读检查第三方代理、端口占用、崩溃残留、路由 / DNS / PAC，不会改动任何设置。</p>
       <template v-if="audit">
         <p class="muted">结论：<strong>{{ audit.summary }}</strong>（{{ auditTimeText }}）</p>
-        <ul class="foreign-list" v-if="audit.foreignProcs.length || audit.portConflicts.length || audit.staleProxy.detected || audit.ownPortLanExposed.length || audit.pacEnabled === 'yes' || audit.openLedger">
-          <li v-for="(p, i) in audit.foreignProcs" :key="'f' + i">第三方代理：{{ p }}</li>
-          <li v-for="(c, i) in audit.portConflicts" :key="'c' + i">端口 {{ c.port }} 被 {{ c.holderCommand }} (PID {{ c.holderPid }}) 占用</li>
-          <li v-for="(s, i) in audit.ownPortLanExposed" :key="'l' + i">端口 {{ s.port }} 对局域网暴露（{{ s.command }}）</li>
-          <li v-if="audit.staleProxy.detected">系统代理残留：{{ audit.staleProxy.detail }}</li>
+        <ul class="foreign-list" v-if="audit.foreignProcs?.length || audit.portConflicts?.length || audit.staleProxy?.detected || audit.ownPortLanExposed?.length || audit.pacEnabled === 'yes' || audit.openLedger">
+          <li v-for="(p, i) in (audit.foreignProcs || [])" :key="'f' + i">第三方代理：{{ p }}</li>
+          <li v-for="(c, i) in (audit.portConflicts || [])" :key="'c' + i">端口 {{ c.port }} 被 {{ c.holderCommand }} (PID {{ c.holderPid }}) 占用</li>
+          <li v-for="(s, i) in (audit.ownPortLanExposed || [])" :key="'l' + i">端口 {{ s.port }} 对局域网暴露（{{ s.command }}）</li>
+          <li v-if="audit.staleProxy?.detected">系统代理残留：{{ audit.staleProxy.detail }}</li>
           <li v-if="audit.pacEnabled === 'yes'">PAC 自动代理已启用</li>
           <li v-if="audit.openLedger">未结接管账本：{{ audit.openLedger.reason }}（{{ audit.openLedger.entries }} 项在册）</li>
         </ul>
-        <p class="muted" v-if="audit.degraded.length">⚠ 部分项目未能采集：{{ audit.degraded.join('、') }}</p>
+        <p class="muted" v-if="audit.degraded?.length">⚠ 部分项目未能采集：{{ audit.degraded.join('、') }}</p>
       </template>
     </section>
     <div class="stat-grid">
