@@ -190,6 +190,117 @@ fn get_proxy_detail(svc: &str, flag: &str, want_port: u16, expect_on: bool, erro
     }
 }
 
+/// 单个服务在某一代理通道上的【完整原值】（P1-2 账本快照用）。
+/// 与 ServiceProxyState 的"达标"语义不同：这里如实记录 enabled/server/port，
+/// 回放时才能把系统恢复成接管前的样子，而不是恢复成"达标"。
+#[derive(Debug, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyChannelRaw {
+    pub enabled: bool,
+    pub server: String,
+    pub port: u16,
+}
+
+/// 一个网络服务三条通道的完整原值快照。
+#[derive(Debug, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceSnapshot {
+    pub service: String,
+    pub http: ProxyChannelRaw,
+    pub https: ProxyChannelRaw,
+    pub socks: ProxyChannelRaw,
+    /// 读取失败时非空；回放遇到有 error 的通道会跳过（宁可不还原，不能瞎写）
+    pub errors: Vec<String>,
+}
+
+/// 逐服务读取【完整原值】（P1-2 接管账本的 before 快照）。
+/// 读法沿用 -getwebproxy 三件套（真机唯一可靠读法）。
+pub fn snapshot_system_proxy() -> Vec<ServiceSnapshot> {
+    list_services()
+        .iter()
+        .map(|svc| {
+            let mut errors = Vec::new();
+            let http = read_channel(svc, "-getwebproxy", &mut errors);
+            let https = read_channel(svc, "-getsecurewebproxy", &mut errors);
+            let socks = read_channel(svc, "-getsocksfirewallproxy", &mut errors);
+            ServiceSnapshot {
+                service: svc.clone(),
+                http,
+                https,
+                socks,
+                errors,
+            }
+        })
+        .collect()
+}
+
+fn read_channel(svc: &str, flag: &str, errors: &mut Vec<String>) -> ProxyChannelRaw {
+    match run(NETWORKSETUP, &[flag, svc]) {
+        Ok(out) => {
+            let (enabled, port) = parse_proxy_detail(&out);
+            let server = parse_proxy_server(&out);
+            ProxyChannelRaw {
+                enabled,
+                server,
+                port,
+            }
+        }
+        Err(e) => {
+            errors.push(format!("{flag}: {e}"));
+            ProxyChannelRaw {
+                enabled: false,
+                server: String::new(),
+                port: 0,
+            }
+        }
+    }
+}
+
+/// 解析 -get*proxy 输出的 Server 行（真机格式 "Server: 127.0.0.1"）。
+fn parse_proxy_server(out: &str) -> String {
+    for line in out.lines() {
+        let l = line.trim();
+        if let Some(v) = l.strip_prefix("Server:") {
+            return v.trim().to_string();
+        }
+    }
+    String::new()
+}
+
+/// 按快照把某服务的某通道恢复回原值（P1-2 账本回放的最小单元）。
+/// 返回 Err 只在该通道【写命令失败】时发生；回放调用方汇总后如实上报，绝不静默。
+fn restore_channel(svc: &str, flag: &str, state_flag: &str, raw: &ProxyChannelRaw) -> Result<(), String> {
+    if raw.enabled {
+        let port = raw.port.to_string();
+        let server = if raw.server.is_empty() { "127.0.0.1".to_string() } else { raw.server.clone() };
+        run(NETWORKSETUP, &[flag, svc, &server, &port])?;
+        run(NETWORKSETUP, &[state_flag, svc, "on"])?;
+    } else {
+        run(NETWORKSETUP, &[state_flag, svc, "off"])?;
+    }
+    Ok(())
+}
+
+/// 按快照逆序回放一个服务（HTTP→HTTPS→SOCKS 的写入顺序与接管时一致）。
+/// 有 error 的通道跳过还原并如实记入返回的错误清单（宁可不还原，不能凭 unknown 瞎写）。
+pub fn restore_service_snapshot(snap: &ServiceSnapshot) -> Vec<String> {
+    let mut errs = Vec::new();
+    if !snap.errors.is_empty() {
+        errs.push(format!("{}: 快照不完整（{}），跳过还原", snap.service, snap.errors.join("；")));
+        return errs;
+    }
+    if let Err(e) = restore_channel(&snap.service, "-setwebproxy", "-setwebproxystate", &snap.http) {
+        errs.push(format!("{}: http 还原失败 {e}", snap.service));
+    }
+    if let Err(e) = restore_channel(&snap.service, "-setsecurewebproxy", "-setsecurewebproxystate", &snap.https) {
+        errs.push(format!("{}: https 还原失败 {e}", snap.service));
+    }
+    if let Err(e) = restore_channel(&snap.service, "-setsocksfirewallproxy", "-setsocksfirewallproxystate", &snap.socks) {
+        errs.push(format!("{}: socks 还原失败 {e}", snap.service));
+    }
+    errs
+}
+
 /// 解析 -get*proxy 输出：提取 Enabled 布尔与 Port。无法解析视为关/0。
 fn parse_proxy_detail(out: &str) -> (bool, u16) {
     let mut enabled = false;

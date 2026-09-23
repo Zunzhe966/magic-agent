@@ -97,6 +97,9 @@ pub struct NetworkAuditReport {
     pub listen_sockets: Vec<ListenSocket>,
     /// 崩溃残留：系统代理指向本程序死端口
     pub stale_proxy: StaleProxyState,
+    /// P1-2 账本视角：未结的接管账本摘要（None = 无未结账本）。
+    /// 与 MCP 侧 audit_network 的 openLedger 字段同源同语义。
+    pub open_ledger: Option<serde_json::Value>,
     pub route: RouteState,
     pub tun_interfaces: Vec<String>,
     pub dns: DnsState,
@@ -433,7 +436,19 @@ pub fn audit(own_ports: &[u16], our_pids: &[u32]) -> NetworkAuditReport {
     // 8) 环境变量代理
     let env_proxy = collect_env_proxy();
 
-    let summary = build_summary(&foreign_procs, &port_conflicts, &stale_proxy, &route, &pac_enabled, &degraded);
+    // 9) P1-2 账本视角：未结账本如实入报告（读账本失败按降级处理，不炸整报）
+    let open_ledger = match crate::ledger::LedgerFile::default().open_session() {
+        Some(session) => serde_json::to_value(serde_json::json!({
+            "id": session.id,
+            "reason": session.reason,
+            "startedTs": session.started_ts,
+            "entries": session.entries.len(),
+        }))
+        .ok(),
+        None => None,
+    };
+
+    let summary = build_summary(&foreign_procs, &port_conflicts, &stale_proxy, &route, &pac_enabled, open_ledger.is_some(), &degraded);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
@@ -445,6 +460,7 @@ pub fn audit(own_ports: &[u16], our_pids: &[u32]) -> NetworkAuditReport {
         port_conflicts,
         listen_sockets,
         stale_proxy,
+        open_ledger,
         route,
         tun_interfaces,
         dns,
@@ -485,6 +501,7 @@ fn build_summary(
     stale: &StaleProxyState,
     route: &RouteState,
     pac: &Triage,
+    open_ledger: bool,
     degraded: &[String],
 ) -> String {
     let mut items: Vec<String> = Vec::new();
@@ -502,6 +519,9 @@ fn build_summary(
     }
     if route.tun_interface {
         items.push(format!("默认路由走 {}", route.interface));
+    }
+    if open_ledger {
+        items.push("存在未结接管账本".into());
     }
     let mut s = if items.is_empty() { "未发现混乱源".into() } else { items.join("、") };
     if !degraded.is_empty() {
@@ -627,11 +647,13 @@ good 42 u f T D S TCP 127.0.0.1:9999 (LISTEN)\n";
             &StaleProxyState { detected: true, detail: "x".into() },
             &RouteState { state: Triage::Yes, gateway: "g".into(), interface: "utun5".into(), tun_interface: true },
             &Triage::No,
+            true,
             &[],
         );
         assert!(s.contains("1 个第三方代理进程"));
         assert!(s.contains("死端口"));
         assert!(s.contains("utun5"));
+        assert!(s.contains("未结接管账本"));
     }
 
     /// run_capped：超时路径必须返回 Err 而非挂死（sleep 10s，上限 200ms）

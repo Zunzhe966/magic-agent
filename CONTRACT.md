@@ -119,6 +119,14 @@ App 已内置 updater（`tauri.conf.json` → `plugins.updater.active=true`，en
   **只能按内核进程判定（pgrep runtime 路径），绝不能用"own 端口有 LISTEN"**——
   第三方占用 7891 时会把真·死端口残留漏报（2026-09-23 回归测试抓出，两侧已修并有回归锁）。
   体检是纯只读：任何写系统状态的诉求走 start/stop，不许塞进 audit。
+- **接管账本红线（P1-2 落地后新增）**：`ledger.json` 的 schema（camelCase 键集）
+  两侧必须逐键一致，改字段名 = 破坏双引擎共账，两侧各有 schema 契约锁测试挡。
+  **先记账后动手**：begin_takeover 必须在任何状态变更（杀进程/关系统代理）之前；
+  已有 open 会话时 begin 幂等跳过，before 永远是【最初】原值。
+  **启动清理 ≠ 接管**：App 启动 800ms 自动清理不记账（否则永远有"未结账本"假象），
+  只有显式接管入口（start_proxy / UI 一键清理 / MCP start）留账。
+  stop/exit 只结账**不回滚**——回放还原属 P1-4，落地前不得在结账路径偷加还原。
+  损坏账本必须先保全 .corrupt 证据再从零继续，绝不静默丢证据。
 
 ## 回滚
 

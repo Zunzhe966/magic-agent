@@ -3,6 +3,7 @@ mod auditor;
 // config / mihomo 对 bin 工具（dump_conf）公开
 pub mod config;
 mod keychain;
+mod ledger;
 pub mod mihomo;
 mod ssh;
 mod system_proxy;
@@ -181,7 +182,12 @@ fn log_proxy_set_result(caller: &str, r: &system_proxy::SystemProxyStatus) {
 /// 1) 杀掉第三方代理进程（先温和 TERM，1.5 秒后仍在则 KILL）
 /// 2) 关闭系统代理设置，让网络回到"未设代理"的干净状态
 ///
-/// 返回清理掉的进程描述列表（供 UI 提示）。
+/// **P1-2 账本立场（CONTRACT：启动清理 ≠ 接管）**：本函数自身不记账。
+/// 记账由【显式接管入口】包裹：start_proxy / kill_foreign_proxies(UI 一键清理)
+/// 在调用本函数前 begin_takeover 快照原值、调用后把被杀进程入账。
+/// App 启动 800ms 后的自动清理不调账本入口（不是接管，不留 open 会话）。
+///
+/// 返回清理掉的进程描述列表（供 UI 提示 / 入账）。
 fn cleanup_foreign_proxies() -> Vec<String> {
     let victims = find_foreign_proxies();
     let mut cleaned = Vec::new();
@@ -268,12 +274,29 @@ fn check_conflicts_blocking() -> ConflictInfo {
     }
 }
 
+/// P1-2 显式接管入口（带账清理）：用户主动发起的"把系统交给我管"才走这里。
+/// 顺序即正确性：先 begin_takeover 快照【动手前】的逐服务原值，再执行清理，
+/// 最后把被杀进程入账（不可逆项 reversible=false）。
+/// App 启动 800ms 的自动清理不走此入口（启动清理 ≠ 接管，不留 open 会话）。
+fn takeover_cleanup(reason: &str) -> Vec<String> {
+    let ledger_file = ledger::LedgerFile::default();
+    if let Err(e) = ledger_file.begin_takeover(reason, system_proxy::snapshot_system_proxy()) {
+        // 记账失败不阻断接管（恢复网络秩序优先），但必须日志点名——静默=没有账
+        eprintln!("[ledger] WARN begin_takeover 失败（本次接管不留账）: {e}");
+    }
+    let cleaned = cleanup_foreign_proxies();
+    if let Err(e) = ledger_file.record_killed_procs(&cleaned) {
+        eprintln!("[ledger] WARN record_killed_procs 失败: {e}");
+    }
+    cleaned
+}
+
 /// 供前端调用的「一键清理第三方代理」命令：
 /// 杀掉所有第三方代理进程 + 关闭系统代理，把系统恢复到干净状态。
 #[tauri::command]
 async fn kill_foreign_proxies() -> Vec<String> {
     // 杀进程含 SIGTERM→等待→SIGKILL，最多约 1.5 秒，改 async 避免卡主线程
-    tauri::async_runtime::spawn_blocking(cleanup_foreign_proxies)
+    tauri::async_runtime::spawn_blocking(|| takeover_cleanup("kill_foreign_proxies(UI 一键清理)"))
         .await
         .unwrap_or_default()
 }
@@ -835,17 +858,29 @@ async fn start_proxy(
     }
     // 启动的慢操作整体挪到线程池
     let status = tauri::async_runtime::spawn_blocking(move || -> Result<MihomoStatus, String> {
-        // 启动前自动清理所有第三方代理：杀掉 FlClash/Clash 等进程 + 关闭系统代理，
-        // 让系统回到「未设代理」的干净状态，再启动本程序的代理。
-        cleanup_foreign_proxies();
-        // 无节点时 mihomo 的 fallback 组 proxies 为空，配置校验会失败且错误晦涩。提前拦截。
+        // 前置检查放在接管之前：无节点时根本不该动系统（原顺序会先清屏再报"没节点"）。
+        // 无节点时 mihomo 的 fallback 组 proxies 为空，配置校验会失败且错误晦涩。
         if cfg.nodes.is_empty() {
             return Err("尚未添加任何代理节点，请先到「云服务器」页添加节点或拉取订阅".to_string());
         }
+        // 用户点「启动代理」= 显式接管：先记账（快照逐服务原值）再清理第三方代理
+        // （杀 FlClash/Clash 等 + 关系统代理），让系统回到「未设代理」的干净状态，
+        // 再启动本程序的代理。
+        takeover_cleanup("start_proxy");
         // 复用 App 扫描缓存，避免启动时全盘扫描
         let app_rules = effective_app_rules_with(&cfg, Some(&apps_cache));
         let mihomo = MihomoManager::new();
-        let status = mihomo.start(&cfg, &[], &app_rules)?;
+        let status = match mihomo.start(&cfg, &[], &app_rules) {
+            Ok(s) => s,
+            Err(e) => {
+                // 清理已执行但内核没起来：结账并如实记录，绝不留"幽灵未结账本"
+                // （未结账本的语义 = 接管生效中且系统状态已被改变待还原）
+                if let Err(le) = ledger::LedgerFile::default().settle_open(&format!("start_proxy 失败：{e}")) {
+                    eprintln!("[ledger] WARN 启动失败后结账失败: {le}");
+                }
+                return Err(e);
+            }
+        };
         if cfg.system_proxy {
             // P0-1：启动后设置系统代理并逐服务回读。部分服务没设上不会断网
             // （那些服务退化为直连），但必须如实记日志，杜绝"报成功实际半套"。
@@ -885,6 +920,14 @@ async fn stop_proxy(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(),
         mihomo.stop();
         if let Ok(r) = system_proxy::set_system_proxy(false, port) {
             log_proxy_set_result("stop_proxy", &r);
+        }
+        // P1-2：正常停止 = 接管结束，结账。
+        // 注意本步只结账不回放原值——一键还原是 P1-4 的 restore_network，
+        // 停止的既有语义（关系统代理回直连）保持不变，不得偷偷扩权。
+        match ledger::LedgerFile::default().settle_open("stop_proxy") {
+            Ok(true) => eprintln!("[ledger] 接管已结账（stop_proxy）"),
+            Ok(false) => {} // 无未结账本（如 MCP 侧已结），幂等正常
+            Err(e) => eprintln!("[ledger] WARN settle 失败: {e}"),
         }
     })
     .await
@@ -1429,6 +1472,30 @@ pub fn run() {
     // 放后台线程会与 800ms 后的 cleanup_foreign_proxies 竞态。
     startup_self_check(&state);
 
+    // P1-2 未结账本提示：正常退出/停止都会 settle，账本仍为 open = 上次
+    // 接管未经正常结束（kill -9/断电/MCP 侧异常）。如实一次性提示。
+    // ⚠️ 只提示不自动回放——还原动作属 P1-4（restore_network），
+    // 且 CONTRACT 红线：还原能力未落地前 UI 不得宣称"可回滚"。
+    {
+        if let Some(session) = ledger::LedgerFile::default().open_session() {
+            let proxy_items = session.entries.iter().filter(|e| e.kind == "system_proxy").count();
+            let killed = session.entries.iter().filter(|e| e.kind == "process").count();
+            let notice = format!(
+                "上次接管（{}，开始于 {}，{} 项系统代理原值在册{}）未正常结账。启动代理或清理时账本继续沿用最初原值；如需还原请等「一键还原」功能或手动检查系统代理设置。",
+                session.reason,
+                session.started_ts,
+                proxy_items,
+                if killed > 0 { format!("，关闭了 {killed} 个第三方进程（不可逆）") } else { String::new() },
+            );
+            let slot = state.lock().unwrap().self_heal_notice.clone();
+            let mut g = slot.lock().unwrap();
+            *g = Some(match g.take() {
+                Some(prev) => format!("{prev} {notice}"),
+                None => notice,
+            });
+        }
+    }
+
     // mihomo 看门狗：每 30s 检查一次。用户启动代理后 should_run=true，
     // 若 mihomo 崩溃（端口探测失败）则自动拉起——但只走特权控制器零弹窗路径
     // （ctl("start")），不弹 osascript 反复骚扰用户。重启失败则关掉系统代理，
@@ -1542,6 +1609,12 @@ pub fn run() {
                 match system_proxy::set_system_proxy(false, g.mihomo.port) {
                     Ok(r) => log_proxy_set_result("exit", &r),
                     Err(e) => eprintln!("[magic-agent] WARN 退出时关闭系统代理失败: {e}"),
+                }
+                // P1-2：正常退出 = 接管结束，结账（与 stop_proxy 同语义，只结账不回滚）
+                match ledger::LedgerFile::default().settle_open("app_exit") {
+                    Ok(true) => eprintln!("[ledger] 接管已结账（app_exit）"),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("[ledger] WARN 退出结账失败: {e}"),
                 }
                 eprintln!("[magic-agent] RunEvent::Exit：收尾完成");
             }

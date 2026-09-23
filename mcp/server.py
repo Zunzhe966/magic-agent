@@ -428,6 +428,161 @@ def write_config(cfg):
         pass
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# P1-2 接管账本（ledger.json）——与 Rust src-tauri/src/ledger.rs 共写同一文件，
+# schema 逐键一致（camelCase：version/sessions/id/status/reason/startedTs/
+# settledTs/settledReason/entries/kind/key/before/after/reversible/ts）。
+# 立场：接管必须先记账后动手；启动清理 ≠ 接管（只有显式启停/接管入口留账）。
+# JSON 键改动必须两侧同步（schema 回归锁在 tests/test_regressions.py）。
+# ─────────────────────────────────────────────────────────────────────────────
+
+LEDGER_PATH = os.path.expanduser('~/Library/Application Support/magic-agent/ledger.json')
+
+
+def _now_ts():
+    return int(time.time())
+
+
+def _ledger_load():
+    """读账本。缺失→空；损坏→原文件保全为 .corrupt 证据（已有 corrupt 不覆盖，
+    加时间戳另存）后从空账本继续。返回 (ledger, note)，note 非空必须打日志——静默=丢证据。
+    与 Rust ledger.rs::load 同语义。"""
+    if not os.path.exists(LEDGER_PATH):
+        return {'version': 1, 'sessions': []}, None
+    try:
+        with open(LEDGER_PATH) as f:
+            data = json.load(f)
+        if (not isinstance(data, dict) or not isinstance(data.get('version'), int)
+                or data.get('version', 0) < 1 or not isinstance(data.get('sessions'), list)):
+            raise ValueError('schema 异常')
+        return data, None
+    except Exception as e:
+        base = LEDGER_PATH + '.corrupt'
+        bak = base if not os.path.exists(base) else f'{base}.{_now_ts()}'
+        try:
+            os.rename(LEDGER_PATH, bak)
+            note = f'账本损坏（{e}），原文件已保全为 {bak}，从空账本继续'
+        except OSError as re_e:
+            note = f'账本损坏（{e}），且备份失败（{re_e}），从空账本继续'
+        return {'version': 1, 'sessions': []}, note
+
+
+def _ledger_save(ledger):
+    # 原子写 + 0600（chmod 在 rename 前，与 Rust 同序，防泄露窗口）
+    os.makedirs(os.path.dirname(LEDGER_PATH), exist_ok=True)
+    tmp = LEDGER_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(ledger, f, ensure_ascii=False, indent=2)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, LEDGER_PATH)
+
+
+def _snapshot_channel(svc, flag):
+    """单通道完整原值（enabled/server/port）——还原的依据，不是"达标"判定。
+    读法用 -get*proxy 三件套（真机唯一可靠读法）。失败返回兜底值 + error。"""
+    try:
+        p = subprocess.run(['/usr/sbin/networksetup', flag, svc],
+                           capture_output=True, text=True, timeout=10)
+        if p.returncode != 0:
+            return {'enabled': False, 'server': '', 'port': 0}, f'{flag}: {p.stderr.strip()}'
+        enabled, port = _parse_proxy_detail(p.stdout)
+        server = ''
+        for line in p.stdout.splitlines():
+            s = line.strip()
+            if s.startswith('Server:'):
+                server = s.split(':', 1)[1].strip()
+        return {'enabled': enabled, 'server': server, 'port': port}, None
+    except Exception as e:
+        return {'enabled': False, 'server': '', 'port': 0}, f'{flag}: {e}'
+
+
+def snapshot_system_proxy():
+    """逐服务完整原值快照（账本 before）。与 Rust system_proxy::snapshot_system_proxy 同语义。"""
+    snaps = []
+    for svc in list_network_services():
+        errors = []
+        channels = {}
+        for key, flag in (('http', '-getwebproxy'), ('https', '-getsecurewebproxy'), ('socks', '-getsocksfirewallproxy')):
+            ch, err = _snapshot_channel(svc, flag)
+            channels[key] = ch
+            if err:
+                errors.append(err)
+        snaps.append({'service': svc, **channels, 'errors': errors})
+    return snaps
+
+
+def ledger_begin(reason):
+    """接管开始记账：必须在任何状态变更前调用。已有 open 会话 → 不动账本
+    （before 永远是【最初】原值），返回 False。与 Rust begin_takeover 同语义。"""
+    ledger, note = _ledger_load()
+    if note:
+        print(f'[ledger] {note}', file=sys.stderr)
+    if any(s.get('status') == 'open' for s in ledger['sessions']):
+        return False
+    ts = _now_ts()
+    entries = [{
+        'kind': 'system_proxy', 'key': s['service'], 'before': s,
+        'after': None, 'reversible': True, 'ts': ts,
+    } for s in snapshot_system_proxy()]
+    session = {
+        'id': f'ls-{ts}-{os.getpid()}', 'status': 'open', 'reason': reason,
+        'startedTs': ts, 'entries': entries,
+    }
+    ledger['sessions'].append(session)
+    _ledger_save(ledger)
+    return True
+
+
+def ledger_record_killed(procs):
+    """被清理的第三方进程入账（不可逆项 reversible=false）。无 open 会话静默跳过。"""
+    if not procs:
+        return
+    ledger, note = _ledger_load()
+    if note:
+        print(f'[ledger] {note}', file=sys.stderr)
+    ts = _now_ts()
+    for s in ledger['sessions']:
+        if s.get('status') == 'open':
+            s['entries'].extend({
+                'kind': 'process', 'key': p, 'before': 'running',
+                'after': 'killed', 'reversible': False, 'ts': ts,
+            } for p in procs)
+            break
+    _ledger_save(ledger)
+
+
+def ledger_settle(reason):
+    """结账（接管正常结束）。无 open 会话返回 False，幂等。与 Rust settle_open 同语义。"""
+    ledger, note = _ledger_load()
+    if note:
+        print(f'[ledger] {note}', file=sys.stderr)
+    done = False
+    for s in ledger['sessions']:
+        if s.get('status') == 'open':
+            s['status'] = 'settled'
+            s['settledTs'] = _now_ts()
+            s['settledReason'] = reason
+            done = True
+            break
+    if done:
+        _ledger_save(ledger)
+    return done
+
+
+def ledger_open_session():
+    """当前未结账本（dict 或 None）。损坏保全 note 同样如实打日志。"""
+    ledger, note = _ledger_load()
+    if note:
+        print(f'[ledger] {note}', file=sys.stderr)
+    for s in ledger['sessions']:
+        if s.get('status') == 'open':
+            return s
+    return None
+
+
 def mihomo_running():
     """内核是否【真正在服务】（与 Rust 侧 mihomo.rs::status 逻辑保持一致）。
 
@@ -1729,6 +1884,12 @@ def audit_network(args=None):
     lan_open = [{'command': s['command'], 'pid': s['pid'], 'port': s['port']}
                 for s in sockets if s['lanExposed'] and s['port'] in _AUDIT_OWN_PORTS]
     route = _audit_route()
+    # P1-2：账本视角也是"秩序"的一部分——未结账本必须出现在体检结论里
+    open_ledger = None
+    try:
+        open_ledger = ledger_open_session()
+    except Exception as e:
+        print(f'[ledger] WARN 体检读取账本失败: {e}', file=sys.stderr)
     summary_bits = []
     if foreign:
         summary_bits.append(f'{len(foreign)} 个第三方代理进程')
@@ -1742,6 +1903,8 @@ def audit_network(args=None):
         summary_bits.append(f'{len(lan_open)} 个本程序端口对局域网暴露')
     if route.get('tunInterface'):
         summary_bits.append(f"默认路由走 {route['interface']}")
+    if open_ledger:
+        summary_bits.append(f"存在未结接管账本（{open_ledger.get('reason')}）")
     summary = '、'.join(summary_bits) if summary_bits else '未发现混乱源'
     if degraded:
         summary += f'（{len(degraded)} 项采集降级）'
@@ -1751,6 +1914,7 @@ def audit_network(args=None):
         'portConflicts': conflicts,
         'ownPortLanExposed': lan_open,
         'staleProxy': stale,
+        'openLedger': open_ledger,
         'route': route,
         'dns': _audit_dns(),
         'pacEnabled': pac,
@@ -2041,8 +2205,21 @@ def call_tool(name, args):
                 except Exception as e:
                     return {'ok': False, 'message': f'内核在运行但关系统代理失败: {e}'}
             return {'ok': True, 'message': '代理已在运行'}
-        regenerate_config()
-        pid = start_mihomo()
+        # P1-2 显式接管入口：内核即将启动+可能改系统代理 = 改变系统状态，
+        # 必须先记账（快照逐服务原值）再动手。失败路径结账，不留幽灵账本。
+        try:
+            ledger_begin('mcp:start_proxy')
+        except Exception as e:
+            print(f'[ledger] WARN begin 失败（本次接管不留账）: {e}', file=sys.stderr)
+        try:
+            regenerate_config()
+            pid = start_mihomo()
+        except Exception as e:
+            try:
+                ledger_settle(f'mcp:start_proxy 失败：{e}')
+            except Exception as le:
+                print(f'[ledger] WARN 启动失败后结账失败: {le}', file=sys.stderr)
+            raise
         # 与 Rust 侧 start_proxy 一致：只在 config.systemProxy=true 时才开系统代理。
         # TUN 模式下不开（TUN 已接管全局，再开系统代理是双开冗余）。
         cfg2 = read_config()
@@ -2061,6 +2238,13 @@ def call_tool(name, args):
             set_system_proxy(False)
         except Exception as e:
             return {'ok': False, 'message': f'内核已停止，但关系统代理失败: {e}'}
+        # P1-2：正常停止 = 接管结束，结账（只结账不回滚，与 Rust 同语义）。
+        # 注意：Rust App 看门狗可能随后复活内核（CONTRACT 已登记的已知缺陷），
+        # 账本视角 stop 已结账如实；仲裁属 P2-1。
+        try:
+            ledger_settle('mcp:stop_proxy')
+        except Exception as e:
+            print(f'[ledger] WARN settle 失败: {e}', file=sys.stderr)
         return {'ok': True, 'message': '代理已停止'}
     elif name == 'list_nodes':
         cfg = read_config()

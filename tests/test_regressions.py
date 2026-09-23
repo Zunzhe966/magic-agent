@@ -396,3 +396,97 @@ def test_audit_network_registered_in_tools_and_dispatch():
     src = (pathlib.Path(__file__).resolve().parents[1] / 'mcp' / 'server.py').read_text(encoding='utf-8')
     assert "'audit_network': _tool_schema()" in src
     assert "elif name == 'audit_network':" in src
+
+
+# ── P1-2 接管账本（与 Rust ledger.rs 共写同一 ledger.json）──
+
+def _audit_proxy_line(on, port=7890, server_ip='127.0.0.1'):
+    if on:
+        return f'Enabled: Yes\nServer: {server_ip}\nPort: {port}\nAuthenticated Proxy Enabled: 0'
+    return 'Enabled: No\nServer: \nPort: 0\nAuthenticated Proxy Enabled: 0'
+
+
+def _fake_ledger_networksetup(webproxy_on=True, port=7890):
+    def runner(cmd, **kw):
+        if cmd[0] == '/usr/sbin/networksetup':
+            flag = cmd[1]
+            if flag == '-listallnetworkservices':
+                return _Proc(stdout='Wi-Fi\nUSB 10/100 LAN\n')
+            if flag == '-getwebproxy':
+                return _Proc(stdout=_audit_proxy_line(webproxy_on, port))
+            return _Proc(stdout=_audit_proxy_line(False))
+        raise AssertionError(f'unexpected cmd {cmd}')
+    return runner
+
+
+def test_ledger_begin_settle_cycle(tmp_path, monkeypatch):
+    """完整周期：begin 记全原值 → 二次 begin 不覆盖 before → settle 结账 → 可再开新会话。"""
+    path = str(tmp_path / 'ledger.json')
+    monkeypatch.setattr(server, 'LEDGER_PATH', path)
+    monkeypatch.setattr(server.subprocess, 'run', _fake_ledger_networksetup(webproxy_on=True, port=7890))
+
+    assert server.ledger_begin('mcp:start_proxy') is True
+    session = server.ledger_open_session()
+    assert session is not None
+    assert session['reason'] == 'mcp:start_proxy'
+    entries = {e['key']: e for e in session['entries']}
+    # before 必须携带【完整原值】：开着指向第三方端口 7890
+    assert entries['Wi-Fi']['before']['http'] == {'enabled': True, 'server': '127.0.0.1', 'port': 7890}
+    assert entries['Wi-Fi']['reversible'] is True
+
+    # 二次接管：幂等，不覆盖最初 before（哪怕现在系统已被改成指向 7891）
+    monkeypatch.setattr(server.subprocess, 'run', _fake_ledger_networksetup(webproxy_on=True, port=7891))
+    assert server.ledger_begin('mcp:start_proxy2') is False
+    session = server.ledger_open_session()
+    assert session['reason'] == 'mcp:start_proxy'
+    assert {e['key']: e for e in session['entries']}['Wi-Fi']['before']['http']['port'] == 7890
+
+    # 被杀进程入账（不可逆）
+    server.ledger_record_killed(['FlClash (PID 123)'])
+    session = server.ledger_open_session()
+    procs = [e for e in session['entries'] if e['kind'] == 'process']
+    assert procs and procs[0]['reversible'] is False
+    assert procs[0]['before'] == 'running' and procs[0]['after'] == 'killed'
+
+    assert server.ledger_settle('mcp:stop_proxy') is True
+    assert server.ledger_open_session() is None
+    assert server.ledger_settle('again') is False  # 幂等
+
+    # 结账后再 begin → 新会话，before 取新原值
+    assert server.ledger_begin('mcp:start_proxy3') is True
+    ledger, _ = server._ledger_load()
+    assert len(ledger['sessions']) == 2
+
+
+def test_ledger_corrupt_preserved_then_empty(tmp_path, monkeypatch, capsys):
+    """损坏账本：保全为 .corrupt 证据（不覆盖已有），从空继续，note 打日志不静默。"""
+    path = tmp_path / 'ledger.json'
+    (tmp_path / 'ledger.json.corrupt').write_text('OLD EVIDENCE')
+    path.write_text('{ not json !!!')
+    monkeypatch.setattr(server, 'LEDGER_PATH', str(path))
+    ledger, note = server._ledger_load()
+    assert ledger['sessions'] == []
+    assert note and '损坏' in note
+    assert (tmp_path / 'ledger.json.corrupt').read_text() == 'OLD EVIDENCE'  # 证据未被覆盖
+    assert not path.exists()  # 损坏文件被移走
+    assert any('ledger' in f.name for f in tmp_path.iterdir() if '.corrupt.' in f.name)  # 时间戳副本
+
+
+def test_ledger_schema_camel_case_contract_with_rust(tmp_path, monkeypatch):
+    """跨引擎契约锁：Python 写的账本 JSON 键必须是 Rust 侧同一套 camelCase。
+    改任一侧字段名 = 破坏共账，必须有测试挡。"""
+    import pathlib
+    path = str(tmp_path / 'ledger.json')
+    monkeypatch.setattr(server, 'LEDGER_PATH', path)
+    monkeypatch.setattr(server.subprocess, 'run', _fake_ledger_networksetup())
+    server.ledger_begin('contract-test')
+    server.ledger_settle('contract-test-end')  # settledTs/settledReason 仅结账后序列化（两侧同语义）
+    text = pathlib.Path(path).read_text(encoding='utf-8')
+    for key in ['"version"', '"sessions"', '"startedTs"', '"settledTs"', '"settledReason"',
+                '"reversible"', '"before"', '"system_proxy"', '"service"', '"http"', '"errors"']:
+        assert key in text, f'账本 JSON 缺契约键 {key}'
+    for bad in ['"started_ts"', '"settled_ts"']:
+        assert bad not in text, f'账本 JSON 出现非契约键 {bad}'
+    # 权限：接管账本含网络配置原值，必须 0600
+    import stat
+    assert stat.S_IMODE(pathlib.Path(path).stat().st_mode) == 0o600

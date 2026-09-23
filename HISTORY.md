@@ -284,6 +284,21 @@
 
 ---
 
+### 2026-09-23（同会话续 2）· P1-2 接管账本落地
+
+| 类型 | 做了什么 |
+|------|----------|
+| feat(P1-2) | **接管账本 `src-tauri/src/ledger.rs`（新模块，~380 行）**：接管"先记账后动手"的凭证。`begin_takeover`（动手前逐服务快照**完整原值** enabled/server/port，是还原依据而非达标判定）→ `record_killed_procs`（被杀第三方进程入账，**不可逆项如实 reversible=false**）→ `settle_open`（正常结束结账）。二次接管幂等——before 永远是【最初】原值不被接管后状态覆盖。损坏→保全 .corrupt 证据（已有不覆盖，时间戳另存）后从空继续；原子写 tmp→chmod 600→rename（config.rs 同序）。Rust 8 项单测含**跨引擎 schema 契约锁**。 |
+| feat | **`system_proxy.rs` 新增快照/回放原语**：`snapshot_system_proxy()`（读 -getwebproxy 三件套完整值）与 `restore_service_snapshot()`（按快照回写单服务，快照不完整的通道宁可不还原、如实报告）——P1-4 一键还原直接消费此接口。 |
+| feat | **接管入口与结账接线**：`takeover_cleanup`=显式接管包装（begin→cleanup→入账），仅 start_proxy（用户点启动）与 kill_foreign_proxies（UI 一键清理）走；**App 启动 800ms 自动清理不记账**（CONTRACT：启动清理 ≠ 接管）。节点缺失前置检查挪到接管之前，mihomo.start 失败即结账——不留幽灵账本。stop_proxy / RunEvent::Exit 结账（**只结账不回滚**，回滚属 P1-4）。启动时检测到未结账本 → selfHealNotice 一次性提示（含接管原因/在册条目/不可逆项数）。 |
+| feat | **MCP 侧同账本**（`mcp/server.py` ledger 段）：与 Rust 共写同一 `ledger.json`（schema 逐键 camelCase 一致，两侧各有契约锁）；start_proxy 未运行路径先记账（失败结账）、stop_proxy 结账；`audit_network` 新增 `openLedger` 字段并计入 summary（Rust 体检同步加，双引擎同口径）。Python +3 回归（完整周期/损坏保全/schema 契约锁含 0600 权限断言）。 |
+| 过程修正 | ① cleanup 一度被设计成"任何清理都记账"，落码时改为显式接管入口才记——启动自动清理不是接管，记了会造成"永远有未结账本"的假象；② 体检报告的 build_summary 增 open_ledger 参数后忘同步测试调用，编译挡下已修；③ 契约测试误断言未结账本含 settledTs（两侧均 skip_serializing_if none，语义一致），测试改先 settle 再断言。 |
+| 验证 | Rust 71 全绿（63→71）、Python 21 全绿（18→21）、parity 0、前端构建过。**真机端到端**：begin 快照真实原值（Wi-Fi http enabled=false/127.0.0.1:7891）→ 不可逆入账 → settle 幂等 → 0600 权限 → 体检报告含 openLedger → 测试账本删除零残留。 |
+
+**下一步**：P1-3 归序流程编排（start_proxy 接 audit：快速/确认双模式）→ P1-4 一键还原 `restore_network` + 看门狗漂移巡检。
+
+---
+
 ## 各版本「增 / 删」总表
 
 | 版本 | 新增 | 删除 |
