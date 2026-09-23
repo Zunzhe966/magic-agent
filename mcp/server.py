@@ -1532,6 +1532,234 @@ def _extract_pct(line, key):
     return 0.0
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# P1-1 audit_network：网络体检（只读采集）。与 Rust 侧 auditor.rs 同口径：
+# 同一份第三方名单、同一组死端口、同样的降级原则（单项失败→unknown 不炸整报）。
+# ─────────────────────────────────────────────────────────────────────────────
+
+_AUDIT_FOREIGN_APPS = [
+    'flclash', 'clash verge', 'clash-verge', 'clashverge', 'clash for windows',
+    'clashx', 'clash-nyanpasu', 'clash.meta', 'v2rayx', 'v2rayu', 'qv2ray',
+    'shadowsocksx', 'shadowsocks-ng', 'surge', 'quantumult', 'stash', 'loon',
+    'sing-box', 'singbox', 'trojan', 'naiveproxy', 'hysteria', 'xray', 'v2ray',
+]
+_AUDIT_FOREIGN_CORES = [
+    'flclashcore', 'clash-verge-service', 'clash-verge-service-ipc', 'verge-mihomo',
+    'clash-meta', 'clash-meta-core', 'sing-box', 'v2ray-core', 'xray-core',
+    'hysteria', 'naive', 'trojan-go',
+]
+# 本程序端口（与 Rust MihomoManager: port=7891, PROXY_PORT=7893, DIRECT_PORT=7892 一致）
+_AUDIT_OWN_PORTS = [7891, 7892, 7893]
+
+
+def _audit_run(bin_, args, cap=3.0):
+    """跑一条采集命令，超时/失败返回 None（降级），绝不抛异常。"""
+    try:
+        p = subprocess.run([bin_] + args, capture_output=True, text=True, timeout=cap)
+        return p.stdout if p.returncode == 0 or p.stdout else None
+    except Exception:
+        return None
+
+
+def _audit_foreign_procs():
+    """第三方代理进程：只匹配可执行路径首 token（与 Rust find_foreign_proxies 同铁律，
+    绝不匹配整个命令行，防误杀 grep/编辑器）。"""
+    out = _audit_run('/bin/ps', ['-axo', 'pid=,args='], 5)
+    if out is None:
+        return None
+    found = []
+    me = str(os.getpid())
+    ppid = str(os.getppid())
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        pid, args_s = parts[0], parts[1]
+        if pid in (me, ppid):
+            continue
+        low = args_s.lower()
+        if ('magic-agent' in low or 'magic_probe' in low or 'dump_conf' in low
+                or RUNTIME_DIR.lower() in low):
+            continue
+        exe = low.split()[0]
+        exe_name = exe.rsplit('/', 1)[-1]
+        hit = None
+        for key in _AUDIT_FOREIGN_APPS:
+            if key in exe or exe_name == key:
+                hit = key
+                break
+        if not hit:
+            for core in _AUDIT_FOREIGN_CORES:
+                if core in exe_name:
+                    hit = core + ' 内核'
+                    break
+        if hit:
+            found.append(f'{hit} (PID {pid})')
+    return found
+
+
+def _audit_listen():
+    """LISTEN 套接字摘要 + 端口占用者映射。"""
+    out = _audit_run('/usr/sbin/lsof', ['-nP', '-iTCP', '-sTCP:LISTEN'], 3)
+    if out is None:
+        return None, None
+    sockets, holders = [], {}
+    for line in out.splitlines()[1:]:
+        cols = line.split()
+        if len(cols) < 9 or cols[-1] != '(LISTEN)':
+            continue
+        name = cols[-2]
+        idx = name.rfind(':')
+        if idx < 0:
+            continue
+        addr, port_s = name[:idx], name[idx + 1:]
+        try:
+            port = int(port_s)
+        except ValueError:
+            continue
+        addr_low = addr.lower()
+        lan = not (addr_low.startswith('127.') or addr in ('::1', '[::1]', 'localhost'))
+        sockets.append({'command': cols[0], 'pid': cols[1], 'port': port, 'lanExposed': lan})
+        holders.setdefault(port, []).append((cols[0], cols[1]))
+    return sockets, holders
+
+
+def _audit_stale_and_pac(holders):
+    """系统代理残留（指向本程序死端口但内核没在跑）+ PAC。
+    kernel_up 判定与 Rust 侧一致：按本程序内核进程存在与否（pgrep runtime 路径），
+    绝不能用"own 端口有 LISTEN"——第三方占用 7891 时会把真·死端口残留漏报。
+    只报告不自愈（改状态是 P1-3 编排的事）。"""
+    text = _audit_run('/usr/sbin/scutil', ['--proxy'], 3)
+    if text is None:
+        return {'detected': False, 'detail': 'scutil 采集失败（unknown）'}, 'unknown'
+    pac = ('yes' if 'ProxyAutoConfigEnable : 1' in text
+           else 'no' if 'ProxyAutoConfigEnable : 0' in text else 'unknown')
+
+    def gport(key):
+        for line in text.splitlines():
+            l = line.strip()
+            if l.startswith(key):
+                try:
+                    return int(l[len(key):].strip().lstrip(':').strip())
+                except ValueError:
+                    return None
+        return None
+
+    pg = _audit_run('/usr/bin/pgrep', ['-f', MIHOMO_PGREP_PATTERN], 3)
+    kernel_up = bool(pg and pg.strip())
+    hits = []
+    if not kernel_up:
+        if 'HTTPEnable : 1' in text:
+            p = gport('HTTPPort')
+            if p in _AUDIT_OWN_PORTS:
+                hits.append(f'HTTP 代理指向死端口 {p}')
+        if 'SOCKSEnable : 1' in text:
+            p = gport('SOCKSPort')
+            if p in _AUDIT_OWN_PORTS:
+                hits.append(f'SOCKS 代理指向死端口 {p}')
+    return {'detected': bool(hits), 'detail': '；'.join(hits)}, pac
+
+
+def _audit_route():
+    text = _audit_run('/sbin/route', ['-n', 'get', 'default'], 3)
+    if text is None:
+        return {'state': 'unknown'}
+    gw = iface = ''
+    for line in text.splitlines():
+        l = line.strip()
+        if l.startswith('gateway:'):
+            gw = l.split(':', 1)[1].strip()
+        elif l.startswith('interface:'):
+            iface = l.split(':', 1)[1].strip()
+    if not gw and not iface:
+        return {'state': 'unknown'}
+    return {'state': 'ok', 'gateway': gw, 'interface': iface,
+            'tunInterface': iface.startswith('utun')}
+
+
+def _audit_dns():
+    text = _audit_run('/usr/sbin/scutil', ['--dns'], 3)
+    if text is None:
+        return {'state': 'unknown', 'nameservers': []}
+    ns = []
+    in_first = False
+    for line in text.splitlines():
+        l = line.strip()
+        if l.startswith('resolver #'):
+            if l == 'resolver #1':
+                in_first = True
+            else:
+                break  # 只取 #1（系统默认出口），后续是分流 resolver
+        elif in_first and l.startswith('nameserver['):
+            rest = l.split(']', 1)[-1].strip().lstrip(':').strip()
+            if rest:
+                ns.append(rest)
+    return {'state': 'ok' if ns else 'unknown', 'nameservers': ns}
+
+
+def _audit_env():
+    names = ['http_proxy', 'https_proxy', 'all_proxy', 'ftp_proxy', 'no_proxy',
+             'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']
+    vars_ = [f'{n}={os.environ[n]}' for n in names if os.environ.get(n)]
+    return {'vars': vars_}
+
+
+def audit_network(args=None):
+    """网络体检总入口（纯只读，零副作用）：看清本机网络秩序现状——
+    第三方代理进程、本程序端口被占/对局域网暴露、崩溃残留系统代理、
+    默认路由与 TUN、DNS 出口、PAC、环境变量代理。不改任何状态。"""
+    degraded = []
+    foreign = _audit_foreign_procs()
+    if foreign is None:
+        degraded.append('foreign_procs')
+        foreign = []
+    sockets, holders = _audit_listen()
+    if sockets is None:
+        degraded.append('listen_sockets')
+        sockets, holders = [], {}
+    conflicts = []
+    for p in _AUDIT_OWN_PORTS:
+        for cmd, pid in (holders or {}).get(p, []):
+            if RUNTIME_DIR.lower() not in cmd.lower():
+                conflicts.append({'port': p, 'holderCommand': cmd, 'holderPid': pid})
+    stale, pac = _audit_stale_and_pac(holders)
+    lan_open = [{'command': s['command'], 'pid': s['pid'], 'port': s['port']}
+                for s in sockets if s['lanExposed'] and s['port'] in _AUDIT_OWN_PORTS]
+    route = _audit_route()
+    summary_bits = []
+    if foreign:
+        summary_bits.append(f'{len(foreign)} 个第三方代理进程')
+    if conflicts:
+        summary_bits.append(f'{len(conflicts)} 个本程序端口被占')
+    if stale['detected']:
+        summary_bits.append('系统代理残留指向死端口')
+    if pac == 'yes':
+        summary_bits.append('PAC 自动代理已启用')
+    if lan_open:
+        summary_bits.append(f'{len(lan_open)} 个本程序端口对局域网暴露')
+    if route.get('tunInterface'):
+        summary_bits.append(f"默认路由走 {route['interface']}")
+    summary = '、'.join(summary_bits) if summary_bits else '未发现混乱源'
+    if degraded:
+        summary += f'（{len(degraded)} 项采集降级）'
+    return {
+        'ts': int(time.time()),
+        'foreignProcs': foreign,
+        'portConflicts': conflicts,
+        'ownPortLanExposed': lan_open,
+        'staleProxy': stale,
+        'route': route,
+        'dns': _audit_dns(),
+        'pacEnabled': pac,
+        'envProxy': _audit_env(),
+        'summary': summary,
+        'degraded': degraded,
+    }
+
+
 def doctor():
     """一键自检：分流引擎、鉴权、fallback 组、节点健康。智能体排查问题的第一入口。"""
     report = {}
@@ -1684,6 +1912,7 @@ TOOLS = [
     {'name': 'node_health', 'description': '全部节点健康探测（延迟）+ fallback 组状态（当前实际使用哪个节点）。判断节点是否挂了/故障转移是否生效用这个'},
     {'name': 'download_proxy', 'description': '【下载/访问网络前先调这个】拿到魔法代理的两条路入口并自己决定走哪条。返回节点代理 http://127.0.0.1:7893（访问国外 GitHub/Google/HuggingFace/国外 API 用这条）、本机直连 http://127.0.0.1:7892（访问国内百度/腾讯/阿里用这条）。魔法代理不替你自动分流，决策权在你：目标在国外走 7893，国内走 7892。可选 {"url":"https://..."} 会附带该域名的国内/国外建议（仅建议，最终你拍板）'},
     {'name': 'doctor', 'description': '一键自检（排查任何"代理好像不对劲"先跑这个）：配置完整性、进程与 API 鉴权、fallback 故障转移组、secret、规则顺序、节点健康，返回各检查项 OK/FAIL'},
+    {'name': 'audit_network', 'description': '【网络体检，纯只读零副作用】看清本机网络秩序现状：第三方代理进程、本程序端口被谁占/是否对局域网暴露、崩溃残留的系统代理死端口、默认路由与 TUN 接口、DNS 出口、PAC、环境变量代理。返回 summary 一句话结论 + degraded 列出采集降级的维度。开代理前或怀疑"网络被人接管"时先跑这个；改状态请走 start_proxy/stop_proxy。'},
     {'name': 'install_privileged_helper', 'description': '一次性安装特权控制器（弹一次管理员授权）：root 控制脚本 + sudoers 白名单。安装后代理启停/重载全部零弹窗。强烈建议安装'},
     {'name': 'probe_route', 'description': '【拿不准走哪条路时先调这个】实测「本机直连(7892) vs 节点代理(7893)」到同一个目标 url 的真实延迟 + 下载吞吐，返回对比数据和明确结论。不再凭国内/国外规则猜，而是实测路况后拍板。如 {"url":"https://huggingface.co"}，可选 {"timeout":12,"read_bytes":262144}'},
     {'name': 'server_metrics', 'description': '云服务器一键探针：远程采集当前激活云服务器的 CPU/内存/磁盘/带宽/负载/在线时长，返回结构化数据。用于远程看清服务器状态（而不是盲敲命令）。未配置服务器时会返回配置指引'},
@@ -1735,6 +1964,7 @@ _TOOL_SCHEMAS = {
     'node_health': _tool_schema(),
     'download_proxy': _tool_schema({'url': {'type': 'string'}}),
     'doctor': _tool_schema(),
+    'audit_network': _tool_schema(),
     'install_privileged_helper': _tool_schema(),
     'probe_route': _tool_schema({
         'url': {'type': 'string'},
@@ -2003,6 +2233,8 @@ def call_tool(name, args):
         return download_proxy(args)
     elif name == 'doctor':
         return doctor()
+    elif name == 'audit_network':
+        return audit_network(args)
     elif name == 'install_privileged_helper':
         return install_privileged_helper()
     elif name == 'probe_route':

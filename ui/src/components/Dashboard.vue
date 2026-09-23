@@ -26,6 +26,25 @@
         <button class="btn primary" :disabled="cleaning" @click="cleanNow">立即清理并恢复干净状态</button>
       </template>
     </section>
+    <!-- P1-1 网络体检：只读看清本机网络秩序现状，不改任何状态 -->
+    <section class="panel">
+      <div class="panel-head">
+        <h2>网络体检</h2>
+        <button class="btn small" :disabled="auditing" @click="runAudit">{{ auditing ? '体检中…' : '开始体检' }}</button>
+      </div>
+      <p class="muted">只读检查第三方代理、端口占用、崩溃残留、路由 / DNS / PAC，不会改动任何设置。</p>
+      <template v-if="audit">
+        <p class="muted">结论：<strong>{{ audit.summary }}</strong>（{{ auditTimeText }}）</p>
+        <ul class="foreign-list" v-if="audit.foreignProcs.length || audit.portConflicts.length || audit.staleProxy.detected || audit.ownPortLanExposed.length || audit.pacEnabled === 'yes'">
+          <li v-for="(p, i) in audit.foreignProcs" :key="'f' + i">第三方代理：{{ p }}</li>
+          <li v-for="(c, i) in audit.portConflicts" :key="'c' + i">端口 {{ c.port }} 被 {{ c.holderCommand }} (PID {{ c.holderPid }}) 占用</li>
+          <li v-for="(s, i) in audit.ownPortLanExposed" :key="'l' + i">端口 {{ s.port }} 对局域网暴露（{{ s.command }}）</li>
+          <li v-if="audit.staleProxy.detected">系统代理残留：{{ audit.staleProxy.detail }}</li>
+          <li v-if="audit.pacEnabled === 'yes'">PAC 自动代理已启用</li>
+        </ul>
+        <p class="muted" v-if="audit.degraded.length">⚠ 部分项目未能采集：{{ audit.degraded.join('、') }}</p>
+      </template>
+    </section>
     <div class="stat-grid">
       <div class="stat-card">
         <div class="stat-label">代理内核</div>
@@ -113,4 +132,21 @@ async function cleanNow() {
   }
 }
 onMounted(refreshForeign);
+
+// P1-1 网络体检（手动触发，内部最坏 ~10 秒）
+const audit = ref(null);
+const auditing = ref(false);
+const auditTimeText = ref('');
+async function runAudit() {
+  if (auditing.value) return;
+  auditing.value = true;
+  try {
+    audit.value = await invoke('audit_network');
+    auditTimeText.value = new Date().toLocaleTimeString();
+  } catch (e) {
+    toast('体检失败：' + e, 'error');
+  } finally {
+    auditing.value = false;
+  }
+}
 </script>

@@ -1,4 +1,5 @@
 mod apps;
+mod auditor;
 // config / mihomo 对 bin 工具（dump_conf）公开
 pub mod config;
 mod keychain;
@@ -288,6 +289,22 @@ async fn list_foreign_proxies() -> Vec<String> {
     })
     .await
     .unwrap_or_default()
+}
+
+/// P1-1 网络体检：只读采集本机网络秩序现状（第三方代理/端口冲突/残留/路由/DNS/PAC）。
+/// 内部串行跑多个子进程（lsof 2.5s + route 2s + scutil 2s…），最坏 ~10 秒，
+/// 必须 async + spawn_blocking（CONTRACT 主线程红线）。
+/// MihomoManager::new() 是轻量构造（与 check_conflicts 同款用法），不依赖 managed state。
+#[tauri::command]
+async fn audit_network() -> Result<auditor::NetworkAuditReport, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let mgr = MihomoManager::new();
+        let own_ports: Vec<u16> = vec![mgr.port, mihomo::PROXY_PORT, mihomo::DIRECT_PORT];
+        let our_pids: Vec<u32> = mgr.find_running_pid().into_iter().collect();
+        auditor::audit(&own_ports, &our_pids)
+    })
+    .await
+    .map_err(|e| format!("audit_network 线程异常: {e}"))
 }
 
 #[tauri::command]
@@ -1495,6 +1512,7 @@ pub fn run() {
             check_conflicts,
             kill_foreign_proxies,
             list_foreign_proxies,
+            audit_network,
             fetch_subscription,
             proxy_api,
             updater::get_update_channel,

@@ -51,9 +51,9 @@ MCP 协议 2025-06-18 引入 `instructions` 能力：客户端会把它注入系
 
 ---
 
-## 3. 工具清单（**27 个**）
+## 3. 工具清单（**28 个**）
 
-> `TOOLS` 数组实际 **27** 个（与 `_TOOL_SCHEMAS` 一一对应）。历史上 README 长期误写"23 个"，2026-09-23 已统一修正为 27。
+> `TOOLS` 数组实际 **28** 个（与 `_TOOL_SCHEMAS` 一一对应）。历史上 README 长期误写"23 个"，2026-09-23 修正为 27；同日 P1-1 新增 `audit_network` 后为 28。
 
 | # | 工具 | 参数（required 加粗） | 说明 |
 |---|---|---|---|
@@ -84,6 +84,7 @@ MCP 协议 2025-06-18 引入 `instructions` 能力：客户端会把它注入系
 | 25 | `set_system_proxy` | **enabled** | 开关 macOS 系统代理（指向 7891） |
 | 26 | `ssh_exec` | **command**、timeout_secs | 在激活服务器非交互执行命令，返回 (stdout, stderr, exit_code) |
 | 27 | `guide` | — | 返回完整使用手册 |
+| 28 | `audit_network` | — | **网络体检（P1-1）**：只读采集第三方代理进程/端口冲突/死端口残留/路由/DNS/PAC/环境变量代理，返回 summary + degraded；与 Rust `auditor.rs` 同口径，零副作用 |
 
 ### 3.1 参数加严（`call_tool` 头部）
 

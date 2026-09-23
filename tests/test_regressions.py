@@ -315,3 +315,84 @@ def test_verify_get_state_command_absent_real_machine():
     rs = (pathlib.Path(__file__).resolve().parents[1] / 'src-tauri' / 'src' / 'system_proxy.rs').read_text(encoding='utf-8')
     seg_rs = rs[rs.index('pub fn verify_system_proxy'):rs.index('fn get_proxy_detail')]
     assert '-getwebproxystate' not in seg_rs and '-getsecurewebproxystate' not in seg_rs and '-getsocksfirewallproxystate' not in seg_rs
+
+
+# ── P1-1 audit_network（网络体检，与 Rust auditor.rs 同口径）──
+
+_AUDIT_PROXY_ALL_OFF = ('<dictionary> {\n  FTPPassive : 1\n  HTTPEnable : 0\n  HTTPSEnable : 0\n'
+                        '  ProxyAutoConfigEnable : 0\n  SOCKSEnable : 0\n}')
+
+
+def _fake_audit_runner(listen_text=None, ps_text=None, proxy_text=_AUDIT_PROXY_ALL_OFF):
+    """伪装修检用到的全部子进程输出（真机格式，2026-09-23 取证）。"""
+    def runner(cmd, **kw):
+        c = cmd[0]
+        if c == '/bin/ps':
+            return _Proc(stdout=ps_text if ps_text is not None else
+                         '  123 /Applications/SomeApp.app/Contents/MacOS/SomeApp\n')
+        if c == '/usr/sbin/lsof':
+            return _Proc(stdout=listen_text if listen_text is not None else
+                         'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n')
+        if c == '/usr/sbin/scutil' and cmd[1] == '--proxy':
+            return _Proc(stdout=proxy_text)
+        if c == '/usr/sbin/scutil' and cmd[1] == '--dns':
+            return _Proc(stdout='DNS configuration\n\nresolver #1\n  nameserver[0] : 223.5.5.5\n\nresolver #2\n  domain   : local\n')
+        if c == '/sbin/route':
+            return _Proc(stdout='   route to: default\ngateway: 172.18.100.1\n  interface: en0\n')
+        raise AssertionError(f'unexpected cmd {cmd}')
+    return runner
+
+
+def test_audit_network_clean_machine(monkeypatch):
+    monkeypatch.setattr(server.subprocess, 'run', _fake_audit_runner())
+    r = server.audit_network()
+    assert r['foreignProcs'] == []
+    assert r['portConflicts'] == []
+    assert r['staleProxy']['detected'] is False
+    assert r['pacEnabled'] == 'no'
+    assert r['summary'] == '未发现混乱源'
+    assert r['degraded'] == []
+
+
+def test_audit_network_detects_foreign_proxy_and_stale(monkeypatch):
+    ps = ('  100 /Applications/FlClash.app/Contents/MacOS/FlClash\n'
+          '  101 grep clash\n'  # 铁律：命令行含 clash 但可执行路径不是 → 绝不误报
+          '  102 /usr/sbin/cupsd -l\n')
+    listen = ('COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n'
+              'Python  200 x      1u IPv4 0xa 0t0 TCP 127.0.0.1:7891 (LISTEN)\n')
+    proxy = ('<dictionary> {\n  HTTPEnable : 1\n  HTTPPort : 7891\n'
+             '  ProxyAutoConfigEnable : 0\n  SOCKSEnable : 0\n}')
+    monkeypatch.setattr(server.subprocess, 'run', _fake_audit_runner(ps_text=ps, listen_text=listen, proxy_text=proxy))
+    r = server.audit_network()
+    assert any('flclash' in p.lower() for p in r['foreignProcs']), r['foreignProcs']
+    assert not any('grep' in p for p in r['foreignProcs']), '误杀非代理进程'
+    # 7891 被 Python 占用：内核不算在跑 → 指向 7891 的系统代理判为死端口残留
+    assert r['portConflicts'] and r['portConflicts'][0]['port'] == 7891
+    assert r['staleProxy']['detected'] is True
+    assert '7891' in r['staleProxy']['detail']
+    assert '第三方代理' in r['summary'] and '死端口' in r['summary']
+
+
+def test_audit_network_degrades_on_command_failure(monkeypatch):
+    """单项采集失败 → 该维度降级，报告整体仍可用（不抛异常）。"""
+    def runner(cmd, **kw):
+        raise RuntimeError('exec denied')
+    monkeypatch.setattr(server.subprocess, 'run', runner)
+    r = server.audit_network()
+    assert 'foreign_procs' in r['degraded']
+    assert 'listen_sockets' in r['degraded']
+    assert '降级' in r['summary']
+    assert r['route']['state'] == 'unknown'
+
+
+def test_audit_network_registered_in_tools_and_dispatch():
+    """工具注册锁：TOOLS 有描述、schema 有空参、分派可达。"""
+    names = [t['name'] for t in server.TOOLS]
+    assert 'audit_network' in names
+    assert server._TOOL_SCHEMAS['audit_network'] == {
+        'type': 'object', 'properties': {}, 'additionalProperties': False,
+    }
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[1] / 'mcp' / 'server.py').read_text(encoding='utf-8')
+    assert "'audit_network': _tool_schema()" in src
+    assert "elif name == 'audit_network':" in src

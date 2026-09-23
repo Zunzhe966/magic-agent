@@ -49,7 +49,7 @@ App 启动与每次开启代理时，自动检测并清理第三方代理软件�
 
 ### 5. AI 客户端控制入口（MCP）
 
-`mcp/server.py` 暴露 **27 个工具**，让 Claude / Codex / WorkBuddy 等 AI 客户端能直接：
+`mcp/server.py` 暴露 **28 个工具**，让 Claude / Codex / WorkBuddy 等 AI 客户端能直接：
 
 - 控制代理（启停、切节点、拉订阅、测延迟、看实时连接、开关系统代理）
 - 实测路由（`probe_route` 双路对比、`download_proxy` 拿双路入口）
@@ -125,7 +125,7 @@ cargo run --bin magic_probe                 # 起 8 秒停，验证 mihomo 可�
 
 ```
 ui/             Vue3 前端（Vite + xterm.js）
-mcp/            Python MCP server（server.py，AI 控制入口，27 个工具）
+mcp/            Python MCP server（server.py，AI 控制入口，28 个工具）
 scripts/        部署/守护/自检脚本（mcp 守护、mihomo 控制、订阅解析、发版）
 docs/           设计、重构计划、免费模型调研、code-wiki
 src-tauri/      Rust 后端（Tauri 2）

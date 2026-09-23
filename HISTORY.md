@@ -267,6 +267,23 @@
 
 ---
 
+### 2026-09-23（同会话续）· 积压入库 + P1-1 审计引擎落地
+
+| 类型 | 做了什么 |
+|------|----------|
+| chore | **v0.2.11 信任版全量入库**（`git add -A && commit`，103 文件 / +5451 行）：P0 四项 + 热修复 + MCP 实机测试 + 文档重写全部落库，补齐发版闭环缺的"git commit"一步。提交号见 `git log` 顶部。 |
+| feat(P1-1) | **审计引擎 `src-tauri/src/auditor.rs`（新模块，652 行）**：`audit()` 只读采集 8 个维度——第三方代理进程（与 lib.rs::find_foreign_proxies 同源，杜绝两套口径）、LISTEN 扫描（lsof 2.5s 硬超时）、本程序端口被占、崩溃残留死端口（P0-4 同口径、只报告不自愈）、默认路由、utun 清单、DNS resolver #1、PAC、环境变量/shell profile 代理提示。三态 `Triage`（unknown 与 false 严格区分）+ `degraded` 字段诚实暴露采集缺口。Rust 15 项单测（真机 fixture、超时路径、坏行跳过）。 |
+| feat | **接线**：`lib.rs` 新增 `audit_network` 命令（async + spawn_blocking，已注册；`MihomoManager::find_running_pid` 提为 pub(crate)）；**MCP 第 28 个工具 `audit_network`**（Python 侧同口径实现，含"命令行含 clash 但可执行路径不是 → 绝不误报"铁律回归）；**Dashboard「网络体检」卡**（手动触发、混乱源列表、降级点名）。 |
+| fix(口径) | **回归测试抓出的判定错误**：内核是否在跑不能用"own 端口有 LISTEN"判定——第三方占用 7891 时内核根本没跑，会把真·死端口残留漏报。两侧同步改为按内核进程判定（pgrep runtime 路径），各加回归锁。 |
+| docs | 重构计划 P1-1 标 ✅（含实现落账细节）；文档 MCP 工具数 27→28（6 处）；CONTRACT 增"体检 kernel_up 口径"红线。 |
+| 验证 | Rust 63 测试全绿（48→63）、Python 18 全绿（14→18）、check_parity 退出码 0、前端 vite build 通过、**真机实测**：MCP audit_network 实跑返回与手工取证一致（route en0/网关 172.18.100.1、DNS 223.5.5.5、PAC no、无混乱源、零降级）。 |
+
+**未做（有意为之）**：计划里"并入 doctor 的展开项"——doctor 是代理自检、audit 是整机审计，两个独立工具更清晰，doctor 描述已引导互用。
+
+**下一步**：P1-2 接管账本 `ledger.rs`（每次 start_proxy 前快照原值，stop/还原时逆序回放）。
+
+---
+
 ## 各版本「增 / 删」总表
 
 | 版本 | 新增 | 删除 |

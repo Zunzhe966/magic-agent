@@ -406,7 +406,7 @@ impl MihomoManager {
     /// 2026-09-03 实测关窗收尾因此落空）。改用 pgrep -f 匹配完整命令行，
     /// 模式与特权控制器 mihomo-ctl.sh 的 PATTERN 同源：只匹配本 App 的 runtime
     /// 常驻副本内核，绝不放宽成 "mihomo"（会误杀 FlClash/Clash Verge 等第三方内核）。
-    fn find_running_pid(&self) -> Option<u32> {
+    pub(crate) fn find_running_pid(&self) -> Option<u32> {
         const PATTERN: &str = "magic-agent/runtime/bin/mihomo";
         let out = Command::new("/usr/bin/pgrep")
             .arg("-f")

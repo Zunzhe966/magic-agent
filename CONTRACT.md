@@ -114,6 +114,11 @@ App 已内置 updater（`tauri.conf.json` → `plugins.updater.active=true`，en
   `allOk/services/mismatched`；**禁止重新引入 any_success 类"任一成功即整体成功"逻辑**。
 - `set_system_proxy` 返回值里 `enabled` 字段在写后路径取期望值（权威是 services），
   轮询路径（`status()`）取 scutil 全局视图——两者语义已在函数 doc 注释钉死，不得混用。
+- **网络体检（P1-1）口径红线**：`auditor.rs` 与 MCP `audit_network` 是同一功能的两个入口，
+  第三方名单、死端口表（7891/7892/7893）、内核在跑判定必须同源同口径；内核是否在跑
+  **只能按内核进程判定（pgrep runtime 路径），绝不能用"own 端口有 LISTEN"**——
+  第三方占用 7891 时会把真·死端口残留漏报（2026-09-23 回归测试抓出，两侧已修并有回归锁）。
+  体检是纯只读：任何写系统状态的诉求走 start/stop，不许塞进 audit。
 
 ## 回滚
 
