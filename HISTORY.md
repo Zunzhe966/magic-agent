@@ -347,6 +347,18 @@
 
 ---
 
+### 2026-09-23（用户实测反馈）· 体检卡黑屏事故修复 + v0.3.1
+
+| 类型 | 做了什么 |
+|------|----------|
+| 现象 | 用户装 0.3.0 实测：**点「开始体检」界面整个黑屏；此后点启动代理"完全没响应"；实时连接页看不到连接**。 |
+| 根因 | 体检卡（前端）引用 `audit.ownPortLanExposed.length`，而 Rust `NetworkAuditReport`【没有这个字段】（只有 MCP 侧 audit_network 有该键——GUI 不消费 MCP）→ undefined 取 .length 抛异常 → Vue 渲染崩溃整树卸载 → **白/黑屏，且同一 WebView 里所有页面（含启动按钮、实时连接）全部失去响应**。三个现象一个根因：不是代理没工作——真机取证内核在跑、`mihomo.log` 有真实 [TCP] 转发记录、`/connections` API 数据正常。属 P1-1 接线时的**双引擎字段漂移第三次实例**（GUI 消费面此前无契约锁）。 |
+| fix(33c0416) | ① Rust 报告补 `ExposedPort` 结构 + `own_port_lan_exposed` 字段（own_ports ∩ lan_exposed LISTEN，与 MCP ownPortLanExposed 同形）；② Dashboard 体检卡全部消费点加可选链/默认值防御（后端字段再漂移不崩整页）；③ 契约锁测试 `report_json_keys_match_frontend_contract`：断言前端消费的 13 个顶层键 + 嵌套消费点（staleProxy.detected / ownPortLanExposed[].port），改字段名=测试挡。验证：Rust 79 全绿（+1 契约锁）、Python 32 全绿、parity 0、前端构建过。 |
+| chore(release) | **v0.3.1 已构建安装（未 --publish）**。首跑 release.sh 在 bundle_dmg 阶段失败：0.2.11/0.3.1 两轮构建各遗留未卸载的打包临时卷（/Volumes/dmg.*）与 rw.*.dmg 临时镜像，重挂撞车——detach 残留卷 + 清理 target 内临时镜像后重跑成功（对账通过、双通道 feed=0.3.1）。**遗留项**：release.sh 可加"构建前自动 detach 残留 dmg 挂载"防呆（P2 一并做）。 |
+| 教训固化 | GUI 消费的后端字段【必须】有编译期/测试期契约锁——check_parity 只管 Rust↔MCP 的规则引擎，管不到 Tauri 命令返回值与 Vue 模板的漂移；本次起 audit_network 报告纳入契约锁，后续新命令接 GUI 时同样先写锁再画页面。 |
+
+---
+
 ## 各版本「增 / 删」总表
 
 | 版本 | 新增 | 删除 |
