@@ -5,7 +5,7 @@
 ## 是什么
 
 MCP（Model Context Protocol）是 AI 客户端与外部工具之间的标准协议。
-本 server 通过 stdio 与 AI 客户端通信，暴露 **28 个工具**（旧文档误写 23/27，均已按 `TOOLS` 数组实际数量更正），AI 可以：
+本 server 通过 stdio 与 AI 客户端通信，暴露 **30 个工具**（数量以 `TOOLS` 数组为准），AI 可以：
 
 - 查看代理状态、启动/停止代理
 - 列出节点、切换节点、测试节点延迟
@@ -41,6 +41,9 @@ MCP（Model Context Protocol）是 AI 客户端与外部工具之间的标准协
 | node_health | - | 汇总各节点健康/延迟 |
 | download_proxy | {url} | 返回两条路入口（7892 直连 / 7893 节点），由 AI 决定走哪条 |
 | doctor | - | 全链路自检（依赖/端口/配置） |
+| audit_network | - | 网络体检（只读）：第三方代理/端口占用/死端口残留/路由/DNS/PAC/未结账本 |
+| restore_network | - | 一键还原：停内核 + 按接管账本逐服务回放系统代理原值（P1-4） |
+| reapply_takeover | - | 漂移归位：接管期间系统代理被外部改动后重新设回接管端口（P1-4） |
 | install_privileged_helper | - | 安装/校验特权 helper |
 | probe_route | {url} | 双路探测：直连 vs 代理的延迟/吞吐对比 |
 | server_metrics | - | 采集激活云服务器的 CPU/内存/磁盘/负载/网络 |

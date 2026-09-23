@@ -572,3 +572,112 @@ def test_start_proxy_rolls_back_when_system_proxy_verify_fails(tmp_path, monkeyp
     assert stop_calls == [1], '内核必须被停掉'
     assert 'Wi-Fi' in r['message'] and '回滚' in r['message']
     assert server.ledger_open_session() is None, '回滚后不得留未结账本'
+
+
+# ── P1-4 一键还原 restore_network / 漂移归位 / 巡检（与 Rust 同语义） ──
+
+def _networksetup_full(webproxy_on=True, port=7890):
+    """get 返回真机格式；set 一律成功（回放/归位路径）。"""
+    def runner(cmd, **kw):
+        if cmd[0] == '/usr/sbin/networksetup':
+            flag = cmd[1]
+            if flag == '-listallnetworkservices':
+                return _Proc(stdout='Wi-Fi\nUSB 10/100 LAN\n')
+            if flag == '-getwebproxy':
+                return _Proc(stdout=_audit_proxy_line(webproxy_on, port))
+            if flag.startswith('-get'):
+                return _Proc(stdout=_audit_proxy_line(False))
+            return _Proc(stdout='')  # set* 成功
+        raise AssertionError(f'unexpected cmd {cmd}')
+    return runner
+
+
+def test_restore_network_with_ledger_replays_and_persists(tmp_path, monkeypatch):
+    """端到端：有未结账本 → 停内核 + 按 before 回放 + 结账 + 意图落 systemProxy=false。"""
+    path = str(tmp_path / 'ledger.json')
+    monkeypatch.setattr(server, 'LEDGER_PATH', path)
+    monkeypatch.setattr(server.subprocess, 'run', _networksetup_full(webproxy_on=True, port=7890))
+    server.ledger_begin('mcp:start_proxy')
+    server.ledger_record_killed(['FlClash (PID 9)'])
+    stop_calls = []
+    monkeypatch.setattr(server, 'stop_mihomo', lambda: stop_calls.append(1))
+    written = {}
+    monkeypatch.setattr(server, 'read_config', lambda: {'systemProxy': True, 'nodes': []})
+    monkeypatch.setattr(server, 'write_config', lambda cfg: written.update(cfg))
+
+    r = server.call_tool('restore_network', {})
+    assert r['ok'] is True and r['restored'] is True
+    assert stop_calls == [1], '还原必须停内核'
+    assert server.ledger_open_session() is None, '还原后结账'
+    assert written.get('systemProxy') is False, '意图落盘防 App 启动联动覆盖'
+    assert 'FlClash' in ' '.join(r['irreversible']) and '不会自动复活' in r['message']
+
+
+def test_restore_network_without_ledger_is_honest(tmp_path, monkeypatch):
+    """无账本：不瞎写，退回关系统代理回直连并如实说明，restored=False。"""
+    path = str(tmp_path / 'ledger.json')
+    monkeypatch.setattr(server, 'LEDGER_PATH', path)
+    monkeypatch.setattr(server.subprocess, 'run', _networksetup_full(webproxy_on=False, port=0))
+    monkeypatch.setattr(server, 'stop_mihomo', lambda: None)
+    monkeypatch.setattr(server, 'read_config', lambda: {'systemProxy': True})
+    monkeypatch.setattr(server, 'write_config', lambda cfg: None)
+    r = server.call_tool('restore_network', {})
+    assert r['ok'] is True and r['restored'] is False
+    assert '无未结接管账本' in r['message'] and '手动恢复' in r['message']
+
+
+def test_reapply_takeover_guardrails(tmp_path, monkeypatch):
+    """归位双检：内核未跑 → 拒；有账但内核在跑 → 设回并对账。"""
+    path = str(tmp_path / 'ledger.json')
+    monkeypatch.setattr(server, 'LEDGER_PATH', path)
+    monkeypatch.setattr(server.subprocess, 'run', _networksetup_full())
+    monkeypatch.setattr(server, 'stop_mihomo', lambda: None)
+    server.ledger_begin('mcp:start_proxy')
+    # 内核没跑 → 拒绝（绝不把系统代理指向死端口）
+    monkeypatch.setattr(server, 'mihomo_running', lambda: False)
+    r = server.call_tool('reapply_takeover', {})
+    assert r['ok'] is False and '未在运行' in r['error']
+    # 内核在跑 → 走 set_system_proxy(True) 归位
+    monkeypatch.setattr(server, 'mihomo_running', lambda: True)
+    monkeypatch.setattr(server, 'set_system_proxy',
+                        lambda enable=True, port=7891: {'allOk': True, 'mismatched': [], 'services': []})
+    monkeypatch.setattr(server, 'system_proxy_enabled', lambda: True)
+    r = server.call_tool('reapply_takeover', {})
+    assert r['ok'] is True and r['allOk'] is True
+
+
+def test_probe_drift_only_when_taking_over(tmp_path, monkeypatch):
+    """巡检守卫：无账本 / 内核未跑 一律 None；接管中读回不达标才报漂移。"""
+    path = str(tmp_path / 'ledger.json')
+    monkeypatch.setattr(server, 'LEDGER_PATH', path)
+    # 无账本 → None（不放大开销）
+    assert server.probe_drift() is None
+    monkeypatch.setattr(server.subprocess, 'run', _networksetup_full(webproxy_on=True, port=7890))
+    server.ledger_begin('mcp:start_proxy')
+    monkeypatch.setattr(server, 'mihomo_running', lambda: False)
+    assert server.probe_drift() is None, '内核未跑交给崩溃看门狗，巡检不抢处置权'
+    # 接管中 + 读回指向 7890（≠ 接管端口 7891）→ 全服务不达标 → 报漂移
+    monkeypatch.setattr(server, 'mihomo_running', lambda: True)
+    drift = server.probe_drift()
+    assert drift and 'Wi-Fi' in drift
+
+
+def test_status_exposes_drift(tmp_path, monkeypatch):
+    """status 联动：接管中被外部改动 → 返回 drift.services 供 AI 处置。"""
+    path = str(tmp_path / 'ledger.json')
+    monkeypatch.setattr(server, 'LEDGER_PATH', path)
+    monkeypatch.setattr(server.subprocess, 'run', _networksetup_full(webproxy_on=True, port=7890))
+    server.ledger_begin('mcp:start_proxy')
+    monkeypatch.setattr(server, 'mihomo_running', lambda: True)
+    monkeypatch.setattr(server, 'system_proxy_enabled', lambda: True)
+    r = server.call_tool('status', {})
+    assert r.get('drift') and 'Wi-Fi' in r['drift']['services']
+    assert r.get('openLedger') is True
+
+
+def test_p14_tools_registered():
+    """双引擎一致性红线：restore_network / reapply_takeover 必须注册且有 schema。"""
+    names = [t['name'] for t in server.TOOLS]
+    assert 'restore_network' in names and 'reapply_takeover' in names
+    assert server._TOOL_SCHEMAS['restore_network'] == server._tool_schema()
+    assert server._TOOL_SCHEMAS['reapply_takeover'] == server._tool_schema()

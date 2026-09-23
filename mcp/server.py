@@ -647,6 +647,31 @@ def ledger_open_session():
     return None
 
 
+def judge_drift(mismatched):
+    """P1-4 漂移判定（与 Rust judge_drift 同口径的纯函数部分）：
+    接管生效中逐服务读回的不达标清单非空 = 外部改动 detected。
+    返回漂移服务清单；无漂移返回 None。"""
+    return list(mismatched) if mismatched else None
+
+
+def probe_drift(port=7891):
+    """P1-4 漂移抽验：接管生效中（有未结账本）时，逐服务读回系统代理现值，
+    期望它们仍指向 127.0.0.1:接管端口。返回漂移服务清单或 None。
+    仅只读，不写任何状态。MCP 无常驻线程，由 status 调用惰性触发——
+    且只在确有未结账本且内核在跑时执行，避免无接管场景放大 networksetup 开销。"""
+    if ledger_open_session() is None:
+        return None
+    if not mihomo_running():
+        return None
+    services = list_network_services()
+    if not services:
+        return None
+    states = verify_system_proxy(services, port, True)
+    mismatched = [st['service'] for st in states
+                  if not (st['httpOn'] and st['httpsOn'] and st['socksOn']) or st['errors']]
+    return judge_drift(mismatched)
+
+
 def mihomo_running():
     """内核是否【真正在服务】（与 Rust 侧 mihomo.rs::status 逻辑保持一致）。
 
@@ -2148,6 +2173,8 @@ TOOLS = [
     {'name': 'select_server', 'description': '切换当前激活的云服务器（server_metrics/ssh_exec 的作用目标随之改变），如 {"id":"ssh-1.2.3.4"}。可用 id 从 list_servers 获取'},
     {'name': 'set_system_proxy', 'description': '开/关 macOS 系统代理（指向 127.0.0.1:7891），如 {"enabled":true}。注意：TUN 模式下内核已接管全局流量，一般不需要开系统代理；单独调整时才用。关系统代理前请确认代理内核在运行，否则用户会断网'},
     {'name': 'ssh_exec', 'description': '在当前激活的云服务器上非交互式执行一条命令并返回 (stdout, stderr, exit_code)。用于远程管理服务器（装软件、看日志、跑脚本）。密码从 macOS Keychain 读取，不落盘。如 {"command":"df -h","timeout_secs":15}'},
+    {'name': 'restore_network', 'description': '【一键还原】停止代理内核，并按接管账本把系统代理逐服务回放到接管前的原值、结账。是 start_proxy 接管的逆操作；账本中"接管时关闭的第三方进程"不可逆，返回里如实列出。无未结账本时只停内核+关系统代理回直连并说明局限。'},
+    {'name': 'reapply_takeover', 'description': '【漂移归位】接管期间系统代理被外部改动（status 的 drift 字段非空）时，重新逐服务设回 127.0.0.1:7891 并回读对账。前提：内核在跑且有未结接管账本，否则拒绝改写。'},
     {'name': 'guide', 'description': '返回魔法代理的完整使用手册（是什么、何时用、两条路怎么选、各工具配合关系）。首次接触魔法代理、或不确定该怎么用它时，先调这个了解全貌'},
 ]
 
@@ -2203,6 +2230,8 @@ _TOOL_SCHEMAS = {
     'list_servers': _tool_schema(),
     'select_server': _tool_schema({'id': {'type': 'string'}}, ['id']),
     'set_system_proxy': _tool_schema({'enabled': {'type': 'boolean'}}, ['enabled']),
+    'restore_network': _tool_schema(),
+    'reapply_takeover': _tool_schema(),
     'ssh_exec': _tool_schema({
         'command': {'type': 'string'},
         'timeout_secs': {'type': 'integer'},
@@ -2236,6 +2265,12 @@ def call_tool(name, args):
                   'openLedger': ledger_open_session() is not None,
                   'confirmTakeover': bool(cfg.get('confirmTakeover')) if 'error' not in cfg else False,
                   'nodes': len(cfg.get('nodes', [])) if 'error' not in cfg else 0}
+        # P1-4 漂移巡检：仅接管生效中（有未结账本且内核在跑）才抽验系统代理现值，
+        # 返回被外部改离接管态的服务清单（None=无漂移/未接管）。probe_drift 自带
+        # 守卫，未接管场景零额外开销。发现漂移 → AI 可调 reapply_takeover 归位。
+        drift = probe_drift()
+        if drift:
+            result['drift'] = {'services': drift}
         # P0-1：verify=true 时做逐服务读回对账（默认关，避免轮询放大 networksetup 开销）。
         # 达标口径：系统代理开着 → 应精确指向 127.0.0.1:7891；关着 → 应全部 Enabled:No。
         # 与 set 路径同用 verify_system_proxy(services, want_port, expect_on)。
@@ -2560,6 +2595,66 @@ def call_tool(name, args):
             cfg['systemProxy'] = enabled
             write_config(cfg)
         # P0-1：透出逐服务对账结果，不再只报"开没开"
+        return {'ok': True, 'systemProxy': system_proxy_enabled(),
+                'allOk': result.get('allOk'), 'mismatched': result.get('mismatched'),
+                'services': result.get('services')}
+    elif name == 'restore_network':
+        # P1-4 一键还原（与 Rust restore_network 同语义）：
+        # 停内核 → 按账本 before 逐服务回放并结账 → 意图落盘 systemProxy=false。
+        # 无账本不瞎写：退回"关系统代理回直连"并如实说明局限。
+        try:
+            stop_mihomo()
+        except Exception as e:
+            return {'ok': False, 'error': f'停止内核失败：{e}'}
+        session = ledger_open_session()
+        irreversible = [e.get('key') for e in (session or {}).get('entries', [])
+                        if e.get('kind') == 'process']
+        try:
+            errs, had_ledger, _ = ledger_rollback('mcp:用户一键还原')
+        except Exception as e:
+            return {'ok': False, 'error': f'还原过程异常：{e}'}
+        if had_ledger:
+            message = '代理内核已停止；系统代理已按接管前账本逐服务还原'
+            if errs:
+                message += f'；{len(errs)} 项还原失败：' + '；'.join(errs)
+            if irreversible:
+                message += f'；{len(irreversible)} 个接管时关闭的第三方进程不会自动复活：' + '、'.join(irreversible)
+        else:
+            # 无账本 = 没有"接管前原值"可回，唯一诚实的动作是退回直连并说明局限
+            notes = []
+            try:
+                r = set_system_proxy(False)
+                if not r.get('allOk'):
+                    notes.append('部分服务未能确认关闭：' + '、'.join(r.get('mismatched') or ['见明细']))
+            except Exception as e:
+                notes.append(f'关闭系统代理失败：{e}')
+            message = '无未结接管账本（本机未发生过接管或账本已结），代理内核已停止，系统代理已关闭回直连'
+            if notes:
+                message += '；' + '；'.join(notes)
+            message += '。若接管前的设置并非直连，请手动恢复'
+            errs = []
+        # 意图落盘：防止 App 启动联动又自动开系统代理覆盖还原结果（与 Rust 同语义）
+        cfg = read_config()
+        if 'error' not in cfg:
+            cfg['systemProxy'] = False
+            try:
+                write_config(cfg)
+            except Exception as e:
+                message += f'；注意：还原意图落盘失败（下次 App 启动可能自动开系统代理）：{e}'
+        return {'ok': True, 'restored': had_ledger, 'errors': errs,
+                'irreversible': irreversible, 'message': message}
+    elif name == 'reapply_takeover':
+        # P1-4 漂移归位（与 Rust reapply_takeover 同语义）：接管生效中系统代理被
+        # 外部改动后，重新逐服务设回 127.0.0.1:7891 并对账。前提双检：内核在跑
+        # （对死端口设代理=亲手制造断网）、有未结账本（无账=系统代理不归本程序管，拒写）。
+        if not mihomo_running():
+            return {'ok': False, 'error': '代理内核未在运行，无法归位（请改用 start_proxy 重新接管）'}
+        if ledger_open_session() is None:
+            return {'ok': False, 'error': '无未结接管账本，系统代理当前不归本程序管辖，拒绝改写'}
+        try:
+            result = set_system_proxy(True)
+        except Exception as e:
+            return {'ok': False, 'error': f'归位失败：{e}'}
         return {'ok': True, 'systemProxy': system_proxy_enabled(),
                 'allOk': result.get('allOk'), 'mismatched': result.get('mismatched'),
                 'services': result.get('services')}

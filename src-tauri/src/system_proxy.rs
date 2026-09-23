@@ -359,7 +359,8 @@ pub fn status() -> SystemProxyStatus {
     }
 }
 
-fn list_services() -> Vec<String> {
+/// 枚举真实网络服务（P1-4 漂移巡检需要与 verify 同一份清单，提为 pub(crate)）。
+pub(crate) fn list_services() -> Vec<String> {
     let text = match run(NETWORKSETUP, &["-listallnetworkservices"]) {
         Ok(t) => t,
         Err(_) => return vec![],

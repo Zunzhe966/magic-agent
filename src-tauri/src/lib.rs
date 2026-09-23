@@ -30,6 +30,22 @@ pub struct AppStatus {
     /// 崩溃自愈提示（P0-4）：启动后发现"内核没跑但系统代理指向本程序端口"
     /// 并已自动关闭时，一次性下发此文案，前端 toast 后调 clear 命令清空。
     pub self_heal_notice: Option<String>,
+    /// P1-4 漂移巡检：接管期间（账本 open）外部把系统代理改离接管态时，
+    /// 看门狗每 5 分钟抽验一次并置此字段。非一次性——get_status 读出但
+    /// 不清空（黄条持续显示），直到用户 [重新归位]（reapply_takeover）或
+    /// [接受]（accept_drift）。None = 无漂移或未接管。
+    pub drift: Option<DriftNotice>,
+    /// P1-4 未结接管账本是否存在（= 接管生效中）。与 MCP status 的 openLedger
+    /// 同口径（CONTRACT 双入口一致性），前端据此决定「一键还原」按钮可见性。
+    pub open_ledger: bool,
+}
+
+/// P1-4 漂移通知：services = 读回不达标（不再指向 127.0.0.1:接管端口）的服务清单。
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DriftNotice {
+    pub services: Vec<String>,
+    pub ts: u64,
 }
 
 /// 代理端口与现有 Clash/FlClash 冲突检测结果
@@ -429,6 +445,12 @@ struct AppState {
     /// 并自动关闭后写入，get_status 读出置 None（前端 toast 一次即消费）。
     /// Arc 包装：启动自检线程与 AppState 共享同一槽位。
     self_heal_notice: Arc<Mutex<Option<String>>>,
+    /// P1-4 漂移通知（看门狗写，get_status 读）：Some = 接管期间系统代理被
+    /// 外部改离接管态。Arc 包装：看门狗线程与 AppState 共享同一槽位。
+    drift: Arc<Mutex<Option<DriftNotice>>>,
+    /// P1-4 用户已接受漂移（点 [接受现状]）：true 后看门狗停止巡检，
+    /// 直到下次 start_proxy 接管重新归位为 false。
+    drift_ack: Arc<AtomicBool>,
 }
 
 /// P0-4 启动自检（崩溃自愈）：App 被 kill -9 / 断电时 RunEvent::Exit 不执行，
@@ -485,6 +507,41 @@ fn startup_self_check(state: &Arc<Mutex<AppState>>) {
     }
 }
 
+/// P1-4 漂移判定（纯函数，供单测直接喂假读回结果）：
+/// 接管生效中（账本 open 且含 system_proxy 项）时，逐服务读回应当
+/// "全部达标指向 127.0.0.1:接管端口"。读回不达标（含被关掉、被改指向、
+/// 读写异常）的服务清单非空 = 外部改动 detected。
+/// 返回漂移服务清单；无漂移返回 None。
+/// 口径说明：expect_on 恒为 true——巡检只在"接管生效中"跑，此时系统代理
+/// 应当开着并指向本程序端口；内核崩溃场景由既有看门狗（重启/关代理恢复直连）
+/// 负责，本巡检绝不与其抢处置权。
+fn judge_drift(mismatched: &[String], drift_ack: bool) -> Option<Vec<String>> {
+    if drift_ack || mismatched.is_empty() {
+        None
+    } else {
+        Some(mismatched.to_vec())
+    }
+}
+
+/// P1-4 漂移抽验（看门狗每 5 分钟调用）：只跑一次逐服务读回对账，
+/// 不写任何状态、不杀任何进程——发现漂移只记录，处置权在用户
+/// （黄条 [重新归位] / [接受]）。
+fn probe_drift(port: u16, drift_ack: bool) -> Option<Vec<String>> {
+    let services = system_proxy::list_services();
+    if services.is_empty() {
+        return None; // 枚举不了服务 = 无从判定，宁可不报也不瞎报
+    }
+    let states = system_proxy::verify_system_proxy(&services, port, true);
+    let mut mismatched: Vec<String> = states
+        .iter()
+        .filter(|st| !(st.http_on && st.https_on && st.socks_on) || !st.errors.is_empty())
+        .map(|st| st.service.clone())
+        .collect();
+    // 去重保序（verify 每服务只出一条，理论上无重复，防御性处理）
+    mismatched.dedup();
+    judge_drift(&mismatched, drift_ack)
+}
+
 #[tauri::command]
 async fn get_status(
     state: tauri::State<'_, Arc<Mutex<AppState>>>,
@@ -494,14 +551,16 @@ async fn get_status(
     // system_proxy::status() 会 fork 子进程跑 scutil。被前端每 5 秒轮询，
     // 任一环节慢（端口被防火墙 DROP / 子进程调度）都会让 UI 卡顿。
     // 改 async + spawn_blocking，探测挪到线程池。
-    let (mihomo_state, apps_count, nodes_count, heal) = {
+    let (mihomo_state, apps_count, nodes_count, heal, drift) = {
         let g = state.lock().unwrap();
         let mihomo = g.mihomo.clone();
         let apps_count = g.apps_cache.lock().unwrap().len();
         let nodes_count = g.config.nodes.len();
         // 一次性消费崩溃自愈提示（读取即清空，前端 toast 一次）
         let heal = g.self_heal_notice.lock().unwrap().take();
-        (mihomo, apps_count, nodes_count, heal)
+        // P1-4 漂移：读出但【不清空】——黄条要持续显示直到用户处置
+        let drift = g.drift.lock().unwrap().clone();
+        (mihomo, apps_count, nodes_count, heal, drift)
     };
     // SshManager 内部全 Arc，直接 clone（clone 与 State 生命周期解耦）
     let ssh: crate::ssh::SshManager = ssh.inner().clone();
@@ -517,6 +576,10 @@ async fn get_status(
             nodes_count,
             ssh: ssh.status(),
             self_heal_notice: heal,
+            drift,
+            // P1-4：接管是否生效中（读账本，与 MCP status.openLedger 同口径）。
+            // 账本是个位 KB 的小文件，5 秒轮询一次可接受。
+            open_ledger: ledger::LedgerFile::default().open_session().is_some(),
         }
     })
     .await
@@ -970,11 +1033,13 @@ async fn start_proxy(
         *state.lock().unwrap().mihomo.pid.lock().unwrap() = Some(pid);
     }
     // 通知看门狗：用户期望代理在运行，mihomo 崩溃后应自动重启
-    state
-        .lock()
-        .unwrap()
-        .should_run
-        .store(true, Ordering::Relaxed);
+    {
+        let g = state.lock().unwrap();
+        g.should_run.store(true, Ordering::Relaxed);
+        // P1-4：新一次接管开始，恢复漂移巡检（清掉上一次的"已接受"与旧黄条）
+        g.drift_ack.store(false, Ordering::Relaxed);
+        *g.drift.lock().unwrap() = None;
+    }
     Ok(status)
 }
 
@@ -1005,6 +1070,139 @@ async fn stop_proxy(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(),
     .await
     .map_err(|e| format!("stop_proxy 线程异常: {e}"))?;
     *state.lock().unwrap().mihomo.pid.lock().unwrap() = None;
+    Ok(())
+}
+
+/// P1-4 一键还原结果（MCP 侧 restore_network 返回同结构，camelCase 契约）。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreResult {
+    /// true = 账本有未结接管、系统代理已按 before 原值逐服务回放
+    pub restored: bool,
+    /// 回放失败项（逐条点名，绝不假装全成）
+    pub errors: Vec<String>,
+    /// 账本中的不可逆项（接管时关闭的第三方进程——还原救不回它们，如实声明）
+    pub irreversible: Vec<String>,
+    pub message: String,
+}
+
+/// P1-4 一键还原：把网络交还给接管之前的状态。
+/// 顺序：通知看门狗停手（防它把内核拉回覆盖还原）→ 停自己内核 →
+/// 按账本 before 逐服务回放系统代理原值并结账 → 落意图（config.systemProxy=false，
+/// 防下次启动联动又指回 7891）→ 清漂移状态。
+/// 无未结账本时不瞎写：退回"关系统代理回直连"的最小安全动作并如实说明。
+#[tauri::command]
+async fn restore_network(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<RestoreResult, String> {
+    // 先通知看门狗：用户要求还原 = 不再期望代理运行（与 stop_proxy 同语义）
+    {
+        let g = state.lock().unwrap();
+        g.should_run.store(false, Ordering::Relaxed);
+    }
+    let result = tauri::async_runtime::spawn_blocking(|| -> Result<RestoreResult, String> {
+        let mihomo = MihomoManager::new();
+        mihomo.stop();
+        let ledger = ledger::LedgerFile::default();
+        // 还原前先读账本：不可逆项清单要在回放（结账）前拿
+        let irreversible: Vec<String> = ledger
+            .open_session()
+            .map(|s| {
+                s.entries
+                    .iter()
+                    .filter(|e| e.kind == "process")
+                    .map(|e| e.key.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (errors, had_ledger) = ledger.rollback_session("用户一键还原")?;
+        let message = if had_ledger {
+            let mut m = String::from("代理内核已停止；系统代理已按接管前账本逐服务还原");
+            if !errors.is_empty() {
+                m.push_str(&format!("；{} 项还原失败：{}", errors.len(), errors.join("；")));
+            }
+            if !irreversible.is_empty() {
+                m.push_str(&format!(
+                    "；{} 个接管时关闭的第三方进程不会自动复活：{}",
+                    irreversible.len(),
+                    irreversible.join("、")
+                ));
+            }
+            m
+        } else {
+            // 无账本 = 没有"接管前原值"可回。唯一诚实的动作是退回直连并说明局限。
+            let mut notes = Vec::new();
+            match system_proxy::set_system_proxy(false, mihomo.port) {
+                Ok(r) => {
+                    log_proxy_set_result("restore_network", &r);
+                    if !r.all_ok {
+                        notes.push(format!("部分服务未能确认关闭：{}", r.mismatched.join("、")));
+                    }
+                }
+                Err(e) => notes.push(format!("关闭系统代理失败：{e}")),
+            }
+            let mut m = String::from("无未结接管账本（本机未发生过接管或账本已结），代理内核已停止，系统代理已关闭回直连");
+            if !notes.is_empty() {
+                m.push_str(&format!("；{}", notes.join("；")));
+            }
+            m.push_str("。若接管前的设置并非直连，请手动恢复");
+            m
+        };
+        Ok(RestoreResult {
+            restored: had_ledger,
+            errors,
+            irreversible,
+            message,
+        })
+    })
+    .await
+    .map_err(|e| format!("restore_network 线程异常: {e}"))??;
+    // 收尾（短临界区）：pid 清空、意图落盘（防启动联动又开系统代理覆盖还原结果）、清漂移
+    {
+        let mut g = state.lock().unwrap();
+        *g.mihomo.pid.lock().unwrap() = None;
+        g.config.system_proxy = false;
+        if let Err(e) = config::save(&g.config) {
+            eprintln!("[restore_network] WARN 意图落盘失败（下次启动可能自动开系统代理）: {e}");
+        }
+        *g.drift.lock().unwrap() = None;
+        g.drift_ack.store(false, Ordering::Relaxed);
+    }
+    Ok(result)
+}
+
+/// P1-4 漂移处置 [重新归位]：接管仍在生效（账本 open）但系统代理被外部改离
+/// 接管态时，用户点归位 = 重新逐服务设回 127.0.0.1:接管端口并回读对账。
+/// 前提校验：内核必须在跑——对着死端口设系统代理 = 亲手制造断网，绝不做。
+#[tauri::command]
+async fn reapply_takeover(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<crate::system_proxy::SystemProxyStatus, String> {
+    let (port, drift_slot, drift_ack) = {
+        let g = state.lock().unwrap();
+        let mihomo = g.mihomo.clone();
+        if !mihomo.status().running {
+            return Err("代理内核未在运行，无法归位（请直接点「启动代理」重新接管）".to_string());
+        }
+        if ledger::LedgerFile::default().open_session().is_none() {
+            return Err("无未结接管账本，系统代理当前不归本程序管辖，拒绝改写".to_string());
+        }
+        (g.mihomo.port, g.drift.clone(), g.drift_ack.clone())
+    };
+    let status = tauri::async_runtime::spawn_blocking(move || system_proxy::set_system_proxy(true, port))
+        .await
+        .map_err(|e| format!("reapply_takeover 线程异常: {e}"))??;
+    log_proxy_set_result("reapply", &status);
+    if status.all_ok {
+        *drift_slot.lock().unwrap() = None;
+        drift_ack.store(false, Ordering::Relaxed);
+    }
+    Ok(status)
+}
+
+/// P1-4 漂移处置 [接受现状]：外部改动是用户有意为之（比如自己开了别的代理），
+/// 停止巡检提示；下次 start_proxy 接管时自动恢复巡检。
+#[tauri::command]
+fn accept_drift(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
+    let g = state.lock().unwrap();
+    g.drift_ack.store(true, Ordering::Relaxed);
+    *g.drift.lock().unwrap() = None;
     Ok(())
 }
 
@@ -1536,6 +1734,8 @@ pub fn run() {
         apps_cache: Mutex::new(Vec::new()),
         should_run: should_run.clone(),
         self_heal_notice: Arc::new(Mutex::new(None)),
+        drift: Arc::new(Mutex::new(None)),
+        drift_ack: Arc::new(AtomicBool::new(false)),
     }));
 
     // P0-4 启动自检：崩溃残留的"系统代理指向死端口"会整机断网，
@@ -1546,14 +1746,14 @@ pub fn run() {
 
     // P1-2 未结账本提示：正常退出/停止都会 settle，账本仍为 open = 上次
     // 接管未经正常结束（kill -9/断电/MCP 侧异常）。如实一次性提示。
-    // ⚠️ 只提示不自动回放——还原动作属 P1-4（restore_network），
-    // 且 CONTRACT 红线：还原能力未落地前 UI 不得宣称"可回滚"。
+    // ⚠️ 只提示不自动回放——回写系统设置属用户决策（P1-4 已交付「一键还原」，
+    // 总览页可执行；异常残留场景下用户可能已手动调过网络，自动回放会覆盖之）。
     {
         if let Some(session) = ledger::LedgerFile::default().open_session() {
             let proxy_items = session.entries.iter().filter(|e| e.kind == "system_proxy").count();
             let killed = session.entries.iter().filter(|e| e.kind == "process").count();
             let notice = format!(
-                "上次接管（{}，开始于 {}，{} 项系统代理原值在册{}）未正常结账。启动代理或清理时账本继续沿用最初原值；如需还原请等「一键还原」功能或手动检查系统代理设置。",
+                "上次接管（{}，开始于 {}，{} 项系统代理原值在册{}）未正常结账。启动代理或清理时账本继续沿用最初原值；如需归还接管前设置，可在总览页点「一键还原」或手动检查系统代理设置。",
                 session.reason,
                 session.started_ts,
                 proxy_items,
@@ -1573,6 +1773,8 @@ pub fn run() {
     // （ctl("start")），不弹 osascript 反复骚扰用户。重启失败则关掉系统代理，
     // 避免 mihomo 死了但系统代理仍指向 127.0.0.1:7891 导致全机断网。
     let watchdog_state = state.clone();
+    // P1-4 漂移巡检也要读 should_run，先 clone 一份（下一条线程会 move 原件）
+    let drift_should_run = should_run.clone();
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(30));
@@ -1603,6 +1805,53 @@ pub fn run() {
             match system_proxy::set_system_proxy(false, port) {
                 Ok(r) => log_proxy_set_result("watchdog", &r),
                 Err(e) => eprintln!("[watchdog] WARN 关闭系统代理失败（用户可能断网，重启 App 可自愈）: {e}"),
+            }
+            continue;
+        }
+    });
+
+    // P1-4 漂移巡检：接管生效中（账本 open）每 5 分钟抽验一次系统代理现值。
+    // 只读不写——发现外部改动仅置 drift 状态（UI 黄条 [重新归位]/[接受]），
+    // 绝不自动改写（用户可能正手动调试网络，抢写比漂移本身更恶劣）。
+    // 内核未运行不巡检：崩溃/重启的处置权在上一条看门狗，避免双线程抢方向。
+    let drift_state = state.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(300));
+            if !drift_should_run.load(Ordering::Relaxed) {
+                continue;
+            }
+            let (port, drift_slot, drift_ack) = {
+                let g = drift_state.lock().unwrap();
+                (g.mihomo.port, g.drift.clone(), g.drift_ack.clone())
+            };
+            if drift_ack.load(Ordering::Relaxed) {
+                continue; // 用户已接受现状，停止打扰
+            }
+            if ledger::LedgerFile::default().open_session().is_none() {
+                // 未接管（无未结账本）：系统代理现状不归本巡检管。
+                // P1-4 跨引擎细节：账本可能刚被 MCP 侧还原/结账，App 内旧黄条
+                // 必须随之解除——接管已结束，警报不得续存扰民。
+                let mut d = drift_slot.lock().unwrap();
+                if d.take().is_some() {
+                    eprintln!("[drift] 接管已结束（无未结账本），解除遗留漂移提示");
+                }
+                continue;
+            }
+            if !MihomoManager::new().status().running {
+                continue;
+            }
+            if let Some(services) = probe_drift(port, drift_ack.load(Ordering::Relaxed)) {
+                let ts = ledger::now_ts();
+                eprintln!("[drift] 接管期间系统代理被外部改动：{} 个服务不达标", services.len());
+                *drift_slot.lock().unwrap() = Some(DriftNotice { services, ts });
+            } else {
+                // 恢复达标（如用户调试完自己改回来）：清除旧的黄条，不留过期警报
+                let mut d = drift_slot.lock().unwrap();
+                if d.is_some() {
+                    *d = None;
+                    eprintln!("[drift] 系统代理已回到接管态，解除漂移提示");
+                }
             }
         }
     });
@@ -1638,6 +1887,9 @@ pub fn run() {
             scan_apps,
             start_proxy,
             stop_proxy,
+            restore_network,
+            reapply_takeover,
+            accept_drift,
             set_system_proxy,
             ssh_connect,
             ssh_write,
@@ -1800,5 +2052,24 @@ eth0: 1234567890 1000 0 0 0 0 0 0 9876543210 2000 0 0 0 0 0 0
         assert_eq!(m["server"]["name"], "prod-1");
         assert_eq!(m["server"]["host"], "203.0.113.10");
         assert_eq!(m["server"]["user"], "root");
+    }
+
+    /// P1-4 漂移判定：不达标清单非空且未接受 → 报漂移（原样带出服务清单）
+    #[test]
+    fn drift_judged_when_mismatched_and_not_acked() {
+        let d = judge_drift(&["Wi-Fi".to_string(), "USB 10/100 LAN".to_string()], false);
+        assert_eq!(d.unwrap(), vec!["Wi-Fi".to_string(), "USB 10/100 LAN".to_string()]);
+    }
+
+    /// 读回全部达标 → 无漂移（绝不在正常状态下报警扰民）
+    #[test]
+    fn drift_none_when_all_services_ok() {
+        assert!(judge_drift(&[], false).is_none());
+    }
+
+    /// 用户已 [接受现状] → 即使不达标也不再报（巡检线程同时会跳过，双保险）
+    #[test]
+    fn drift_silent_after_accept() {
+        assert!(judge_drift(&["Wi-Fi".to_string()], true).is_none());
     }
 }

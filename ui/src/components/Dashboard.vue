@@ -8,9 +8,22 @@
       <div class="head-actions">
         <button v-if="!status?.proxyRunning" class="btn primary" :disabled="proxyBusy" @click="$emit('start')">{{ proxyBusy ? '正在启动…' : '启动代理' }}</button>
         <button v-else class="btn danger" :disabled="proxyBusy" @click="$emit('stop')">{{ proxyBusy ? '正在停止…' : '停止代理' }}</button>
+        <!-- P1-4 一键还原：接管生效中（有未结账本）才可见，按账本把系统代理归还给接管前 -->
+        <button v-if="status?.openLedger" class="btn" :disabled="restoring" @click="restoreNetwork" :title="'停止内核，并按接管账本把系统代理逐服务还原为接管前原值'">{{ restoring ? '正在还原…' : '一键还原' }}</button>
       </div>
       <div v-if="proxyError" class="proxy-error" role="alert">{{ proxyError }}</div>
     </header>
+    <!-- P1-4 漂移巡检黄条：接管期间系统代理被外部改动，处置权在用户 -->
+    <div v-if="status?.drift" class="drift-banner" role="alert">
+      <div class="drift-text">
+        <strong>接管期间系统代理被外部改动</strong>
+        <span>{{ status.drift.services.join('、') }} 已不再指向本程序端口（巡检约每 5 分钟一次）。</span>
+      </div>
+      <div class="drift-actions">
+        <button class="btn small primary" :disabled="reapplying" @click="reapplyTakeover">{{ reapplying ? '归位中…' : '重新归位' }}</button>
+        <button class="btn small" @click="acceptDrift">接受现状</button>
+      </div>
+    </div>
     <!-- 第三方代理清理：启动魔法代理前，把系统里其他代理全部关掉，回到干净状态 -->
     <section class="panel" v-if="foreignProxies.length || cleanedNotice">
       <div class="panel-head">
@@ -148,6 +161,48 @@ async function runAudit() {
     toast('体检失败：' + e, 'error');
   } finally {
     auditing.value = false;
+  }
+}
+
+// ── P1-4 一键还原 / 漂移处置 ──────────────────────────────
+const restoring = ref(false);
+const reapplying = ref(false);
+
+async function restoreNetwork() {
+  if (restoring.value) return;
+  restoring.value = true;
+  try {
+    const r = await invoke('restore_network');
+    // 后端 message 已逐层如实（有账回放/失败项/不可逆项/无账局限），原样转达
+    toast(r.message, r.errors.length ? 'warn' : 'success');
+  } catch (e) {
+    toast('还原失败：' + e, 'error');
+  } finally {
+    restoring.value = false;
+  }
+}
+
+async function reapplyTakeover() {
+  if (reapplying.value) return;
+  reapplying.value = true;
+  try {
+    const r = await invoke('reapply_takeover');
+    if (r.allOk) toast('系统代理已重新归位，全部服务达标', 'success');
+    else toast(`归位不完全达标：${(r.mismatched || []).join('、') || '见日志'}`, 'warn');
+    // 达标时 drift 已在后端清空；不达标保持黄条，用户可再次尝试或接受现状
+  } catch (e) {
+    toast('归位失败：' + e, 'error');
+  } finally {
+    reapplying.value = false;
+  }
+}
+
+async function acceptDrift() {
+  try {
+    await invoke('accept_drift');
+    toast('已接受外部改动，本次接管期间不再巡检提示', 'info');
+  } catch (e) {
+    toast('操作失败：' + e, 'error');
   }
 }
 </script>
