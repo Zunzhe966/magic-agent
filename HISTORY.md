@@ -330,7 +330,20 @@
 
 **设计取舍**：巡检"只报不写"——用户可能正手动调试网络，自动改写比漂移本身更恶劣；处置权完全交给用户（归位/接受双选）。异常退出留下的未结账本不自动回放（P1-2 既有立场）：残留场景下用户可能已手动调过网络，自动回写会覆盖之，一键还原按钮把决策留给用户。
 
-**下一步**：P1-5 验收场景人工回归（A~E 五场景，见 docs/重构计划.md）→ 走 release.sh 发 v0.3.0（一键归序版）。P0-5（Developer ID 签名）仍卡待用户提供苹果开发者账号。
+---
+
+### 2026-09-23（交接会话续 2）· P1-5 MCP 引擎侧真机验收 + v0.3.0 构建
+
+| 类型 | 做了什么 |
+|------|----------|
+| chore(release) | `release.sh 0.3.0` 本地构建（不加 --publish、不动 /Applications）：包版本=feed 版本对账通过、ad-hoc 重签校验通过；产物在 src-tauri/target/release/bundle/。三处版本号升 0.3.0 入库。README 撤"尚无一键还原/归序闭环在建"过期表述（4 处）。 |
+| test(P1-5) | **经 stdio JSON-RPC 直连 mcp/server.py 跑五场景**（详见 docs/重构计划.md P1-5 表）：E ✅（netstat 钉证 7891/7892/7893 全绑 127.0.0.1，LAN IP 连接被拒、回环 200）；C ✅×4 轮（start→restore 闭环逐服务比对基线一致、内核零残留）；D 账本半边 ✅（kill -9 内核后 openLedger/staleProxy 如实报告）；B ✅但**抓出护栏缺陷**（见下行）；A ⏸️本机无竞品进程可注入，GUI 确认弹窗留人工。全程现场恢复：系统代理关、账本全 settled、无内核残留。 |
+| fix(护栏) | **reapply_takeover TUN 模式方向错误（真机验收抓出）**：接管意图 systemProxy=false（TUN）时达标态=系统代理全关，旧实现无条件 set(True) 会把"外部关掉"归位成"打开双开冗余"——与 start_proxy 的 TUN 分支语义相反。Rust+MCP 同步改为按 config.systemProxy 定向归位（true→设回指向端口 / false→关闭），Python +1 护栏回归锁断言两模式方向。 |
+| fix(测试隔离) | test_audit_network_clean_machine 未隔离 LEDGER_PATH：audit 读生产账本语义正确（给用户体检用），错在测试——本机存在未结账本时 summary 必含"存在未结接管账本"撞断言。测试改指向 tmp 空账本。 |
+| 过程发现 | App 启动 800ms 自动清理会误杀运行中的自有内核并留下 open 账本（cleanup 名单防误杀铁律挡了第三方，但本轮一次接管中 App 启动把内核带走、账本未结）——restore_network 按账本正确回放收场，属 D 场景意外验证；根因（App 启动清理 vs 运行中内核的互斥）登记为遗留项。 |
+| 验证 | Rust 78 / Python 32 全绿、parity 0。提交：feat 修复 + chore 版本号 + docs README 同步 + docs 验收记录。 |
+
+**下一步**：① 人工完成 A/B/D 的 GUI 侧验收（装 FlClash 走一遍确认弹窗、黄条观感、kill -9 App 自愈提示）；② 通过后 `bash scripts/release.sh 0.3.0 --publish` 正式发布；③ 进入 P2-1 MCP 瘦客户端化。遗留项：App 启动自动清理误杀自有内核的互斥缺口（建议 P2 一并治理）。
 
 ---
 

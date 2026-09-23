@@ -2645,14 +2645,19 @@ def call_tool(name, args):
                 'irreversible': irreversible, 'message': message}
     elif name == 'reapply_takeover':
         # P1-4 漂移归位（与 Rust reapply_takeover 同语义）：接管生效中系统代理被
-        # 外部改动后，重新逐服务设回 127.0.0.1:7891 并对账。前提双检：内核在跑
+        # 外部改动后，恢复到【本次接管声明的秩序】并对账。前提双检：内核在跑
         # （对死端口设代理=亲手制造断网）、有未结账本（无账=系统代理不归本程序管，拒写）。
+        # 方向按接管意图 cfg.systemProxy：true=系统代理模式→设回指向 7891；
+        # false=TUN 模式→达标态是系统代理全关，归位=关掉（真机验收抓出的护栏缺陷：
+        # 曾无条件 set(True)，TUN 下把"外部关掉"归位成"打开双开冗余"）。
         if not mihomo_running():
             return {'ok': False, 'error': '代理内核未在运行，无法归位（请改用 start_proxy 重新接管）'}
         if ledger_open_session() is None:
             return {'ok': False, 'error': '无未结接管账本，系统代理当前不归本程序管辖，拒绝改写'}
+        cfg0 = read_config()
+        want_on = bool(cfg0.get('systemProxy')) if 'error' not in cfg0 else True
         try:
-            result = set_system_proxy(True)
+            result = set_system_proxy(want_on)
         except Exception as e:
             return {'ok': False, 'error': f'归位失败：{e}'}
         return {'ok': True, 'systemProxy': system_proxy_enabled(),

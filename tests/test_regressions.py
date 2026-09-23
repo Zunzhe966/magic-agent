@@ -343,8 +343,13 @@ def _fake_audit_runner(listen_text=None, ps_text=None, proxy_text=_AUDIT_PROXY_A
     return runner
 
 
-def test_audit_network_clean_machine(monkeypatch):
+def test_audit_network_clean_machine(monkeypatch, tmp_path):
     monkeypatch.setattr(server.subprocess, 'run', _fake_audit_runner())
+    # P1-4 验收抓出的测试隔离缺陷：audit_network 会读【真实】LEDGER_PATH 的
+    # openLedger——本机若存在未结账本（接管进行中/崩溃残留），summary 必然含
+    # "存在未结接管账本"，与"干净机器"断言冲突。体检语义上读生产账本是正确的
+    # （MCP 就是给用户体检用的），错在测试没隔离 → 指向空账本路径。
+    monkeypatch.setattr(server, 'LEDGER_PATH', str(tmp_path / 'ledger.json'))
     r = server.audit_network()
     assert r['foreignProcs'] == []
     assert r['portConflicts'] == []
@@ -627,7 +632,7 @@ def test_restore_network_without_ledger_is_honest(tmp_path, monkeypatch):
 
 
 def test_reapply_takeover_guardrails(tmp_path, monkeypatch):
-    """归位双检：内核未跑 → 拒；有账但内核在跑 → 设回并对账。"""
+    """归位双检：内核未跑 → 拒；有账且内核在跑 → 按接管意图方向归位并对账。"""
     path = str(tmp_path / 'ledger.json')
     monkeypatch.setattr(server, 'LEDGER_PATH', path)
     monkeypatch.setattr(server.subprocess, 'run', _networksetup_full())
@@ -637,13 +642,36 @@ def test_reapply_takeover_guardrails(tmp_path, monkeypatch):
     monkeypatch.setattr(server, 'mihomo_running', lambda: False)
     r = server.call_tool('reapply_takeover', {})
     assert r['ok'] is False and '未在运行' in r['error']
-    # 内核在跑 → 走 set_system_proxy(True) 归位
+    # 内核在跑 + 接管意图 systemProxy=true（系统代理模式）→ set(True) 设回指向 7891
     monkeypatch.setattr(server, 'mihomo_running', lambda: True)
+    calls = []
+    monkeypatch.setattr(server, 'read_config', lambda: {'systemProxy': True})
     monkeypatch.setattr(server, 'set_system_proxy',
-                        lambda enable=True, port=7891: {'allOk': True, 'mismatched': [], 'services': []})
+                        lambda enable=True, port=7891: calls.append(enable) or
+                        {'allOk': True, 'mismatched': [], 'services': []})
     monkeypatch.setattr(server, 'system_proxy_enabled', lambda: True)
     r = server.call_tool('reapply_takeover', {})
     assert r['ok'] is True and r['allOk'] is True
+    assert calls == [True], '系统代理模式的归位方向必须是打开并指向接管端口'
+
+
+def test_reapply_takeover_tunnel_mode_restores_closed(tmp_path, monkeypatch):
+    """护栏回归（真机验收抓出）：TUN 接管下达标态=系统代理全关，
+    漂移归位必须【关掉】而不是打开——无条件 set(True) 会制造双开冗余。"""
+    path = str(tmp_path / 'ledger.json')
+    monkeypatch.setattr(server, 'LEDGER_PATH', path)
+    monkeypatch.setattr(server.subprocess, 'run', _networksetup_full())
+    server.ledger_begin('mcp:start_proxy')
+    monkeypatch.setattr(server, 'mihomo_running', lambda: True)
+    monkeypatch.setattr(server, 'read_config', lambda: {'systemProxy': False})  # TUN 模式
+    calls = []
+    monkeypatch.setattr(server, 'set_system_proxy',
+                        lambda enable=True, port=7891: calls.append(enable) or
+                        {'allOk': True, 'mismatched': [], 'services': []})
+    monkeypatch.setattr(server, 'system_proxy_enabled', lambda: False)
+    r = server.call_tool('reapply_takeover', {})
+    assert r['ok'] is True
+    assert calls == [False], 'TUN 模式的归位方向必须是关闭系统代理'
 
 
 def test_probe_drift_only_when_taking_over(tmp_path, monkeypatch):

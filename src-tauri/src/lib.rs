@@ -1170,11 +1170,15 @@ async fn restore_network(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Resul
 }
 
 /// P1-4 漂移处置 [重新归位]：接管仍在生效（账本 open）但系统代理被外部改离
-/// 接管态时，用户点归位 = 重新逐服务设回 127.0.0.1:接管端口并回读对账。
-/// 前提校验：内核必须在跑——对着死端口设系统代理 = 亲手制造断网，绝不做。
+/// 接管态时，用户点归位 = 把系统代理恢复到【本次接管声明的秩序】并回读对账。
+/// 前提校验一：内核必须在跑——对着死端口设系统代理 = 亲手制造断网，绝不做。
+/// 前提校验二：按接管意图分模式归位——systemProxy=true（系统代理模式）归位到
+/// 指向 127.0.0.1:接管端口；systemProxy=false（TUN 模式）的"达标态"是系统代理
+/// 全关（TUN 已全局接管，再开系统代理是双开冗余），归位 = 关掉，绝不能反向
+/// 把系统代理打开（真机验收抓出的护栏缺陷：曾无条件 set(true)）。
 #[tauri::command]
 async fn reapply_takeover(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<crate::system_proxy::SystemProxyStatus, String> {
-    let (port, drift_slot, drift_ack) = {
+    let (port, want_system_proxy, drift_slot, drift_ack) = {
         let g = state.lock().unwrap();
         let mihomo = g.mihomo.clone();
         if !mihomo.status().running {
@@ -1183,9 +1187,9 @@ async fn reapply_takeover(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Resu
         if ledger::LedgerFile::default().open_session().is_none() {
             return Err("无未结接管账本，系统代理当前不归本程序管辖，拒绝改写".to_string());
         }
-        (g.mihomo.port, g.drift.clone(), g.drift_ack.clone())
+        (g.mihomo.port, g.config.system_proxy, g.drift.clone(), g.drift_ack.clone())
     };
-    let status = tauri::async_runtime::spawn_blocking(move || system_proxy::set_system_proxy(true, port))
+    let status = tauri::async_runtime::spawn_blocking(move || system_proxy::set_system_proxy(want_system_proxy, port))
         .await
         .map_err(|e| format!("reapply_takeover 线程异常: {e}"))??;
     log_proxy_set_result("reapply", &status);
