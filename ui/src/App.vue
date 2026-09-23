@@ -27,19 +27,18 @@
       <AppsView v-else-if="view === 'apps'" :apps="apps" :nodes="config?.nodes || []" @change="applyApps" @refresh="refreshApps" />
       <ServersView v-else-if="view === 'servers'" :config="config" @update="saveConfig" @select-server="selectSshServer" @delete-server="deleteSshServer" @nav="view = 'ssh'" />
       <ServerDashboard v-else-if="view === 'server-dashboard'" :config="config" @goto-servers="view = 'servers'" />
-      <DomainRulesView v-else-if="view === 'domain-rules'" :config="config" @update="saveConfig" />
+      <DomainRulesView v-else-if="view === 'domain-rules'" :config="config" @update="saveDomainRules" />
       <ConnectionsView v-else-if="view === 'connections'" :config="config" />
       <SshView v-else-if="view === 'ssh'" :config="config" @saved="onSshSaved" />
-      <SettingsView v-else-if="view === 'settings'" ref="settingsView" />
+      <SettingsView v-else-if="view === 'settings'" />
     </main>
   </div>
 </template>
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
-import { ask } from '@tauri-apps/plugin-dialog';
-import { relaunch } from '@tauri-apps/plugin-process';
 import { toast } from './toast.js';
+
 import Dashboard from './components/Dashboard.vue';
 import AppsView from './components/AppsView.vue';
 import ServersView from './components/ServersView.vue';
@@ -48,8 +47,6 @@ import DomainRulesView from './components/DomainRulesView.vue';
 import ConnectionsView from './components/ConnectionsView.vue';
 import SshView from './components/SshView.vue';
 import SettingsView from './components/SettingsView.vue';
-
-const settingsView = ref(null);
 
 const view = ref('dashboard');
 const status = ref(null);
@@ -74,6 +71,10 @@ async function refresh() {
     const [s, c] = await Promise.all([invoke('get_status'), invoke('get_config')]);
     status.value = s;
     config.value = c;
+    // P0-4 崩溃自愈提示：后端一次性下发（读取即清空），toast 告知用户
+    if (s.selfHealNotice) {
+      toast(s.selfHealNotice, 'warn');
+    }
   } catch (e) {
     console.error('refresh failed', e);
   }
@@ -127,7 +128,11 @@ async function stopProxy() {
 }
 async function toggleSystemProxy(enabled) {
   try {
-    await invoke('set_system_proxy', { enabled });
+    const r = await invoke('set_system_proxy', { enabled });
+    // P0-1：部分服务未达标时如实提示，不再默认"成功"
+    if (r && r.allOk === false && r.mismatched && r.mismatched.length) {
+      toast(`系统代理${enabled ? '开启' : '关闭'}不完全：${r.mismatched.join('、')} 未生效，请检查这些网络的服务设置`, 'warn');
+    }
   } catch (e) {
     proxyError.value = (enabled ? '开启' : '关闭') + '系统代理失败：' + String(e);
     console.error('toggle system proxy failed', e);
@@ -155,14 +160,23 @@ async function applyApps(list) {
 }
 async function saveConfig(patch) {
   if (!config.value) return;
+  const previous = config.value;
   config.value = { ...config.value, ...patch };
   try {
     await invoke('save_config', { config: config.value });
+    return true;
   } catch (e) {
     // 后端返回 Err（如规则热更新失败）必须让用户看到，否则用户以为已保存
+    config.value = previous;
     toast('保存失败：' + e, 'error');
+    return false;
   }
-  await refresh();
+}
+
+async function saveDomainRules(patch) {
+  const ok = await saveConfig(patch);
+  if (ok) await refresh();
+  return ok;
 }
 function onSshSaved(next) {
   config.value = { ...config.value, ...next };
@@ -194,43 +208,30 @@ async function deleteSshServer(serverId) {
     toast('删除服务器失败：' + e, 'error');
   }
 }
-// 启动时静默检查更新：有新版弹原生对话框，用户确认后下载安装+重启
-// 失败静默吞掉，不打扰用户；手动检查走设置页 SettingsView 自己的 UI 流程
-//
-// 关键：必须走后端 check_channel_update / install_channel_update，
-// 不能直接调 plugin-updater 的 check()——后者的端点编译期固定，
-// 无法跟随用户在设置页选择的更新通道（本地测试 / GitHub 发布）。
-async function checkForUpdateQuiet() {
-  try {
-    const res = await invoke('check_channel_update');
-    if (!res || !res.available) return;
-    const ok = await ask(
-      `发现新版本 v${res.version}，立即更新？`,
-      { title: '软件更新', kind: 'info' }
-    );
-    if (!ok) return;
-    toast('正在下载更新…');
-    await invoke('install_channel_update');
-    toast('更新已安装，即将重启…');
-    await relaunch();
-  } catch (e) {
-    console.error('update check failed', e);
-  }
-}
+// 启动时不自动检查更新：检查更新只在设置页手动触发，避免一开就查本地/GitHub。
 
 onMounted(async () => {
-  // 先只拉轻量数据（状态+配置），让界面立刻可用可点击。
-  // scan_apps 是重操作（扫全盘 App + lsof 全机连接），绝不阻塞首屏交互。
+  // 先拉轻量数据（状态+配置），界面立即可用。
   await refresh();
-  // App 扫描放后台异步跑，不 await：用户点导航/按钮时不会被扫描卡住
+  
+  // 自动启动代理：无论之前状态如何，打开 App 就把代理和系统代理启动好。
+  // 这是用户核心诉求：打开就可用，不需要手动点"启动"。
+  if (!status.value?.proxyRunning) {
+    console.log('[App] 代理未运行，自动启动...');
+    await startProxy();
+  } else if (!status.value?.systemProxy) {
+    // 代理在跑但系统代理没开（如 App 重启后），立即开启
+    console.log('[App] 代理在跑但系统代理未开，自动开启...');
+    await toggleSystemProxy(true);
+  }
+  
+  // App 扫描放后台异步跑，不阻塞首屏
   refreshApps();
   // 定时器只做轻量状态轮询；只有停留在软件分流页时才刷新 App 运行状态
   timer = setInterval(() => {
     refresh();
     if (view.value === 'apps') refreshApps();
   }, 5000);
-  // 启动静默检查更新（不打扰，失败静默吞掉）
-  checkForUpdateQuiet();
 });
 onUnmounted(() => clearInterval(timer));
 </script>

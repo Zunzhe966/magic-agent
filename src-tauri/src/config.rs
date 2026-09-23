@@ -68,8 +68,8 @@ pub struct ServerInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DomainRule {
-    pub domain: String,   // 如 github.com、huggingface.co
-    pub target: String,   // "proxy" 走代理 | "direct" 直连 | 节点名（走该节点）
+    pub domain: String, // 如 github.com、huggingface.co
+    pub target: String, // "proxy" 走代理 | "direct" 直连 | 节点名（走该节点）
     /// 服务于哪个密钥/软件（如"WorkBuddy 的 OpenRouter 密钥"），防止日久失忆误删
     #[serde(default)]
     pub reason: String,
@@ -79,33 +79,42 @@ pub struct DomainRule {
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     pub nodes: Vec<ProxyNode>,
+    #[serde(alias = "selected_node")]
     pub selected_node: Option<String>,
     pub apps: Vec<AppSetting>,
+    #[serde(default, alias = "system_proxy")]
     pub system_proxy: bool,
+    #[serde(alias = "auto_global")]
     pub auto_global: String,
-    #[serde(default)]
+    #[serde(default, alias = "subscription_url")]
     pub subscription_url: Option<String>,
     #[serde(default)]
     pub servers: Vec<ServerInfo>,
-    #[serde(default)]
+    #[serde(default, alias = "active_server_id")]
     pub active_server_id: Option<String>,
     #[serde(default)]
     pub domain_rules: Vec<DomainRule>,
     /// mihomo 控制 API（127.0.0.1:19091）的鉴权 secret。
     /// 缺失时在 load() 自动生成并持久化，防止本机任意进程/网页 CSRF 操控代理。
-    #[serde(default)]
+    #[serde(default, alias = "api_secret")]
     pub api_secret: Option<String>,
     /// 更新通道：`local`（本地开发测试，127.0.0.1:7878）
     /// 或 `github`（GitHub Releases，面向真实用户）。
     /// None / 未知值一律按 github 处理（面向用户更安全）。
-    #[serde(default)]
+    #[serde(default, alias = "update_channel")]
     pub update_channel: Option<String>,
     // 兼容旧配置：仍保留这几个字段，但新逻辑不再把明文写进 config.json
+    #[serde(alias = "ssh_host")]
     pub ssh_host: Option<String>,
+    #[serde(alias = "ssh_port")]
     pub ssh_port: Option<u16>,
+    #[serde(alias = "ssh_user")]
     pub ssh_user: Option<String>,
+    #[serde(alias = "ssh_auth")]
     pub ssh_auth: Option<String>,
+    #[serde(alias = "ssh_password")]
     pub ssh_password: Option<String>,
+    #[serde(alias = "ssh_private_key")]
     pub ssh_private_key: Option<String>,
 }
 
@@ -147,24 +156,34 @@ impl AppConfig {
             return Some(s.clone());
         }
         // 旧字段兼容
-        let host = self.ssh_host.clone()
-            .or_else(|| {
-                // SSH 主机未配置时，从选中的代理节点推导——
-                // 用户的代理节点就部署在云服务器上，SSH 和代理是同一台机器，
-                // 不再要求用户在 SSH 页面重新填一遍服务器地址。
-                let selected = self.selected_node.as_ref()?;
-                let node = self.nodes.iter().find(|n| &n.name == selected)?;
-                Some(node.server.clone())
-            })?;
+        let host = self.ssh_host.clone().or_else(|| {
+            // SSH 主机未配置时，从选中的代理节点推导——
+            // 用户的代理节点就部署在云服务器上，SSH 和代理是同一台机器，
+            // 不再要求用户在 SSH 页面重新填一遍服务器地址。
+            let selected = self.selected_node.as_ref()?;
+            let node = self.nodes.iter().find(|n| &n.name == selected)?;
+            Some(node.server.clone())
+        })?;
         Some(ServerInfo {
             id: format!("ssh-{}", host),
             name: host.clone(),
             host,
             port: self.ssh_port.unwrap_or(22),
             user: self.ssh_user.clone().unwrap_or_else(|| "root".to_string()),
-            auth: self.ssh_auth.clone().unwrap_or_else(|| "password".to_string()),
-            password_saved: self.ssh_password.as_deref().map(|p| !p.is_empty()).unwrap_or(false),
-            private_key_saved: self.ssh_private_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false),
+            auth: self
+                .ssh_auth
+                .clone()
+                .unwrap_or_else(|| "password".to_string()),
+            password_saved: self
+                .ssh_password
+                .as_deref()
+                .map(|p| !p.is_empty())
+                .unwrap_or(false),
+            private_key_saved: self
+                .ssh_private_key
+                .as_deref()
+                .map(|k| !k.is_empty())
+                .unwrap_or(false),
             key_path: self.ssh_private_key.clone(),
         })
     }
@@ -175,27 +194,143 @@ pub fn config_path() -> PathBuf {
     dir.join("magic-agent").join("config.json")
 }
 
+/// 把 JSON object 的所有键从 snake_case 规整为 camelCase，递归处理嵌套对象。
+/// 仅处理 object 的 key，不动 value（包括字符串值里的下划线）。
+/// 用于兼容旧 config.json：早期版本部分键用 snake_case 写入，而 AppConfig
+/// 用 rename_all="camelCase" 反序列化；不规整则 snake_case 键匹配不上字段。
+fn normalize_keys_to_camel(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            // 先收集所有键，再逐个替换（避免遍历时修改 map）
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for k in keys {
+                let new_k = snake_to_camel(&k);
+                if new_k != k {
+                    if let Some(v) = map.remove(&k) {
+                        // 若 camelCase 键已存在，保留后写入的那个（即蛇形的旧值被新值覆盖）；
+                        // serde_json Value 解析重复键时已取最后一个，这里再插入不会丢数据。
+                        map.insert(new_k, v);
+                    }
+                }
+            }
+            // 递归处理所有值
+            for v in map.values_mut() {
+                normalize_keys_to_camel(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                normalize_keys_to_camel(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// snake_case → camelCase。只按下划线分割，首段全小写、后续每段首字母大写。
+/// 已经是 camelCase（不含下划线）的原样返回。
+fn snake_to_camel(s: &str) -> String {
+    if !s.contains('_') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut upper_next = false;
+    for (i, c) in s.chars().enumerate() {
+        if c == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(c.to_uppercase());
+            upper_next = false;
+        } else if i == 0 {
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// 从字符串解析配置：
+///   1) 先 parse 成 serde_json::Value：Value 解析器对重复键取最后一个值、不报错——
+///      避免旧版遗留的 snake_case 键与新版 camelCase 键共存时，被字符串替换制造出
+///      重复键、serde 直接 Err、整份配置被判定损坏、用户数据全丢。
+///   2) 递归把键从 snake_case 规整为 camelCase，兼容旧配置。
+///   3) from_value 反序列化为 AppConfig；类型不匹配等仍会 Err。
+fn parse_config_str(s: &str) -> Result<AppConfig, String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(s).map_err(|e| format!("JSON 语法错误: {e}"))?;
+    let mut value = parsed;
+    normalize_keys_to_camel(&mut value);
+    serde_json::from_value::<AppConfig>(value).map_err(|e| format!("结构不兼容: {e}"))
+}
+
+/// 备份坏文件，但**只在备份不存在时**写入——避免二次事故把仅存的好备份覆盖掉。
+fn backup_once(p: &std::path::Path) {
+    let bak = p.with_extension("json.corrupt");
+    if !bak.exists() {
+        let _ = std::fs::copy(p, &bak);
+    }
+}
+
+/// 尝试从 .corrupt 备份恢复配置。
+fn recover_from_backup(p: &std::path::Path) -> Option<AppConfig> {
+    let bak = p.with_extension("json.corrupt");
+    let s = std::fs::read_to_string(&bak).ok()?;
+    parse_config_str(&s).ok()
+}
+
 pub fn load() -> AppConfig {
     let p = config_path();
-    let mut cfg: AppConfig = match std::fs::read_to_string(&p) {
-        Ok(s) => match serde_json::from_str::<AppConfig>(&s) {
-            Ok(c) => c,
-            Err(e) => {
-                // 配置损坏：不静默吞掉，先备份坏文件再回退默认，避免用户节点/设置全丢
-                eprintln!("[magic-agent] config.json 解析失败，已备份为 .corrupt 并回退默认配置: {e}");
-                let bak = p.with_extension("json.corrupt");
-                let _ = std::fs::copy(&p, &bak);
-                AppConfig::default()
-            }
-        },
-        Err(_) => AppConfig::default(),
+
+    // 文件不存在 → 首次运行：生成默认配置并落盘（安全，不会覆盖任何用户数据）
+    let text = match std::fs::read_to_string(&p) {
+        Ok(s) => s,
+        Err(_) => {
+            let mut cfg = AppConfig::default();
+            cfg.api_secret = Some(generate_api_secret());
+            let _ = save(&cfg);
+            return cfg;
+        }
     };
-    // 首次运行生成 API secret 并持久化（mihomo external-controller 的鉴权令牌）
-    if cfg.api_secret.as_deref().map(|s| s.is_empty()).unwrap_or(true) {
-        cfg.api_secret = Some(generate_api_secret());
-        let _ = save(&cfg);
+
+    match parse_config_str(&text) {
+        Ok(mut cfg) => {
+            // 正常解析：补齐 API secret（mihomo external-controller 的鉴权令牌）后返回
+            if cfg
+                .api_secret
+                .as_deref()
+                .map(|s| s.is_empty())
+                .unwrap_or(true)
+            {
+                cfg.api_secret = Some(generate_api_secret());
+                let _ = save(&cfg);
+            }
+            cfg
+        }
+        Err(e) => {
+            // 解析失败 / 文件为空：只备份（不覆盖已有备份）并尝试从备份自愈。
+            // 关键：**绝不在此把空配置写回用户文件**——那正是"数据消失"的元凶。
+            eprintln!("[magic-agent] config.json 解析失败，暂不回写用户文件: {e}");
+            backup_once(&p);
+            match recover_from_backup(&p) {
+                Some(mut cfg) => {
+                    eprintln!("[magic-agent] 已从 config.json.corrupt 自愈恢复");
+                    if cfg
+                        .api_secret
+                        .as_deref()
+                        .map(|s| s.is_empty())
+                        .unwrap_or(true)
+                    {
+                        cfg.api_secret = Some(generate_api_secret());
+                    }
+                    let _ = save(&cfg);
+                    cfg
+                }
+                // 无法恢复：仅在内存兜底，不动磁盘上的用户文件
+                None => AppConfig::default(),
+            }
+        }
     }
-    cfg
 }
 
 /// 从 /dev/urandom 读 16 字节转 hex，无第三方依赖。
@@ -235,8 +370,11 @@ pub fn save(cfg: &AppConfig) -> Result<(), String> {
     }
     // 原子写：临时文件+rename，防止与 Python(MCP) 并发写时出现半截 JSON
     let tmp = p.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        &tmp,
+        serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     // 配置含 apiSecret 与节点 UUID/公钥，必须收紧为 0600。
     // 关键：chmod 必须在 rename 之前——若先 rename 再 chmod，rename 完成到
     // chmod 执行之间会有一个可被其他用户读取 secret 的短窗口（tmp 默认 0644）。
@@ -248,7 +386,6 @@ pub fn save(cfg: &AppConfig) -> Result<(), String> {
     std::fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
     Ok(())
 }
-
 
 /// 校验订阅 URL 的 host 是否指向公网，拒绝回环/内网/链路本地/组播/保留地址，
 /// 防止恶意前端借 fetch_subscription 触发 SSRF 拉取内网内容。
@@ -289,7 +426,11 @@ pub fn validate_public_host(host: &str) -> Result<(), String> {
     if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(host_only, 443)) {
         for a in addrs {
             if is_private_or_reserved(a.ip()) {
-                return Err(format!("订阅域名 {} 解析到内网/保留地址 {}，已拦截", host_only, a.ip()));
+                return Err(format!(
+                    "订阅域名 {} 解析到内网/保留地址 {}，已拦截",
+                    host_only,
+                    a.ip()
+                ));
             }
         }
     }
@@ -362,7 +503,9 @@ pub fn parse_vless_subscription(text: &str) -> Result<Vec<ProxyNode>, String> {
     let mut seen = std::collections::HashSet::new();
     for line in content.lines() {
         let line = line.trim();
-        let Some(idx) = line.find("vless://") else { continue };
+        let Some(idx) = line.find("vless://") else {
+            continue;
+        };
         let uri = &line[idx..];
         if let Ok(node) = parse_vless_uri(uri) {
             // 按 server:port 去重：订阅可能重复返回同一节点，避免重复添加
@@ -417,10 +560,19 @@ fn parse_vless_uri(uri: &str) -> Result<ProxyNode, String> {
         port,
         uuid: userinfo.to_string(),
         flow: params.get("flow").cloned().unwrap_or_default(),
-        network: params.get("type").cloned().unwrap_or_else(|| "tcp".to_string()),
-        tls: params.get("security").map(|s| s == "reality" || s == "tls").unwrap_or(false),
+        network: params
+            .get("type")
+            .cloned()
+            .unwrap_or_else(|| "tcp".to_string()),
+        tls: params
+            .get("security")
+            .map(|s| s == "reality" || s == "tls")
+            .unwrap_or(false),
         udp: true,
-        fingerprint: params.get("fp").cloned().unwrap_or_else(|| "chrome".to_string()),
+        fingerprint: params
+            .get("fp")
+            .cloned()
+            .unwrap_or_else(|| "chrome".to_string()),
         public_key: params.get("pbk").cloned().unwrap_or_default(),
         short_id: params.get("sid").cloned().unwrap_or_default(),
         sni: params.get("sni").cloned().unwrap_or_default(),
@@ -432,8 +584,24 @@ fn parse_vless_uri(uri: &str) -> Result<ProxyNode, String> {
 pub fn guess_region(name: &str) -> String {
     let n = name.to_lowercase();
     let pairs = [
-        ("美国", vec!["美国", "美", "us", "usa", "america", "texas", "硅谷", "洛杉矶", "纽约"]),
-        ("日本", vec!["日本", "日", "jp", "japan", "tokyo", "东京", "大阪"]),
+        (
+            "美国",
+            vec![
+                "美国",
+                "美",
+                "us",
+                "usa",
+                "america",
+                "texas",
+                "硅谷",
+                "洛杉矶",
+                "纽约",
+            ],
+        ),
+        (
+            "日本",
+            vec!["日本", "日", "jp", "japan", "tokyo", "东京", "大阪"],
+        ),
         ("香港", vec!["香港", "港", "hk", "hongkong", "hong kong"]),
         ("台湾", vec!["台湾", "台", "tw", "taiwan", "台北"]),
         ("新加坡", vec!["新加坡", "新", "sg", "singapore", "狮城"]),
@@ -481,10 +649,131 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snake_to_camel_works() {
+        assert_eq!(snake_to_camel("system_proxy"), "systemProxy");
+        assert_eq!(snake_to_camel("update_channel"), "updateChannel");
+        assert_eq!(snake_to_camel("api_secret"), "apiSecret");
+        assert_eq!(snake_to_camel("selected_node"), "selectedNode");
+        // 已经是 camelCase 的不动
+        assert_eq!(snake_to_camel("systemProxy"), "systemProxy");
+        assert_eq!(snake_to_camel("nodes"), "nodes");
+        // 连续下划线
+        assert_eq!(snake_to_camel("a__b"), "aB");
+    }
+
+    #[test]
+    fn normalize_keys_handles_duplicate_snake_and_camel() {
+        // 回归：旧版遗留 snake_case 键与新版 camelCase 键共存时，
+        // 旧的字符串替换会产生重复键导致 serde Err、整份配置被清空。
+        // 现在先 parse 成 Value（重复键取最后一个），再规整键名，不应失败。
+        let json = r#"{
+            "systemProxy": true,
+            "autoGlobal": "auto",
+            "nodes": [],
+            "apps": [],
+            "system_proxy": false,
+            "update_channel": "local"
+        }"#;
+        let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+        normalize_keys_to_camel(&mut value);
+        let cfg: AppConfig = serde_json::from_value(value).expect("应能解析含重复键的配置");
+        // 重复键取最后一个值：system_proxy=false 在 systemProxy=true 之后
+        assert_eq!(cfg.system_proxy, false);
+        assert_eq!(cfg.update_channel.as_deref(), Some("local"));
+        assert_eq!(cfg.auto_global, "auto");
+    }
+
+    #[test]
+    fn load_recovers_real_corrupt_file() {
+        // 用本机真实的 .corrupt 文件端到端验证：修复后 load() 应能恢复所有用户数据，
+        // 不再因重复键回退默认配置。文件不存在则跳过（CI/其他机器）。
+        let p = std::path::PathBuf::from(
+            "/Users/someuser/Library/Application Support/magic-agent/config.json.corrupt",
+        );
+        if !p.exists() {
+            eprintln!("跳过：.corrupt 文件不存在");
+            return;
+        }
+        let s = std::fs::read_to_string(&p).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&s).expect("Value 应解析成功");
+        normalize_keys_to_camel(&mut value);
+        let cfg: AppConfig =
+            serde_json::from_value(value).expect("修复后应能反序列化含重复键的旧配置");
+        assert!(
+            !cfg.nodes.is_empty(),
+            "恢复后节点不应为空（原配置有节点）"
+        );
+        assert!(
+            !cfg.apps.is_empty(),
+            "恢复后软件分流不应为空"
+        );
+        assert!(
+            !cfg.domain_rules.is_empty(),
+            "恢复后域名规则不应为空"
+        );
+        assert!(
+            !cfg.servers.is_empty(),
+            "恢复后 SSH 服务器不应为空"
+        );
+        eprintln!(
+            "恢复成功：nodes={} apps={} servers={} domainRules={} selectedNode={:?} channel={:?}",
+            cfg.nodes.len(),
+            cfg.apps.len(),
+            cfg.servers.len(),
+            cfg.domain_rules.len(),
+            cfg.selected_node,
+            cfg.update_channel
+        );
+    }
+
+    #[test]
+    fn self_heal_from_corrupt_backup() {
+        // 端到端（在临时目录里、不碰线上文件）：
+        //   * backup_once 只在无备份时写，已有 .corrupt 不被坏文件覆盖；
+        //   * 解析失败时用坏文件副本触发自愈；
+        //   * recover_from_backup 能从真实 .corrupt 恢复全部用户数据。
+        let real_bak = std::path::PathBuf::from(
+            "/Users/someuser/Library/Application Support/magic-agent/config.json.corrupt",
+        );
+        if !real_bak.exists() {
+            eprintln!("跳过：真实 .corrupt 不存在");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("magic-agent-heal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        let bak = p.with_extension("json.corrupt");
+
+        // 好备份 = 真实 .corrupt；当前 config.json = 语法错
+        std::fs::copy(&real_bak, &bak).unwrap();
+        std::fs::write(&p, "{ this is not valid json").unwrap();
+        assert!(parse_config_str("{ this is not valid json").is_err(), "坏文件应解析失败");
+
+        // backup_once 不应覆盖已存在的好备份
+        backup_once(&p);
+        let bak_text = std::fs::read_to_string(&bak).unwrap();
+        assert_eq!(bak_text, std::fs::read_to_string(&real_bak).unwrap(), ".corrupt 不应被覆盖");
+
+        let recovered = recover_from_backup(&p).expect("应从 .corrupt 自愈恢复");
+        assert!(!recovered.nodes.is_empty(), "自愈后节点不应为空");
+        assert!(!recovered.apps.is_empty(), "自愈后软件分流不应为空");
+        assert!(!recovered.domain_rules.is_empty(), "自愈后域名规则不应为空");
+        assert!(!recovered.servers.is_empty(), "自愈后 SSH 服务器不应为空");
+        eprintln!(
+            "自愈成功：nodes={} apps={} servers={} domainRules={}",
+            recovered.nodes.len(),
+            recovered.apps.len(),
+            recovered.servers.len(),
+            recovered.domain_rules.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn url_decode_never_panics_on_multibyte() {
@@ -548,7 +837,10 @@ mod tests {
         assert_eq!(node.port, 443);
         assert_eq!(node.uuid, "00000000-0000-4000-8000-000000000000");
         assert_eq!(node.flow, "xtls-rprx-vision");
-        assert_eq!(node.public_key, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(
+            node.public_key,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        );
         assert_eq!(node.short_id, "0000000000000000");
         assert_eq!(node.sni, "www.example.com");
         assert_eq!(node.name, "\u{793a}\u{4f8b}\u{8282}\u{70b9}");

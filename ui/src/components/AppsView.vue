@@ -16,7 +16,7 @@
     <p class="muted" style="margin-bottom: 10px;">默认策略：所有软件直连。只有你在下面明确选为「代理」的软件才会走代理。带「联网」标记的软件/脚本当前正在访问网络，是需要关注的对象；「本地」的则未联网，无需处理。</p>
     <div class="apps-table">
       <div class="apps-row head">
-        <span>软件</span><span>类别</span><span>模式</span><span>状态</span><span>路径</span>
+        <span>软件</span><span>类别</span><span>模式</span><span>节点</span><span>状态</span><span>路径</span>
       </div>
       <div class="apps-row" v-for="app in filtered" :key="app.id">
         <div class="app-name">
@@ -31,6 +31,7 @@
           <option :value="null">当前节点</option>
           <option v-for="n in nodes" :key="n.name" :value="n.name">{{ n.name }}</option>
         </select>
+        <span v-else class="muted">—</span>
         <span class="conn-status" :class="connClass(app)">{{ connText(app) }}</span>
         <span class="path muted">{{ app.path }}</span>
       </div>

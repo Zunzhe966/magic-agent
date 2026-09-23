@@ -18,11 +18,11 @@ pub struct MihomoStatus {
 /// 本程序内核的控制 API 固定端口（external-controller）
 pub const API_PORT: u16 = 19091;
 
-/// 「坐飞机」端口：进去后无条件走代理（PROXY），mihomo 不做国内外自动分流。
+/// 节点代理端口：进来的流量全部走节点（PROXY），mihomo 不做国内外自动分流。
 /// 智能体自己决定要不要走这条路——把需要出国的请求直接送进这个口。
 pub const PROXY_PORT: u16 = 7893;
 
-/// 「坐火车」端口：进去后无条件直连（DIRECT），绝不碰任何节点。
+/// 本机直连端口：进来的流量全部本机直连（DIRECT），绝不碰任何节点。
 /// 智能体自己决定走国内直连时送进这个口。
 pub const DIRECT_PORT: u16 = 7892;
 
@@ -80,22 +80,40 @@ impl MihomoManager {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("magic-agent")
             .join("runtime");
-        Self { pid: Arc::new(Mutex::new(None)), port: 7891, runtime_dir }
+        Self {
+            pid: Arc::new(Mutex::new(None)),
+            port: 7891,
+            runtime_dir,
+        }
     }
 
     pub fn status(&self) -> MihomoStatus {
         let mut guard = self.pid.lock().unwrap();
         let mut alive = guard.map(process_alive).unwrap_or(false);
         if !alive {
-            *guard = None;
+            // App 重启/外部 extension 启动后，内存里没有 PID。先按 runtime 路径重新发现，
+            // 不能只看端口：第三方程序占用 7891+19091 也会造成假“运行中”。
+            if let Some(pid) = self.find_running_pid() {
+                *guard = Some(pid);
+                alive = true;
+            } else {
+                *guard = None;
+            }
         }
-        // 如果 PID 不在（例如 mihomo 由外部/MCP 启动），但混合端口和控制 API 都开放，
-        // 才认为代理在运行——只查混合端口会把占用 7891 的第三方代理误判成自己。
-        if !alive
-            && TcpStream::connect(("127.0.0.1", self.port)).is_ok()
-            && TcpStream::connect(("127.0.0.1", API_PORT)).is_ok()
-        {
-            alive = true;
+        // 有 PID 还不够：mihomo 可能卡在启动阶段/控制 API 未监听。必须确认
+        // 控制 API 能建立连接，否则状态栏会把“孤儿进程/半启动”误报成可用。
+        // connect 必须带超时：无超时的 connect 在异常网络栈下可能长时间阻塞，
+        // 而此处持有 pid 锁，会把所有并发 status 调用串行卡死。
+        if alive {
+            alive = std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], API_PORT)),
+                std::time::Duration::from_millis(500),
+            )
+            .is_ok();
+            // API 连不上 = 进程僵死/半启动，PID 已不可信。清除避免下次误判。
+            if !alive {
+                *guard = None;
+            }
         }
         MihomoStatus {
             running: alive,
@@ -108,7 +126,12 @@ impl MihomoManager {
     /// 启动 mihomo。
     /// TUN 模式需要 root 权限，通过 osascript 弹管理员授权后以 root 启动。
     /// app_rules: (路径前缀列表, 目标) 列表，目标为 "DIRECT" 或 "NODE-<节点名>" / "PROXY"。
-    pub fn start(&self, cfg: &AppConfig, rules: &[String], app_rules: &[(Vec<String>, String)]) -> Result<MihomoStatus, String> {
+    pub fn start(
+        &self,
+        cfg: &AppConfig,
+        rules: &[String],
+        app_rules: &[(Vec<String>, String)],
+    ) -> Result<MihomoStatus, String> {
         self.stop();
         let _ = std::fs::create_dir_all(&self.runtime_dir);
         self.ensure_runtime_bin()?;
@@ -121,13 +144,23 @@ impl MihomoManager {
             if let Ok(pid) = pid_str.parse::<u32>() {
                 *self.pid.lock().unwrap() = Some(pid);
                 if self.wait_api() {
-                    return Ok(MihomoStatus { running: true, pid: Some(pid), port: self.port, node: cfg.selected_node.clone() });
+                    return Ok(MihomoStatus {
+                        running: true,
+                        pid: Some(pid),
+                        port: self.port,
+                        node: cfg.selected_node.clone(),
+                    });
                 }
                 return Err(format!("内核已启动（PID {pid}）但控制 API 未就绪"));
             }
             if pid_str == "already-running" && self.wait_api() {
                 // 已有实例在跑（如 runtime 常驻副本），接管它
-                return Ok(MihomoStatus { running: true, pid: None, port: self.port, node: cfg.selected_node.clone() });
+                return Ok(MihomoStatus {
+                    running: true,
+                    pid: None,
+                    port: self.port,
+                    node: cfg.selected_node.clone(),
+                });
             }
             // ctl 启动失败则继续走 osascript 弹窗路径
         }
@@ -140,31 +173,30 @@ impl MihomoManager {
         let log_path = self.runtime_dir.join("mihomo.log");
         let err_path = self.runtime_dir.join("mihomo.err.log");
         let conf_path = self.runtime_dir.join("mihomo.yaml");
-        // 日志轮转：超 10MB 改名为 .old（启动前执行，运行中的旧进程持有 fd 不受影响）
-        for p in [&log_path, &err_path] {
-            if let Ok(meta) = std::fs::metadata(p) {
-                if meta.len() > 10 * 1024 * 1024 {
-                    let old = p.with_extension("log.old");
-                    let _ = std::fs::remove_file(&old);
-                    let _ = std::fs::rename(p, &old);
-                }
-            }
-        }
+        // 日志轮转：超 10MB 改名为 .old。
+        // 注意：mihomo 以 root 运行，日志文件属 root，普通用户无法 rename/remove。
+        // 因此轮转逻辑必须放在 osascript 的 shell 命令里，由 root 执行。
         // 直接 & 后台启动并输出 $!（后台进程 PID），由 osascript 以管理员权限执行。
         // 注意：do shell script 会等待前台命令结束，但 & 让 mihomo 立即后台化，$! 被 echo 返回。
         // 不能用 nohup：osascript 的 shell 没有 TTY，nohup 会报 "can't detach from console"。
+        // 日志权限：root 默认 umask 020，日志会落成 0644 世界可读——日志里是用户
+        // 全量连接记录（进程名 --> 域名），同机其他账号能直接读走。
+        // umask 077 管新建，chmod 600 管已存在的旧文件，轮转出的 .old 同样收权。
         let shell_cmd = format!(
-            "'{}' -f '{}' -d '{}' > '{}' 2> '{}' & echo $!",
+            "umask 077; for f in '{}' '{}'; do if [ -f \"$f\" ]; then if [ $(stat -f%z \"$f\") -gt 10485760 ]; then mv -f \"$f\" \"$f.old\"; chmod 600 \"$f.old\"; else chmod 600 \"$f\"; fi; fi; done; '{}' -f '{}' -d '{}' > '{}' 2> '{}' & echo $!",
+            log_path.display(),
+            err_path.display(),
             bin.display(),
             conf_path.display(),
             self.runtime_dir.display(),
             log_path.display(),
             err_path.display()
         );
-        let escaped = shell_cmd
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
-        let apple_script = format!("do shell script \"{}\" with administrator privileges", escaped);
+        let escaped = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
+        let apple_script = format!(
+            "do shell script \"{}\" with administrator privileges",
+            escaped
+        );
 
         let out = Command::new("/usr/bin/osascript")
             .arg("-e")
@@ -197,11 +229,22 @@ impl MihomoManager {
             let _ = Command::new("/bin/kill").arg(pid.to_string()).output();
             *self.pid.lock().unwrap() = None;
             let err_tail = std::fs::read_to_string(&err_path).unwrap_or_default();
-            let err_suffix: String = err_tail.chars().rev().take(600).collect::<String>().chars().rev().collect();
+            let err_suffix: String = err_tail
+                .chars()
+                .rev()
+                .take(600)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
             return Err(format!(
                 "代理端口 {} 未能在 30 秒内就绪，mihomo 可能启动失败。错误日志末尾：{}",
                 self.port,
-                if err_suffix.trim().is_empty() { "空" } else { err_suffix.trim() }
+                if err_suffix.trim().is_empty() {
+                    "空"
+                } else {
+                    err_suffix.trim()
+                }
             ));
         }
         Ok(MihomoStatus {
@@ -214,7 +257,11 @@ impl MihomoManager {
 
     /// 热更新配置：写完整 YAML 到 mihomo.yaml，然后提权发送 SIGHUP 让 mihomo 重载。
     /// 不用 PATCH /configs——实测 mihomo 的 PATCH 对多条 PROCESS-PATH-REGEX 只保留第一条。
-    pub fn reload_rules(&self, cfg: &AppConfig, app_rules: &[(Vec<String>, String)]) -> Result<(), String> {
+    pub fn reload_rules(
+        &self,
+        cfg: &AppConfig,
+        app_rules: &[(Vec<String>, String)],
+    ) -> Result<(), String> {
         // 1. 写完整配置
         let conf = self.build_conf(cfg, &[], app_rules);
         self.write_conf(&conf)?;
@@ -234,7 +281,10 @@ impl MihomoManager {
         let pid = pid.to_string();
 
         // 3. 提权发送 SIGHUP 重载配置
-        let script = format!("do shell script \"/bin/kill -HUP {}\" with administrator privileges", pid);
+        let script = format!(
+            "do shell script \"/bin/kill -HUP {}\" with administrator privileges",
+            pid
+        );
         let out = Command::new("/usr/bin/osascript")
             .arg("-e")
             .arg(&script)
@@ -251,14 +301,23 @@ impl MihomoManager {
     ///   第1层 进程级（谁进隧道）：防卷优先——云服务器自身流量永远直连；
     ///   第2层 域名级（去了哪）：显式域名规则 → 国内域名/IP（GEOSITE,cn + GEOIP,CN）直连；
     ///   第3层 节点级（谁来送）：进程规则把该软件剩余流量交给指定节点，兜底直连。
-    pub fn build_rules_for(&self, cfg: &AppConfig, app_rules: &[(Vec<String>, String)]) -> Vec<String> {
+    pub fn build_rules_for(
+        &self,
+        cfg: &AppConfig,
+        app_rules: &[(Vec<String>, String)],
+    ) -> Vec<String> {
         self.build_rules(cfg, &[], app_rules)
     }
-    fn build_rules(&self, cfg: &AppConfig, rules: &[String], app_rules: &[(Vec<String>, String)]) -> Vec<String> {
+    fn build_rules(
+        &self,
+        cfg: &AppConfig,
+        rules: &[String],
+        app_rules: &[(Vec<String>, String)],
+    ) -> Vec<String> {
         let mut out = Vec::new();
 
         // ── 第 -1 层：两条「路」的死锁分流（IN-PORT 双保险）──
-        // 用户要求 mihomo 不自动判断国内外，而是智能体自己选「坐飞机(走代理) / 坐火车(直连)」。
+        // 用户要求 mihomo 不自动判断国内外，而是智能体自己选「节点代理(7893) / 本机直连(7892)」。
         // listeners 的 proxy 字段已能强制死锁；这里再加 IN-PORT 规则双保险，确保无论
         // mihomo 版本对 listeners.proxy 的语义如何，从 7893 进来的流量都无条件 PROXY、
         // 从 7892 进来的都无条件 DIRECT，优先级高于下面所有规则（含 GEOSITE,cn）。
@@ -321,7 +380,11 @@ impl MihomoManager {
         // ── 第3层：进程规则（软件默认去向）。隧道内该软件未被上面命中的流量按此转发 ──
         for (paths, target) in app_rules {
             for p in paths {
-                out.push(format!("PROCESS-PATH-REGEX,^{},{}", regex_escape_path(p), target));
+                out.push(format!(
+                    "PROCESS-PATH-REGEX,^{},{}",
+                    regex_escape_path(p),
+                    target
+                ));
             }
         }
 
@@ -365,7 +428,12 @@ impl MihomoManager {
             return;
         }
         // 内存 PID 优先；App 重启后 PID 丢失，退回按配置路径查找
-        let pid_opt = self.pid.lock().unwrap().take().or_else(|| self.find_running_pid());
+        let pid_opt = self
+            .pid
+            .lock()
+            .unwrap()
+            .take()
+            .or_else(|| self.find_running_pid());
         eprintln!("[mihomo] stop(): 目标 PID = {pid_opt:?}");
         if let Some(pid) = pid_opt {
             let _ = Command::new("/bin/kill").arg(pid.to_string()).output();
@@ -439,9 +507,15 @@ impl MihomoManager {
     /// 注意：必须等 API_PORT 而非混合端口 self.port——ctl("start") 返回后，
     /// 混合端口可能先于控制 API 开放；若只等 self.port 就判定就绪，
     /// 紧接着的 proxy_api 调用会连不上 19091 而失败。
+    /// connect 必须带超时：无超时的 connect 在异常网络栈下可能长时间阻塞。
     pub fn wait_api(&self) -> bool {
         for _ in 0..150 {
-            if std::net::TcpStream::connect(("127.0.0.1", API_PORT)).is_ok() {
+            if std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], API_PORT)),
+                std::time::Duration::from_millis(500),
+            )
+            .is_ok()
+            {
                 return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -517,7 +591,12 @@ impl MihomoManager {
         Ok(())
     }
 
-    fn build_conf(&self, cfg: &AppConfig, rules: &[String], app_rules: &[(Vec<String>, String)]) -> String {
+    fn build_conf(
+        &self,
+        cfg: &AppConfig,
+        rules: &[String],
+        app_rules: &[(Vec<String>, String)],
+    ) -> String {
         let mut out = String::new();
         out.push_str(&format!("mixed-port: {}\n", self.port));
         out.push_str("mode: rule\n");
@@ -531,12 +610,18 @@ impl MihomoManager {
         out.push_str("tun:\n  enable: true\n  stack: system\n  auto-route: false\n  strict-route: true\n  auto-detect-interface: true\n  dns-hijack:\n    - any:53\n");
         // ── 两条物理上分开的「路」，决策权在智能体，不在 mihomo ──
         // 用户明确要求：不要 mihomo 自动判断国内外分流，而是给智能体两条明确的路，
-        // 智能体当场看清路况后自己拍板——坐飞机（走代理）还是坐火车（直连），
+        // 智能体当场实测后自己拍板——节点代理还是本机直连，
         // 然后把请求直接送进对应的口，进去后不再被二次判断。
         //   proxy-only  → PROXY_PORT (7893)：无条件 PROXY，连国内域名也强制走节点。
         //   direct-only → DIRECT_PORT (7892)：无条件 DIRECT，绝不碰节点。
+        // 安全红线：listeners 必须逐条显式 listen: 127.0.0.1。
+        //   - allow-lan: false 只管 mixed-port 等传统端口，管不到 listeners；
+        //   - listeners 不写 listen 时默认绑 0.0.0.0（2026-09-23 实测：无 listen 字段
+        //     时 nstat 显示 *.7892/*.7893 对所有网卡开放，同版本 bind-address 字段被
+        //     忽略仍通配，只有 listen 能真正钉回 127.0.0.1）。
+        //   否则局域网任意主机可匿名白嫖本机节点出口（7893）/直连转发（7892）。
         out.push_str(&format!(
-            "listeners:\n  - name: proxy-only\n    type: mixed\n    port: {}\n    proxy: PROXY\n  - name: direct-only\n    type: mixed\n    port: {}\n    proxy: DIRECT\n",
+            "listeners:\n  - name: proxy-only\n    type: mixed\n    port: {}\n    listen: 127.0.0.1\n    proxy: PROXY\n  - name: direct-only\n    type: mixed\n    port: {}\n    listen: 127.0.0.1\n    proxy: DIRECT\n",
             PROXY_PORT, DIRECT_PORT
         ));
         out.push_str("log-level: info\n");
@@ -570,7 +655,8 @@ impl MihomoManager {
             if !node.public_key.is_empty() {
                 out.push_str(&format!(
                     "    reality-opts:\n      public-key: \"{}\"\n      short-id: \"{}\"\n",
-                    yaml_quote(&node.public_key), yaml_quote(&node.short_id)
+                    yaml_quote(&node.public_key),
+                    yaml_quote(&node.short_id)
                 ));
             }
         }
@@ -591,7 +677,8 @@ impl MihomoManager {
             let gname = sanitize_node_name(&node.name);
             out.push_str(&format!(
                 "  - name: \"NODE-{}\"\n    type: select\n    proxies:\n      - \"{}\"\n",
-                yaml_quote(&gname), yaml_quote(&node.name)
+                yaml_quote(&gname),
+                yaml_quote(&node.name)
             ));
         }
 
@@ -664,7 +751,6 @@ fn regex_escape_path(s: &str) -> String {
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,13 +787,28 @@ mod tests {
             nodes: vec![node],
             selected_node: Some("test-node".to_string()),
             domain_rules: vec![
-                crate::config::DomainRule { domain: "github.com".into(), target: "proxy".into(), reason: String::new() },
-                crate::config::DomainRule { domain: "bilibili.com".into(), target: "direct".into(), reason: String::new() },
-                crate::config::DomainRule { domain: "openai.com".into(), target: "test-node".into(), reason: String::new() },
+                crate::config::DomainRule {
+                    domain: "github.com".into(),
+                    target: "proxy".into(),
+                    reason: String::new(),
+                },
+                crate::config::DomainRule {
+                    domain: "bilibili.com".into(),
+                    target: "direct".into(),
+                    reason: String::new(),
+                },
+                crate::config::DomainRule {
+                    domain: "openai.com".into(),
+                    target: "test-node".into(),
+                    reason: String::new(),
+                },
             ],
             ..Default::default()
         };
-        let app_rules = vec![(vec!["/Applications/Google Chrome.app".to_string()], "PROXY".to_string())];
+        let app_rules = vec![(
+            vec!["/Applications/Google Chrome.app".to_string()],
+            "PROXY".to_string(),
+        )];
         let rules = m.build_rules(&cfg, &[], &app_rules);
 
         let pos = |s: &str| rules.iter().position(|r| r.contains(s)).expect(s);
@@ -723,7 +824,9 @@ mod tests {
         assert!(pos("DOMAIN-SUFFIX,github.com,PROXY") < pos("GEOSITE,cn,DIRECT"));
         assert!(pos("DOMAIN-SUFFIX,bilibili.com,DIRECT") < pos("GEOSITE,cn,DIRECT"));
         // 节点名 target 映射为 NODE- 组
-        assert!(rules.iter().any(|r| r == "DOMAIN-SUFFIX,openai.com,NODE-test-node"));
+        assert!(rules
+            .iter()
+            .any(|r| r == "DOMAIN-SUFFIX,openai.com,NODE-test-node"));
         // 国内清单在进程规则之前
         assert!(pos("GEOSITE,cn,DIRECT") < pos("PROCESS-PATH-REGEX"));
         // 兜底
@@ -756,20 +859,34 @@ mod tests {
         };
         let conf = m.build_conf(&cfg, &[], &[]);
         // 出网接口必须被钉死（2026-09-03 修复：auto-detect 抓错接口致 DIRECT 超时）
-        assert!(conf.contains("interface-name: "), "必须钉死顶层 interface-name:\n{conf}");
+        assert!(
+            conf.contains("interface-name: "),
+            "必须钉死顶层 interface-name:\n{conf}"
+        );
         // PROXY 组必须是 fallback（自动故障转移），且不再有死代码 AUTO 组
         assert!(conf.contains("  - name: PROXY\n    type: fallback\n"));
         assert!(!conf.contains("url-test"));
-        // 「两条路」监听端口：坐飞机(7893)=无条件 PROXY，坐火车(7892)=无条件 DIRECT。
+        // 「两条路」监听端口：7893=无条件 PROXY，7892=无条件 DIRECT。
         // 用户明确要求 mihomo 不自动分流，决策权在智能体——这里必须死锁两个端口。
-        assert!(conf.contains(&format!("listeners:\n  - name: proxy-only\n    type: mixed\n    port: {}\n    proxy: PROXY\n", PROXY_PORT)));
-        assert!(conf.contains(&format!("  - name: direct-only\n    type: mixed\n    port: {}\n    proxy: DIRECT\n", DIRECT_PORT)));
+        // 安全红线（回归锁）：listeners 必须逐条显式 listen: 127.0.0.1，
+        // 不写则 mihomo 默认绑 0.0.0.0，局域网可匿名白嫖本机节点出口。
+        assert!(conf.contains(&format!(
+            "listeners:\n  - name: proxy-only\n    type: mixed\n    port: {}\n    listen: 127.0.0.1\n    proxy: PROXY\n",
+            PROXY_PORT
+        )));
+        assert!(conf.contains(&format!(
+            "  - name: direct-only\n    type: mixed\n    port: {}\n    listen: 127.0.0.1\n    proxy: DIRECT\n",
+            DIRECT_PORT
+        )));
         // IN-PORT 双保险：规则最前面必须有按端口死锁的两条，且优先级高于 GEOSITE,cn
         assert!(conf.contains(&format!("IN-PORT,{},PROXY", PROXY_PORT)));
         assert!(conf.contains(&format!("IN-PORT,{},DIRECT", DIRECT_PORT)));
         let ip_rule_idx = conf.find(&format!("IN-PORT,{},PROXY", PROXY_PORT)).unwrap();
         let geosite_idx = conf.find("GEOSITE,cn,DIRECT").unwrap();
-        assert!(ip_rule_idx < geosite_idx, "IN-PORT 双保险必须在 GEOSITE,cn 之前");
+        assert!(
+            ip_rule_idx < geosite_idx,
+            "IN-PORT 双保险必须在 GEOSITE,cn 之前"
+        );
         let tmp = std::env::temp_dir().join("magic-agent-test-conf.yaml");
         std::fs::write(&tmp, &conf).unwrap();
         let out = Command::new(m.bin_path())
@@ -820,8 +937,14 @@ mod tests {
         };
         let conf = m.build_conf(&cfg, &[], &[]);
         // 组名定义与规则引用必须一致，且都保留中文
-        assert!(conf.contains("name: \"NODE-示例节点\""), "组名应保留中文: \n{conf}");
-        assert!(conf.contains("DOMAIN-SUFFIX,openai.com,NODE-示例节点"), "规则应引用完整中文组名: \n{conf}");
+        assert!(
+            conf.contains("name: \"NODE-示例节点\""),
+            "组名应保留中文: \n{conf}"
+        );
+        assert!(
+            conf.contains("DOMAIN-SUFFIX,openai.com,NODE-示例节点"),
+            "规则应引用完整中文组名: \n{conf}"
+        );
         // 不能出现空引用 NODE-
         assert!(!conf.contains("NODE-\n"), "不得出现空节点组引用");
     }
@@ -858,8 +981,14 @@ mod tests {
         };
         let conf = m.build_conf(&cfg, &[], &[]);
         // 逗号被剔除：组名和规则引用都应是 NODE-nodea
-        assert!(conf.contains("name: \"NODE-nodea\""), "组名应剔除逗号: \n{conf}");
-        assert!(conf.contains("DOMAIN-SUFFIX,openai.com,NODE-nodea"), "规则应引用剔除逗号后的组名: \n{conf}");
+        assert!(
+            conf.contains("name: \"NODE-nodea\""),
+            "组名应剔除逗号: \n{conf}"
+        );
+        assert!(
+            conf.contains("DOMAIN-SUFFIX,openai.com,NODE-nodea"),
+            "规则应引用剔除逗号后的组名: \n{conf}"
+        );
     }
 
     #[test]
@@ -896,9 +1025,18 @@ mod tests {
         };
         let conf = m.build_conf(&cfg, &[], &[]);
         // 恶意注入的关键载荷不能以"裸配置行"形式出现在输出里
-        assert!(!conf.contains("\n    type: trojan\n"), "节点名注入了 trojan 配置");
-        assert!(!conf.contains("\n    allow-lan: true"), "server 注入了 allow-lan");
-        assert!(!conf.contains("\n    password: hacked"), "节点名注入了 password");
+        assert!(
+            !conf.contains("\n    type: trojan\n"),
+            "节点名注入了 trojan 配置"
+        );
+        assert!(
+            !conf.contains("\n    allow-lan: true"),
+            "server 注入了 allow-lan"
+        );
+        assert!(
+            !conf.contains("\n    password: hacked"),
+            "节点名注入了 password"
+        );
         // 转义后应包含转义序列，而不是原始换行 + 双引号
         assert!(conf.contains("\\\""), "双引号应被转义");
         assert!(conf.contains("\\n"), "换行应被转义");
@@ -906,7 +1044,11 @@ mod tests {
         let rules = m.build_rules(&cfg, &[], &[]);
         for r in &rules {
             assert!(!r.contains('\n'), "规则不得含换行: {:?}", r);
-            assert!(!r.contains("injected.com"), "域名规则注入了额外域名: {:?}", r);
+            assert!(
+                !r.contains("injected.com"),
+                "域名规则注入了额外域名: {:?}",
+                r
+            );
         }
     }
 }

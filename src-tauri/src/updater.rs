@@ -24,8 +24,6 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
 
-use crate::config::AppConfig;
-
 /// 本地开发测试通道：配套 `scripts/release.sh` 生成 feed +
 /// `python3 -m http.server 7878` 起服务，仅监听 127.0.0.1。
 pub const ENDPOINT_LOCAL: &str = "http://127.0.0.1:7878/latest.json";
@@ -87,11 +85,15 @@ impl UpdateChannelInfo {
     }
 }
 
-type ConfigState = Arc<Mutex<AppConfig>>;
+// 注意：这里必须用 crate::AppState（lib.rs 中 .manage(state) 注册的类型），
+// 而不是直接用 AppConfig。lib.rs 实际注册的是 Arc<Mutex<AppState>>，
+// 其中 AppState.config 才是 AppConfig。如果这里写 Arc<Mutex<AppConfig>>，
+// 调用 app.state::<ConfigState>() 会 panic：state() called before manage()。
+type ConfigState = Arc<Mutex<crate::AppState>>;
 
 fn read_channel(state: &ConfigState) -> String {
     let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-    normalize_channel(guard.update_channel.as_deref().unwrap_or(DEFAULT_CHANNEL))
+    normalize_channel(guard.config.update_channel.as_deref().unwrap_or(DEFAULT_CHANNEL))
 }
 
 /// 读取当前更新通道（不触网，纯读配置）。
@@ -110,8 +112,8 @@ pub fn set_update_channel(
     let normalized = normalize_channel(&channel);
     {
         let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-        guard.update_channel = Some(normalized.clone());
-        crate::config::save(&guard)?;
+        guard.config.update_channel = Some(normalized.clone());
+        crate::config::save(&guard.config)?;
     }
     Ok(UpdateChannelInfo::from_channel(&normalized))
 }
@@ -140,7 +142,6 @@ pub async fn check_channel_update(app: AppHandle) -> Result<UpdateCheckResult, S
     let state = app.state::<ConfigState>();
     let channel = read_channel(state.inner());
     let endpoint_str = endpoint_for(&channel);
-
     let url = tauri::Url::parse(endpoint_str).map_err(|e| format!("端点 URL 非法: {e}"))?;
 
     // 运行时覆盖端点，其余（pubkey、dangerous 开关、target）沿用编译期配置
@@ -201,11 +202,20 @@ pub async fn install_channel_update(app: AppHandle) -> Result<(), String> {
         .map_err(|e| format!("检查更新失败: {e}"))?
         .ok_or_else(|| "已是最新版本，无需安装".to_string())?;
 
+    // 让更新下载走魔法代理自己的 mihomo，不走系统直连国际出口。
+    // 否则几十兆 .app.tar.gz 直连 GitHub 慢得不可用——
+    // 一个代理软件自己更新还慢，不可接受。
+    //
+    // 做法：临时给本进程注入 HTTP(S)_PROXY 指向 mihomo mixed-port（127.0.0.1:port），
+    // 并加 NO_PROXY=127.0.0.1,localhost 防止 local 通道 feed 与 mihomo 控制请求被自己套住。
+    // reqwest 在同进程内会读 env，所以能生效。
+    let proxy_guard = scope_update_proxy_env(state.inner());
+
     let app_for_progress = app.clone();
     let app_for_finish = app.clone();
     let mut downloaded: usize = 0;
 
-    update
+    let result = update
         .download_and_install(
             move |chunk_length, content_length| {
                 downloaded += chunk_length;
@@ -222,12 +232,65 @@ pub async fn install_channel_update(app: AppHandle) -> Result<(), String> {
                 );
             },
             move || {
-                let _ = app_for_finish
-                    .emit("update-progress", serde_json::json!({ "event": "finished" }));
+                let _ = app_for_finish.emit(
+                    "update-progress",
+                    serde_json::json!({ "event": "finished" }),
+                );
             },
         )
-        .await
-        .map_err(|e| format!("下载/安装失败: {e}"))?;
+        .await;
 
+    // 不管成功失败都恢复 env，避免后续请求仍套代理
+    drop(proxy_guard);
+
+    result.map_err(|e| format!("下载/安装失败: {e}"))?;
     Ok(())
+}
+
+/// RAII 代理 env 守卫：构造时注入 HTTP_PROXY 等，析构时恢复原值。
+/// 仅在 mihomo 在跑时才注入，否则返回 None（让请求走默认路径）。
+struct ProxyEnvGuard {
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+impl Drop for ProxyEnvGuard {
+    fn drop(&mut self) {
+        for (k, v) in &self.saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
+/// 读取并设置更新下载用代理 env，返回 guard 用于结束时恢复。
+/// mihomo 未在跑时返回 None，让更新走默认路径（避免指向不通的端口导致下载失败）。
+fn scope_update_proxy_env(state: &ConfigState) -> Option<ProxyEnvGuard> {
+    let (port, running) = {
+        let g = state.lock().unwrap_or_else(|e| e.into_inner());
+        let m = g.mihomo.status();
+        (m.port, m.running)
+    };
+    if !running {
+        return None;
+    }
+    let proxy_url = format!("http://127.0.0.1:{port}");
+    let keys = [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ];
+    let mut saved = Vec::with_capacity(keys.len() + 2);
+    for k in keys {
+        saved.push((k, std::env::var(k).ok()));
+        std::env::set_var(k, &proxy_url);
+    }
+    // local 通道 feed 与 mihomo 控制接口都在 loopback，绝不能走代理
+    saved.push(("NO_PROXY", std::env::var("NO_PROXY").ok()));
+    std::env::set_var("NO_PROXY", "127.0.0.1,localhost,::1");
+    Some(ProxyEnvGuard { saved })
 }

@@ -39,9 +39,13 @@ case "$1" in
     fi
     ensure_bin
     [ -f "$BIN" ] || { echo "kernel-not-found"; exit 1; }
-    # 日志轮转（超 10MB 归档 .old）
+    # 日志权限：root umask 020 会把日志落成 0644，同机任何账号都能读用户全量连接记录。
+    # umask 077 管新建，chmod 600 管已存在的旧文件与轮转出的 .old。
+    umask 077
     for f in "$LOG" "$ERR"; do
-      [ -f "$f" ] && [ "$(stat -f %z "$f")" -gt 10485760 ] && mv -f "$f" "$f.old"
+      if [ -f "$f" ]; then
+        if [ "$(stat -f %z "$f")" -gt 10485760 ]; then mv -f "$f" "$f.old"; chmod 600 "$f.old"; else chmod 600 "$f"; fi
+      fi
     done
     "$BIN" -f "$CONF" -d "$RUNTIME" >> "$LOG" 2>> "$ERR" &
     echo $!

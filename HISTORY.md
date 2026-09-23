@@ -22,6 +22,8 @@
 | v0.2.2 | 2026-09-19 | `v0.2.2` | `45ac703` | 启动即清理第三方代理 + 卡顿修复 + 规范发版流程 |
 | v0.2.3 | 2026-09-19 | `v0.2.3` | `f9a0a50` | 全部慢命令 async 化，根治点仪表盘彩色转圈 |
 | v0.2.4 | 2026-09-19 | `v0.2.4` | `56e02ee` | get_status 也 async 化，根治 5 秒轮询卡顿 |
+| v0.2.5~0.2.10 | 2026-09-20~22 | — | 多提交 | 开源合规（MIT+第三方许可随包）、图标更新、双通道更新器、MCP 参数健壮化 |
+| v0.2.11 | 2026-09-23 | —（未打 tag） | 工作区 | **信任版（P0）**：P0-1 系统代理逐服务对账（消灭 any_success 假账 + parse_port 潜伏 bug）、P0-4 崩溃自愈（启动自检死端口残留自动恢复直连 + UI 提示）；前序工作区含 listener 钉回环、root 日志收权、文档全面重写（见下） |
 
 > 版本号以 `tauri.conf.json` 为准。v0.2.1 只改过内部版本号、未单独发版。
 
@@ -217,6 +219,54 @@
 
 ---
 
+### 2026-09-23 · 安全修复 + P0 信任版 + 定位改版「网络管理」（v0.2.11 已构建）
+
+| 类型 | 做了什么 |
+|------|----------|
+| fix(安全) | **listeners 对局域网裸奔**：mihomo `listeners` 段不受 `allow-lan:false` 约束、`bind-address` 字段实测无效，7892/7893 一直绑 0.0.0.0 → 同网段可匿名白嫖节点出口。双引擎（Rust build_conf + MCP generate_config）每条 listener 显式加 `listen: 127.0.0.1`，Rust 单测断言锁死，check_parity 验证一致。 |
+| fix(隐私) | **root 日志世界可读**：提权启动 umask 020 使 mihomo.log 落成 0644（全机连接记录含进程名→域名），osascript 路径与 mihomo-ctl.sh 均改 `umask 077` + 存量日志/轮转 .old `chmod 600`。 |
+| fix(对账) | **P0-1 系统代理逐服务对账**：`set_system_proxy` 的 `any_success`（任一服务成功即整体成功）替换为逐服务 `-get*state` 读回，返回 `{enabled, services[], allOk, mismatched[]}`；Rust 13 个调用点全部接入 `log_proxy_set_result` 日志，UI 部分失败黄色点名，MCP 同契约（`set_system_proxy` 返回对账、`status` 加 `verify` 可选参数）。附带揪出 `parse_port` 潜伏 bug：scutil 的 `HTTPPort : 7891` 带前导空格，旧解析恒失败、端口字段永远为 0。测试：Rust 4 项 + Python mock 4 项。 |
+| fix(自愈) | **P0-4 崩溃自愈**：App 被强杀/断电后"系统代理指向本程序死端口（7891/7892/7893）"会在下次启动被 `startup_self_check` 检测→自动关闭恢复直连→toast 一次性告知（AppStatus.selfHealNotice 读取即清空）；指向第三方端口的系统代理绝不误关。 |
+| docs | **全面重写**：定位从"魔法代理客户端"升级为"网络管理员·一键归序"；设计文档新增废弃旧思想对照表与验收实验章节；新增 `docs/重构计划.md`（P0 修信任 / P1 归序 MVP / P2 收敛更名）。 |
+| 更正 | ① "SSH 隧道/端口转发"系 2026-09-23 排查过程中子代理误报——经 git 全量核实，历史文档从无此声称，本项目也从未实现过该功能（全源码无 `-L`/tunnel），现于各文档明示 SSH 能力边界；② MCP 工具数 README 长期写 23，实际 TOOLS 数组为 **27**（code-wiki/04 早已指出，本次统一修正所有引用处）；③ "启动清理第三方 = 接管秩序"的旧立场废弃，接管必须配审计+账本+回滚。 |
+| 根因认知 | "问题是不是因为 mihomo 用的别人的"——**不是**。内核行为完全符合其文档；缺陷全部出在我们对配置语义的理解（缺 listen 字段）与工程习惯（any_success 报假账、umask 想当然）。用成熟内核恰恰是正确决策，需要的是把它的配置契约当回事。 |
+| 构建 | **v0.2.11 已发版**（`release.sh 0.2.11`，未 --publish）：产物 `尊者魔法代理.app`/`.dmg`/`.app.tar.gz` + Ed25519 签名 + 双通道 feed（本地 7878 已更新、GitHub 通道待 `--publish`）。发版中揪出 release 链断裂：tauri-cli 2.11.4 起 beforeBuildCommand 工作目录改为项目根，旧配置 `cd .. && pnpm --dir ui build` 会跑到磁盘根导致构建失败，已改为目录探测兼容写法。|
+
+**下一步**：安装 v0.2.11 走验收场景 D 人工回归（kill -9 自愈）→ P1-1 审计引擎（auditor.rs）。
+
+### 2026-09-23（同日续）· MCP 27 工具全量实机测试 + v0.2.11 热修复（工作区）
+
+| 类型 | 做了什么 |
+|------|----------|
+| 测试 | 以真实 MCP 客户端身份（stdio JSON-RPC）**跑完全部 27 个工具**：15 只读全过；写操作（规则/应用模式/节点切换/系统代理/启停/SSH 只读命令）逐项验证副作用真实发生；负例（SSRF×3、未知服务器、脏参数）行为符合预期；测试全程留基线快照，结束后 diff 确认配置零差异、现场完全恢复。 |
+| fix(热修) | **揪出 v0.2.11 自埋的雷**：`-getwebproxystate` 等读命令真机【不存在】（rc=5，读写命令集不对称），上一轮对账的读回恒失败、恒误报 mismatched；纯 mock 测试全绿但真实链路全错。修复：两侧改用真机实测的 `-getwebproxy` 三件套（`Enabled: Yes/Server/Port` 行式），达标口径升级为"开关 + 端口精确匹配"（"开着指向 7890"这类残留同样点名）；Python 测试 fixture 全部换成真机输出，并加源码回归锁（verify 函数体出现 `-get*state` 即失败）。验证：真机 `status{verify:true}` 从误报 allOk:false 修正为如实 allOk:true。Rust 48 测试 + Python 14 测试全绿。**此修复未入 v0.2.11 包，发版前需 rebuild 覆盖。** |
+| 登记 | CONTRACT 新增 5 条实测缺陷（Enabled 字段语义不可靠 / MCP stop 被看门狗复活 / 域名无校验 / probe_route 无参数校验 / SSH 缺凭钥慢超时），修法均已写明。 |
+
+**教训固化**：mock 测试只能证明"代码按我以为的格式解析"，证明不了"我以为的格式是真的"。凡对接系统命令的解析，fixture 必须先取自真机输出。
+
+---
+
+### 2026-09-23（换账号后新会话接手）· 进度核查交接记录
+
+> 新会话无上一轮对话记忆，依用户"开工前先核查、收工后必落账"的要求，本节记录本会话对现场的一次性核实结论，作为下个会话的交接基线。
+
+**核实手段**：`git status` / `git log` / 文件 mtime / 已装 App 二进制字符串取证 / `cargo test` / `pytest` / `check_parity.py`。
+
+**结论（已验证）**：
+- **代码基线全绿**：Rust `cargo test` 48 项全过；`tests/test_regressions.py` 14 项全过；`check_parity.py` 退出码 0（双引擎一致）。
+- **v0.2.11 热修复已入已装包**：`/Applications/尊者魔法代理.app`（14:14 安装）二进制取证 `getwebproxy`/`getsecurewebproxy` 各命中、`getwebproxystate`/`getsecurewebproxystate`/`getsocksfirewallproxystate` 全 0，且 `mismatched`/`allOk` 命中——即已装包用的是热修后的 `-get*proxy` 三件套读法，非旧的 `-get*state`。上一节"此修复未入 v0.2.11 包，发版前需 rebuild 覆盖"的告警，经时间线核对（源文件 mtime 13:47/13:50 均早于 14:14 安装、且无源文件晚于该安装）**已解除**：14:14 的安装发生在热修之后，包是新的。bundle 目录 14:19 另有一次构建产物。
+- **唯一明确缺口 = 未提交**：工作区 `git status` 有 **82 个已改文件 + 多份新增未跟踪文件**（`docs/code-wiki/`、`docs/重构计划.md`、`docs/免费模型清单.md`、`tests/`、`ui/src/updater.js`、图标母版等），覆盖 v0.2.11 信任版 + MCP 27 工具实机测试 + 热修复 + 文档重写全部成果，**尚未 `git commit`**。按 `CONTRACT.md` 发版铁律，闭环最后一步"git commit"未做，即 HISTORY 自己点过的老毛病"改完不提交 = 源码与 App 脱节"。
+- **已安装版本 = 0.2.11**，与 `tauri.conf.json` 一致；App 当前未运行（`pgrep` 无进程）。
+
+**下一步候选（待用户定向，未擅自开工）**：
+1. 把工作区 backlog 落一次 `git commit`（补齐发版闭环的最后一步）。
+2. 开 P1-1 审计引擎 `auditor.rs`（`docs/重构计划.md` 明列的"下一步"，P1 MVP 首个新模块）。
+3. 修 `CONTRACT.md`「已知待修缺陷」里登记的 5 项（Enabled 语义 / MCP stop 被看门狗复活 / add_domain_rule 无校验 / probe_route 无校验 / SSH 缺凭据慢超时）。
+
+**本会话未改动任何代码/配置，仅新增本节交接记录。**
+
+---
+
 ## 各版本「增 / 删」总表
 
 | 版本 | 新增 | 删除 |
@@ -233,6 +283,7 @@
 | v0.2.3 | 13 个慢命令 async 化、SshManager 可 Clone、apps_cache 复用 | 同步命令阻塞主线程的写法 |
 | v0.2.4 | get_status async 化、MihomoManager 可 Clone | 5 秒轮询里残留的同步阻塞 |
 | 文档整理 | docs/设计.md、docs/免费模型.md | 3 份旧产品文档、2 份旧模型文档、过期计划 |
+| 2026-09-23 改版 | listener 回环钉死、日志 0600、重构计划.md、定位「网络管理」 | "allow-lan 管得住 listeners"错觉、"SSH 隧道"排查误报（已澄清，项目从无此功能）、"清理=接管"旧立场、README"23 工具"错数 |
 
 ---
 

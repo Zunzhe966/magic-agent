@@ -1,11 +1,14 @@
-# CONTRACT.md — 魔法代理（尊者魔法代理）项目宪法
+# CONTRACT.md — 网络管理（现名：尊者魔法代理）项目宪法
 
 > 代码合并顺序：改代码 → 更新本文件。本文件与其他文档冲突时，本文件优先。
+> 产品定位与重构路线：`docs/设计.md`（一键归序五步闭环）、`docs/重构计划.md`（P0/P1/P2）。
 
-## 冻结的正确状态（2026-09-03 起）
+## 冻结的正确状态（2026-09-03 起；2026-09-23 增补安全红线）
 
 - 架构：Tauri 2 + mihomo 内核。组合根 = `src-tauri/src/lib.rs::run()`；内核管理 = `mihomo.rs::MihomoManager`（深模块，接口只增不删）。
-- 分流设计（README 钉死）：系统代理 + 进程级分流；TUN 仅按规则拉「该走代理」的流量（auto-route: false, strict-route: true）；两条死锁端口 7893(无条件 PROXY)/7892(无条件 DIRECT)。
+- 分流设计：系统代理 + 进程级分流；TUN 仅按规则拉「该走代理」的流量（auto-route: false, strict-route: true）；两条死锁端口 7893(无条件 PROXY)/7892(无条件 DIRECT)。
+- **监听红线（2026-09-23）**：所有 `listeners` 条目必须显式 `listen: 127.0.0.1`。实测证伪两个旧假设：①`allow-lan: false` 管不到 listeners 段；②`bind-address` 字段对 listener 无效——缺 `listen:` 时内核绑 0.0.0.0，局域网可匿名白嫖节点出口。Rust 单测已锁死断言，升级 mihomo 版本后须重跑 docs/设计.md §七 验收实验。
+- **日志权限红线（2026-09-23）**：root 启动路径（osascript shell_cmd 与 mihomo-ctl.sh start）必须 `umask 077` 并对存量日志/轮转 .old `chmod 600`。日志含全机连接记录，世界可读 = 同机隐私泄露。
 - 回归基线：`cd src-tauri && cargo test` 全绿（含 `generated_conf_is_valid_mihomo_yaml` 用 `mihomo -t` 真校验配置）。
 
 ## 发版流程铁律（2026-09-19 起，**这是唯一正确的发布方式**）
@@ -75,6 +78,42 @@ App 已内置 updater（`tauri.conf.json` → `plugins.updater.active=true`，en
 - 不得删除 `RunEvent::Exit` 收尾钩子。
 - mihomo 以 root 运行是 TUN 的硬约束；一切「App 退出后仍需内核活着」的需求必须走显式的后台服务（launchd），不许靠孤儿进程。
 - 组名/规则引用必须同源 `sanitize_node_name`（有回归测试钉死）。
+- 图标唯一母版必须是 `src-tauri/icons/source-icon.png`，全部尺寸只能通过 `scripts/make-icons.sh` 生成；禁止手工替换单个尺寸后直接发版。
+- **不得给 listeners 缺省 `listen:` 字段或用 `bind-address` 替代**（见上方监听红线；违反 = 局域网裸奔）。
+- **文档不得声称本项目有 SSH 端口转发/隧道功能**（全源码无 `-L`/tunnel；2026-09-23 曾出现排查误报，已澄清并作为能力边界明示，防止未来误加此表述）。
+- **归序功能（P1）落地前，UI/文档不得宣称"一键还原/可回滚"**——清理第三方 ≠ 接管，报状态要如实。
+
+## 已知待修缺陷（修复后移入 HISTORY）
+
+- **`-getwebproxy` 的 `Enabled:` 字段语义在真机不可靠**（2026-09-23 MCP 实机实测）：
+  `-set*state off` 后立刻读回显示 `Enabled: No`，但同一台机器另一时点出现
+  scutil 全局 `HTTPEnable: 0` 而服务级仍回 `Enabled: Yes` 的矛盾态；
+  `-get*state` 系列读命令真机又不存在（读写命令集不对称）。
+  后果：`set_system_proxy(false)` 的对账可能虚报未达标（漏报方向安全但违反
+  "状态如实"红线）。修法：**达标口径改为"scutil 全局视图为准 + 服务级仅核对
+  Server/Port 精确匹配"**，不再从服务级 Enabled 字段推断开关态；需真机多状态
+  取证（开/关/半关）后再定判定表。
+- **MCP stop_proxy 会被 App 看门狗 30 秒内复活**（同轮实测）：App 在跑且
+  should_run=true 时，MCP `stop_proxy` 杀掉内核后，App 看门狗按设计自动拉起
+  （PID 变化 34747→40591 证实）。单看是"预期行为"，但从 AI 入口视角
+  "我停了它又活了"= 失控。这是双引擎共享状态缺仲裁的实例，P2-1 收敛时一并解决；
+  过渡修法：MCP stop 同时把 should_run 落盘（config 增 userStopped 标记），App 看门狗读取。
+- **MCP add_domain_rule 域名入参无校验**（同轮实测）：`localhost` 与含换行的
+  `evil.com\nallow-lan: true` 都返回"已保存"原样入库。配置生成器两侧都会把
+  非法域名静默丢弃（dump_conf/generate_config 双验证未发生注入），但"保存成功
+  却永不生效"就是静默失效。修法：add 时即校验拒绝、明确报错。
+- **MCP probe_route 无参数校验**（同轮实测）：url=`file:///etc/passwd` 被拼成
+  `https://file:///etc/passwd` 照常发起探测；url 传数字 12345 被拼成
+  `https://12345`。无注入风险但结果全是误导。修法：scheme 白名单 + 类型校验。
+- **SSH auth:key 缺私钥时退化为 10 秒 TCP 超时**（同轮实测）：Keychain 无对应
+  私钥时未快速失败提示"缺凭据"，而是等 connect 超时报网络错误，误导排查方向。
+
+## 状态如实红线（P0-1 修复后新增）
+
+- 系统代理设置必须走逐服务读回对账（`verify_system_proxy`），返回值如实携带
+  `allOk/services/mismatched`；**禁止重新引入 any_success 类"任一成功即整体成功"逻辑**。
+- `set_system_proxy` 返回值里 `enabled` 字段在写后路径取期望值（权威是 services），
+  轮询路径（`status()`）取 scutil 全局视图——两者语义已在函数 doc 注释钉死，不得混用。
 
 ## 回滚
 

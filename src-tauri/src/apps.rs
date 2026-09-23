@@ -25,29 +25,13 @@ pub struct AppEntry {
     pub remote_ips: Vec<String>,
 }
 
-
 pub fn scan_macos_apps() -> Vec<AppEntry> {
     let installed = scan_installed_apps();
     let running = scan_running_processes();
     // 一次性拿到全机网络连接：进程名/PID -> 远端 IP 集合
     let net = scan_network_connections();
-    let mut by_path: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for (i, app) in installed.iter().enumerate() {
-        if let Some(path) = &app.path {
-            by_path.insert(path.clone(), i);
-        }
-        if let Some(b) = &app.bundle_id {
-            by_path.insert(b.clone(), i);
-        }
-    }
     let mut list = installed;
-    for proc in running {
-        if let Some(&i) = by_path.get(&proc.app_path) {
-            list[i].running = true;
-        } else if let Some(&i) = by_path.get(&proc.bundle_id) {
-            list[i].running = true;
-        }
-    }
+    mark_running_apps(&mut list, &running);
     // 追加：命令行/脚本类进程（Python/Node/ffmpeg 等），它们不是 .app，但也要能分流
     list.extend(scan_script_processes());
 
@@ -91,6 +75,37 @@ pub fn scan_macos_apps() -> Vec<AppEntry> {
 
     list.sort_by(|a, b| a.name.cmp(&b.name));
     list
+}
+
+/// 把运行中的进程归属到安装列表。先按可执行文件路径，再按 bundle id；
+/// bundle id 为空时不能误按空字符串去重，否则所有无 plist 的进程会被合成一个。
+fn mark_running_apps(list: &mut [AppEntry], running: &[RunningProcess]) {
+    use std::collections::HashMap;
+
+    let mut by_path: HashMap<String, usize> = HashMap::new();
+    let mut by_bundle: HashMap<String, usize> = HashMap::new();
+    for (i, app) in list.iter().enumerate() {
+        if let Some(path) = &app.path {
+            by_path.insert(path.clone(), i);
+            if let Some((dir, _)) = path.split_once("/Contents/") {
+                by_path.insert(dir.to_string(), i);
+            }
+        }
+        if let Some(b) = app.bundle_id.as_deref().filter(|b| !b.is_empty()) {
+            by_bundle.insert(b.to_string(), i);
+        }
+    }
+    for proc in running {
+        if let Some(&i) = by_path.get(&proc.app_dir) {
+            list[i].running = true;
+        } else if let Some(&i) = by_path.get(&proc.app_path) {
+            list[i].running = true;
+        } else if !proc.bundle_id.is_empty() {
+            if let Some(&i) = by_bundle.get(&proc.bundle_id) {
+                list[i].running = true;
+            }
+        }
+    }
 }
 
 /// 进程名匹配：判断 lsof 的进程名 p 是否属于候选名 c 所代表的软件。
@@ -174,7 +189,9 @@ fn scan_network_connections() -> std::collections::HashMap<String, Vec<String>> 
         }
         let proc_name = cols[0].to_string();
         // 找 "->" 后面的远端地址
-        let Some(arrow) = line.find("->") else { continue };
+        let Some(arrow) = line.find("->") else {
+            continue;
+        };
         let remote = line[arrow + 2..].trim();
         // 提取远端 IP：
         //   - IPv4/IPv6 带方括号：[2408:8207::1]:443  -> 取方括号内
@@ -182,11 +199,7 @@ fn scan_network_connections() -> std::collections::HashMap<String, Vec<String>> 
         //   - IPv6 明文（无方括号）：2408:8207::1:443 -> 最后一个冒号是端口分隔，
         //     需保留完整 IPv6（不能像旧实现那样 split(':') 取首个，会截成 2408）
         let ip = if remote.starts_with('[') {
-            remote[1..]
-                .split(']')
-                .next()
-                .unwrap_or("")
-                .to_string()
+            remote[1..].split(']').next().unwrap_or("").to_string()
         } else {
             // 无方括号：若冒号数量 > 1 判定为 IPv6，去掉末尾 :port
             let colon_count = remote.matches(':').count();
@@ -197,18 +210,20 @@ fn scan_network_connections() -> std::collections::HashMap<String, Vec<String>> 
                     .unwrap_or_else(|| remote.to_string())
             } else {
                 // IPv4:port 或裸 IPv4
-                remote
-                    .split([':', ' '])
-                    .next()
-                    .unwrap_or("")
-                    .to_string()
+                remote.split([':', ' ']).next().unwrap_or("").to_string()
             }
         };
         if ip.is_empty() {
             continue;
         }
         // 排除回环
-        if ip == "127.0.0.1" || ip == "::1" || ip == "localhost" || ip == "*" || ip == "0.0.0.0" || ip == "::" {
+        if ip == "127.0.0.1"
+            || ip == "::1"
+            || ip == "localhost"
+            || ip == "*"
+            || ip == "0.0.0.0"
+            || ip == "::"
+        {
             continue;
         }
         let entry = map.entry(proc_name).or_insert_with(Vec::new);
@@ -242,8 +257,7 @@ fn scan_script_processes() -> Vec<AppEntry> {
 
     // 需要识别为"脚本进程"的解释器/命令
     let interpreters = [
-        "python", "python3", "node", "ffmpeg", "java", "ruby", "perl", "go",
-        "deno", "bun", "php",
+        "python", "python3", "node", "ffmpeg", "java", "ruby", "perl", "go", "deno", "bun", "php",
     ];
 
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -259,9 +273,9 @@ fn scan_script_processes() -> Vec<AppEntry> {
         }
         let exe_name = exe_path.rsplit('/').next().unwrap_or(exe_path);
         // 是否属于脚本解释器进程
-        let is_interp = interpreters.iter().any(|i| {
-            exe_name == *i || exe_name.starts_with(&format!("{}.", i))
-        });
+        let is_interp = interpreters
+            .iter()
+            .any(|i| exe_name == *i || exe_name.starts_with(&format!("{}.", i)));
         if !is_interp {
             continue;
         }
@@ -309,7 +323,9 @@ fn scan_script_processes() -> Vec<AppEntry> {
 /// （如 /Users/x/example monitor/main.py）不会被空格拆散导致识别失败。
 fn infer_script_project_dir(line: &str) -> Option<String> {
     let tokens = shell_split_argv(line);
-    let script_exts = [".py", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".php", ".go"];
+    let script_exts = [
+        ".py", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".php", ".go",
+    ];
     // 1) 找脚本文件参数
     for t in &tokens {
         if t.starts_with('-') {
@@ -410,7 +426,7 @@ fn shell_split_argv(line: &str) -> Vec<String> {
 }
 
 fn scan_installed_apps() -> Vec<AppEntry> {
-    let mut apps = Vec::new();
+    let mut candidates = Vec::new();
     let mut roots = vec![
         PathBuf::from("/Applications"),
         PathBuf::from("/System/Applications"),
@@ -421,38 +437,88 @@ fn scan_installed_apps() -> Vec<AppEntry> {
     }
     let mut seen = std::collections::HashSet::new();
     for root in roots {
-        let Ok(rd) = std::fs::read_dir(&root) else { continue };
+        let Ok(rd) = std::fs::read_dir(&root) else {
+            continue;
+        };
         for e in rd.flatten() {
             let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("app") { continue; }
-            let name = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
-            if !seen.insert(name.clone()) { continue; }
+            if p.extension().and_then(|s| s.to_str()) != Some("app") {
+                continue;
+            }
+            let name = p
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let canonical_path = p.canonicalize().unwrap_or_else(|_| p.clone());
+            if !seen.insert(canonical_path.clone()) {
+                continue;
+            }
             // 可执行文件通常是 Contents/MacOS/<AppName>，也可能是 Info.plist 里的 CFBundleExecutable
             let exe = p.join("Contents/MacOS").join(&name);
-            let path = if exe.exists() { exe.to_string_lossy().to_string() } else { p.to_string_lossy().to_string() };
+            let path = if exe.exists() {
+                exe.to_string_lossy().to_string()
+            } else {
+                p.to_string_lossy().to_string()
+            };
             let bundle_id = read_bundle_id(&p);
-            let id = format!("app-{}", name);
-            apps.push(AppEntry {
-                id,
-                name: name.clone(),
-                bundle_id: bundle_id.clone(),
-                // path 指向主可执行文件（展示用）；rule_paths 是规则前缀（匹配整组进程用）
-                path: Some(path),
-                running: false,
-                mode: "direct".to_string(),
-                category: classify(&name),
-                confirmed: false,
-                node: None,
-                rule_paths: rule_paths_for(&p, bundle_id.as_deref()),
-                online: false,
-                remote_ips: Vec::new(),
-            });
+            candidates.push((canonical_path, name, path, bundle_id));
         }
+    }
+
+    let ids = app_ids(&candidates);
+    let mut apps = Vec::with_capacity(candidates.len());
+    for ((canonical_path, name, path, bundle_id), id) in candidates.into_iter().zip(ids) {
+        apps.push(AppEntry {
+            id,
+            name: name.clone(),
+            bundle_id: bundle_id.clone(),
+            // path 指向主可执行文件（展示用）；rule_paths 是规则前缀（匹配整组进程用）
+            path: Some(path),
+            running: false,
+            mode: "direct".to_string(),
+            category: classify(&name),
+            confirmed: false,
+            node: None,
+            rule_paths: rule_paths_for(&canonical_path, bundle_id.as_deref()),
+            online: false,
+            remote_ips: Vec::new(),
+        });
     }
     apps
 }
 
+/// App id 必须唯一，同时不能让已有配置全部失效。
+/// 无重名时沿用历史 `app-<显示名>`；只有真正重名时，冲突项才追加稳定后缀。
+fn app_ids(candidates: &[(PathBuf, String, String, Option<String>)]) -> Vec<String> {
+    use std::collections::HashMap;
+
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for (_, name, _, _) in candidates {
+        *counts.entry(name.as_str()).or_default() += 1;
+    }
+    candidates
+        .iter()
+        .map(|(path, name, _, bundle)| {
+            let base = format!("app-{name}");
+            if counts.get(name.as_str()).copied().unwrap_or(0) <= 1 {
+                return base;
+            }
+            if let Some(b) = bundle.as_deref().filter(|b| !b.is_empty()) {
+                return format!("{base}--{b}");
+            }
+            let normalized = path
+                .to_string_lossy()
+                .trim_end_matches('/')
+                .trim_start_matches('/')
+                .replace('/', ":");
+            format!("{base}--{normalized}")
+        })
+        .collect()
+}
+
 struct RunningProcess {
+    app_dir: String,
     app_path: String,
     bundle_id: String,
 }
@@ -462,51 +528,92 @@ fn scan_running_processes() -> Vec<RunningProcess> {
     // 用 args= 而非 comm=：comm 是进程名（不含路径、截断），永远匹配不到 .app/ 路径，
     // 导致"运行中"状态检测失效。args 含完整可执行文件路径。
     let ps = std::process::Command::new("/bin/ps")
-        .args(["-axo", "pid=,args="])
+        .args(["-axo", "pid=,comm=,args="])
         .output()
         .ok();
     let Some(ps) = ps else { return out };
-    if !ps.status.success() { return out; }
+    if !ps.status.success() {
+        return out;
+    }
     let text = String::from_utf8_lossy(&ps.stdout);
     let mut seen = std::collections::HashSet::new();
     for line in text.lines() {
         let line = line.trim_start();
-        // ps -axo pid=,args= 输出形如 "12345 /Applications/xxx.app/Contents/MacOS/xxx --flag"
-        let mut it = line.split_whitespace();
-        let Some(pid) = it.next() else { continue };
+        // ps -axo pid=,comm=,args= 形如
+        // "12345 /Applications/xxx.app/Contents/MacOS/xxx /Applications/xxx.app/Contents/MacOS/xxx --flag"
+        let Some((pid, rest)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
         if !pid.chars().all(|c| c.is_ascii_digit()) {
             continue;
         }
-        let args = line[pid.len()..].trim_start();
-        if !args.contains(".app/") { continue; }
+        let rest = rest.trim_start();
+        let Some((comm, args)) = rest.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if !args.contains(".app/") {
+            continue;
+        }
         let marker = ".app/";
-        let Some(pos) = args.find(marker) else { continue };
+        let Some(pos) = args.find(marker) else {
+            continue;
+        };
         // 取到 .app 目录（形如 /Applications/xxx.app/）
         let app_dir = &args[..pos + marker.len()];
         let bundle_id = bundle_id_for_path(app_dir);
-        // app_path 仅作展示用：可执行文件路径可能含空格（如 "Google Chrome"），
-        // ps 输出又不加重引号，静态层面无法可靠区分"路径内空格"与"参数分隔空格"，
-        // 因此这里不强求精确路径——真正的"运行中"判定在 scan_macos_apps 里
-        // 靠 bundle_id 匹配（Info.plist 读取，不受空格影响）完成。
-        // 取首个 token 作近似路径即可，含空格主程序由 bundle_id 兜底。
-        let app_path = args.split_whitespace().next().unwrap_or(args).trim().to_string();
+        // comm 在 macOS 上按空格截断，不能当完整路径。app_dir 才是可靠身份；
+        // app_path 只用于无 bundle id 时的兜底展示/匹配。
+        // 先从完整 args 提取，comm 在 macOS 上常被截断到首个空格之前
+        // （例如 "Google Chrome" 只留下 "Google"）。bundle id 缺失时
+        // app_path 是唯一去重/匹配键，不能让截断值污染它。
+        let app_path = exact_process_path(args, app_dir)
+            .or_else(|| exact_process_path(comm, app_dir))
+            .unwrap_or_else(|| comm.trim().to_string());
         // 去重键优先用 bundle_id（更稳定，不受 args 空格截断影响）；
         // bundle_id 为空（极少见，Info.plist 读不到）才退回 app_path。
         // 此前用 app_path 去重，含空格的路径被截断到首个 token，
         // 多个不同进程首 token 相同会被误并为一个，丢失真实运行进程。
-        let dedup_key = if !bundle_id.is_empty() { bundle_id.clone() } else { app_path.clone() };
-        if !seen.insert(dedup_key) { continue; }
-        out.push(RunningProcess { app_path, bundle_id });
+        let dedup_key = if !bundle_id.is_empty() {
+            bundle_id.clone()
+        } else {
+            app_path.clone()
+        };
+        if !seen.insert(dedup_key) {
+            continue;
+        }
+        out.push(RunningProcess {
+            app_dir: app_dir.trim_end_matches('/').to_string(),
+            app_path,
+            bundle_id,
+        });
     }
     out
+}
+
+/// 从 `ps args=` 行中提取 .app 主可执行文件的精确路径。
+/// ps 不引用含空格路径，但 `.app/Contents/MacOS/` 这个稳定分界能确定
+/// 可执行文件在 `.app/` 后的第一段；超出分界的部分是参数，不是路径。
+fn exact_process_path(args: &str, app_dir: &str) -> Option<String> {
+    let (_, after_app) = args.split_once(app_dir)?;
+    let executable = after_app.split_whitespace().next()?;
+    if executable.is_empty() {
+        return None;
+    }
+    Some(format!("{app_dir}{executable}"))
 }
 
 fn bundle_id_for_path(app_path: &str) -> String {
     let p = Path::new(app_path);
     let plist = p.join("Contents/Info.plist");
     let out = std::process::Command::new("/usr/bin/plutil")
-        .arg("-extract").arg("CFBundleIdentifier").arg("raw").arg("-o").arg("-").arg(&plist)
-        .output().ok();
+        .arg("-extract")
+        .arg("CFBundleIdentifier")
+        .arg("raw")
+        .arg("-o")
+        .arg("-")
+        .arg(&plist)
+        .output()
+        .ok();
     if let Some(o) = out {
         if o.status.success() {
             return String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -545,15 +652,49 @@ fn rule_paths_for(app_dir: &Path, bundle_id: Option<&str>) -> Vec<String> {
 
 pub fn classify(name: &str) -> String {
     let n = name.to_lowercase();
-    if n.contains("chrome") || n.contains("safari") || n.contains("edge") || n.contains("firefox") || n.contains("browser") {
+    if n.contains("chrome")
+        || n.contains("safari")
+        || n.contains("edge")
+        || n.contains("firefox")
+        || n.contains("browser")
+    {
         "浏览器".to_string()
-    } else if n.contains("wechat") || n.contains("weixin") || n.contains("qq") || n.contains("telegram") || n.contains("discord") || n.contains("slack") || n.contains("dingtalk") || n.contains("lark") || n.contains("feishu") || n.contains("whatsapp") {
+    } else if n.contains("wechat")
+        || n.contains("weixin")
+        || n.contains("qq")
+        || n.contains("telegram")
+        || n.contains("discord")
+        || n.contains("slack")
+        || n.contains("dingtalk")
+        || n.contains("lark")
+        || n.contains("feishu")
+        || n.contains("whatsapp")
+    {
         "通讯".to_string()
-    } else if n.contains("meeting") || n.contains("zoom") || n.contains("tencent") || n.contains("会议") {
+    } else if n.contains("meeting")
+        || n.contains("zoom")
+        || n.contains("tencent")
+        || n.contains("会议")
+    {
         "会议".to_string()
-    } else if n.contains("terminal") || n.contains("iterm") || n.contains("ssh") || n.contains("code") || n.contains("studio") || n.contains("xcode") || n.contains("docker") || n.contains("vim") {
+    } else if n.contains("terminal")
+        || n.contains("iterm")
+        || n.contains("ssh")
+        || n.contains("code")
+        || n.contains("studio")
+        || n.contains("xcode")
+        || n.contains("docker")
+        || n.contains("vim")
+    {
         "开发工具".to_string()
-    } else if n.contains("chatgpt") || n.contains("claude") || n.contains("gemini") || n.contains("kimi") || n.contains("qianwen") || n.contains("doubao") || n.contains("ollama") {
+    } else if n.contains("chatgpt")
+        || n.contains("claude")
+        || n.contains("gemini")
+        || n.contains("kimi")
+        || n.contains("qianwen")
+        || n.contains("doubao")
+        || n.contains("ollama")
+    {
         "AI 工具".to_string()
     } else {
         "其他".to_string()
@@ -621,10 +762,19 @@ mod tests {
         // 精确相等
         assert!(process_name_matches("google chrome", "google chrome"));
         // 边界匹配：空格（Helper）
-        assert!(process_name_matches("google chrome helper", "google chrome"));
-        assert!(process_name_matches("google chrome helper (renderer)", "google chrome"));
+        assert!(process_name_matches(
+            "google chrome helper",
+            "google chrome"
+        ));
+        assert!(process_name_matches(
+            "google chrome helper (renderer)",
+            "google chrome"
+        ));
         // 边界匹配：点
-        assert!(process_name_matches("google chrome.helper", "google chrome"));
+        assert!(process_name_matches(
+            "google chrome.helper",
+            "google chrome"
+        ));
     }
 
     #[test]
@@ -644,5 +794,146 @@ mod tests {
         // 候选名 <2 字符时，只允许精确相等
         assert!(process_name_matches("x", "x"));
         assert!(!process_name_matches("xhelper", "x"));
+    }
+
+    fn app_entry(id: &str, name: &str, path: &str, bundle: Option<&str>) -> AppEntry {
+        AppEntry {
+            id: id.to_string(),
+            name: name.to_string(),
+            bundle_id: bundle.map(str::to_string),
+            path: Some(path.to_string()),
+            running: false,
+            mode: "direct".to_string(),
+            category: "其他".to_string(),
+            confirmed: false,
+            node: None,
+            rule_paths: vec![],
+            online: false,
+            remote_ips: vec![],
+        }
+    }
+
+    #[test]
+    fn mark_running_apps_matches_exact_path() {
+        let mut list = vec![
+            app_entry(
+                "app-a",
+                "SameName",
+                "/Applications/A.app/Contents/MacOS/A",
+                Some("com.a"),
+            ),
+            app_entry(
+                "app-b",
+                "SameName",
+                "/Applications/B.app/Contents/MacOS/B",
+                Some("com.b"),
+            ),
+        ];
+        let running = vec![RunningProcess {
+            app_dir: "/Applications/B.app".to_string(),
+            app_path: "/Applications/B.app/Contents/MacOS/B".to_string(),
+            bundle_id: String::new(),
+        }];
+
+        mark_running_apps(&mut list, &running);
+
+        assert!(!list[0].running);
+        assert!(list[1].running);
+    }
+
+    #[test]
+    fn mark_running_apps_matches_bundle_id_for_helper() {
+        let mut list = vec![app_entry(
+            "app-a",
+            "Demo",
+            "/Applications/Demo.app/Contents/MacOS/Demo",
+            Some("com.demo"),
+        )];
+        let running = vec![RunningProcess {
+            app_dir: "/Applications/Demo.app".to_string(),
+            app_path: "/Applications/Demo.app/Contents/Frameworks/Helper.app/Contents/MacOS/Helper"
+                .to_string(),
+            bundle_id: "com.demo".to_string(),
+        }];
+
+        mark_running_apps(&mut list, &running);
+
+        assert!(list[0].running);
+    }
+
+    #[test]
+    fn exact_process_path_keeps_app_dir_prefix() {
+        assert_eq!(
+            exact_process_path(
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Google Chrome.app/",
+            ),
+            Some("/Applications/Google Chrome.app/Contents/MacOS/Google".to_string()),
+        );
+    }
+
+    #[test]
+    fn scan_running_process_prefers_full_args_path_over_truncated_comm() {
+        let args = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --flag";
+        let app_dir = "/Applications/Google Chrome.app/";
+        assert_eq!(
+            exact_process_path(args, app_dir),
+            Some("/Applications/Google Chrome.app/Contents/MacOS/Google".to_string()),
+        );
+        let comm = "/Applications/Google Chrome.app/Contents/MacOS/Google";
+        assert_eq!(
+            exact_process_path(comm, app_dir),
+            Some("/Applications/Google Chrome.app/Contents/MacOS/Google".to_string()),
+        );
+    }
+
+    #[test]
+    fn mark_running_apps_matches_main_app_dir_when_comm_is_truncated() {
+        let mut list = vec![app_entry(
+            "app-Demo",
+            "Google Chrome",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            Some("com.google.Chrome"),
+        )];
+        let running = vec![RunningProcess {
+            app_dir: "/Applications/Google Chrome.app".to_string(),
+            app_path: "/Applications/Google Chrome.app/Contents/MacOS/Google".to_string(),
+            bundle_id: "com.google.Chrome".to_string(),
+        }];
+
+        mark_running_apps(&mut list, &running);
+
+        assert!(list[0].running);
+    }
+
+    #[test]
+    fn app_ids_keep_legacy_id_when_name_is_unique() {
+        let candidates = vec![(
+            PathBuf::from("/Applications/Demo.app"),
+            "Demo".to_string(),
+            "/Applications/Demo.app/Contents/MacOS/Demo".to_string(),
+            Some("com.demo".to_string()),
+        )];
+        assert_eq!(app_ids(&candidates), vec!["app-Demo"]);
+    }
+
+    #[test]
+    fn app_ids_disambiguate_same_display_name() {
+        let candidates = vec![
+            (
+                PathBuf::from("/Applications/A.app"),
+                "SameName".to_string(),
+                "/Applications/A.app/Contents/MacOS/A".to_string(),
+                Some("com.a".to_string()),
+            ),
+            (
+                PathBuf::from("/Applications/B.app"),
+                "SameName".to_string(),
+                "/Applications/B.app/Contents/MacOS/B".to_string(),
+                Some("com.b".to_string()),
+            ),
+        ];
+        let ids = app_ids(&candidates);
+        assert_eq!(ids, vec!["app-SameName--com.a", "app-SameName--com.b"]);
     }
 }

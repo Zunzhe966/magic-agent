@@ -25,6 +25,9 @@ pub struct AppStatus {
     pub apps_count: usize,
     pub nodes_count: usize,
     pub ssh: Option<crate::ssh::SshSession>,
+    /// 崩溃自愈提示（P0-4）：启动后发现"内核没跑但系统代理指向本程序端口"
+    /// 并已自动关闭时，一次性下发此文案，前端 toast 后调 clear 命令清空。
+    pub self_heal_notice: Option<String>,
 }
 
 /// 代理端口与现有 Clash/FlClash 冲突检测结果
@@ -91,32 +94,51 @@ fn find_foreign_proxies() -> Vec<(u32, String)> {
     let runtime_str = runtime.to_string_lossy().to_string();
     let self_pid = std::process::id();
 
-    let ps = match std::process::Command::new("/bin/ps").args(["-axo", "pid=,args="]).output() {
+    let ps = match std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,args="])
+        .output()
+    {
         Ok(o) => o,
         Err(_) => return found,
     };
     let text = String::from_utf8_lossy(&ps.stdout);
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
         let mut parts = line.splitn(2, char::is_whitespace);
         let pid: u32 = match parts.next().and_then(|s| s.trim().parse().ok()) {
             Some(p) => p,
             None => continue,
         };
-        let args = match parts.next() { Some(a) => a.trim(), None => continue };
-        if pid == self_pid { continue; }
+        let args = match parts.next() {
+            Some(a) => a.trim(),
+            None => continue,
+        };
+        if pid == self_pid {
+            continue;
+        }
         // 跳过本程序自己的可执行文件
-        if args.contains("magic-agent") || args.contains("magic_probe") || args.contains("dump_conf") {
+        if args.contains("magic-agent")
+            || args.contains("magic_probe")
+            || args.contains("dump_conf")
+        {
             continue;
         }
         // 跳过本程序 runtime 目录下的内核（那是我们自己的）
-        if args.contains(&runtime_str) { continue; }
+        if args.contains(&runtime_str) {
+            continue;
+        }
 
         // 只取可执行文件路径部分做匹配（首个空格前的 token）。
         // 绝不用整个命令行匹配：否则任何在参数里提到 "clash"/"v2ray" 字样的进程
         // （grep、编辑器、脚本）都会被误杀。
-        let exe_path = args.split_whitespace().next().unwrap_or(args).to_lowercase();
+        let exe_path = args
+            .split_whitespace()
+            .next()
+            .unwrap_or(args)
+            .to_lowercase();
         let exe_name = exe_path.rsplit('/').next().unwrap_or(&exe_path).to_string();
 
         // 匹配应用可执行名（如 /Applications/FlClash.app/Contents/MacOS/FlClash → flclash）
@@ -139,6 +161,21 @@ fn find_foreign_proxies() -> Vec<(u32, String)> {
     found
 }
 
+/// P0-1 统一对账日志：系统代理设置结果不再 `let _ =` 静默吞掉。
+/// 全部达标记一行 ok；有失败服务则 WARN 点名到服务级，供排查
+/// "显示已开启但某些网络其实没走代理"这类假账场景。
+fn log_proxy_set_result(caller: &str, r: &system_proxy::SystemProxyStatus) {
+    if r.all_ok {
+        eprintln!("[system_proxy] {caller}: 逐服务对账通过（{} 个服务）", r.services.len());
+    } else {
+        eprintln!(
+            "[system_proxy] WARN {caller}: 部分服务未达标: {}（共 {} 个服务，请检查这些网络的代理状态）",
+            if r.mismatched.is_empty() { "原因见 services.errors".to_string() } else { r.mismatched.join("、") },
+            r.services.len()
+        );
+    }
+}
+
 /// 启动魔法代理前，清理所有第三方代理：
 /// 1) 杀掉第三方代理进程（先温和 TERM，1.5 秒后仍在则 KILL）
 /// 2) 关闭系统代理设置，让网络回到"未设代理"的干净状态
@@ -149,7 +186,9 @@ fn cleanup_foreign_proxies() -> Vec<String> {
     let mut cleaned = Vec::new();
     if victims.is_empty() {
         // 没有第三方进程，但仍要确保系统代理是干净状态
-        let _ = system_proxy::set_system_proxy(false, 0);
+        if let Ok(r) = system_proxy::set_system_proxy(false, 0) {
+            log_proxy_set_result("cleanup(无第三方)", &r);
+        }
         return cleaned;
     }
 
@@ -179,7 +218,9 @@ fn cleanup_foreign_proxies() -> Vec<String> {
     }
 
     // 关闭系统代理，回到干净状态（第三方软件可能残留了代理指向）
-    let _ = system_proxy::set_system_proxy(false, 0);
+    if let Ok(r) = system_proxy::set_system_proxy(false, 0) {
+        log_proxy_set_result("cleanup", &r);
+    }
 
     cleaned
 }
@@ -189,7 +230,10 @@ async fn check_conflicts() -> ConflictInfo {
     // 内部跑 ps + TCP 连接探测，改 async 避免卡主线程
     tauri::async_runtime::spawn_blocking(check_conflicts_blocking)
         .await
-        .unwrap_or(ConflictInfo { has_conflict: false, messages: vec![] })
+        .unwrap_or(ConflictInfo {
+            has_conflict: false,
+            messages: vec![],
+        })
 }
 
 fn check_conflicts_blocking() -> ConflictInfo {
@@ -198,7 +242,10 @@ fn check_conflicts_blocking() -> ConflictInfo {
     let foreign = find_foreign_proxies();
     if !foreign.is_empty() {
         let names: Vec<String> = foreign.iter().map(|(_, l)| l.clone()).collect();
-        messages.push(format!("检测到正在运行的第三方代理程序：{}", names.join("、")));
+        messages.push(format!(
+            "检测到正在运行的第三方代理程序：{}",
+            names.join("、")
+        ));
     }
     // 2) 检测本程序要用的混合端口是否已被占用（排除自己的 runtime 内核）
     let port = MihomoManager::new().port;
@@ -214,7 +261,10 @@ fn check_conflicts_blocking() -> ConflictInfo {
             messages.push(format!("端口 {} 已被其他程序占用", port));
         }
     }
-    ConflictInfo { has_conflict: !messages.is_empty(), messages }
+    ConflictInfo {
+        has_conflict: !messages.is_empty(),
+        messages,
+    }
 }
 
 /// 供前端调用的「一键清理第三方代理」命令：
@@ -231,7 +281,10 @@ async fn kill_foreign_proxies() -> Vec<String> {
 #[tauri::command]
 async fn list_foreign_proxies() -> Vec<String> {
     tauri::async_runtime::spawn_blocking(|| {
-        find_foreign_proxies().into_iter().map(|(p, l)| format!("{} (PID {})", l, p)).collect()
+        find_foreign_proxies()
+            .into_iter()
+            .map(|(p, l)| format!("{} (PID {})", l, p))
+            .collect()
     })
     .await
     .unwrap_or_default()
@@ -266,16 +319,26 @@ fn fetch_subscription_blocking(url: String) -> Result<Vec<crate::config::ProxyNo
     // 用系统 curl 拉取订阅内容
     let out = std::process::Command::new("/usr/bin/curl")
         .arg("-sL")
-        .arg("--max-time").arg("15")
+        .arg("--max-time")
+        .arg("15")
         // 拉订阅必须走真实链路，不受环境代理变量（HTTP_PROXY 等）劫持
-        .arg("--noproxy").arg("*")
-        .arg("-A").arg("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
+        .arg("--noproxy")
+        .arg("*")
+        .arg("-A")
+        .arg("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
         .arg(trimmed)
         .output()
         .map_err(|e| format!("调用 curl 失败: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(format!("拉取订阅失败: {}", if err.is_empty() { "HTTP 错误".to_string() } else { err }));
+        return Err(format!(
+            "拉取订阅失败: {}",
+            if err.is_empty() {
+                "HTTP 错误".to_string()
+            } else {
+                err
+            }
+        ));
     }
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     crate::config::parse_vless_subscription(&text)
@@ -289,20 +352,83 @@ struct AppState {
     /// 用户是否期望代理在运行（start_proxy 置 true，stop_proxy 置 false）。
     /// 看门狗线程据此判断 mihomo 崩溃后是否需要自动重启。
     should_run: Arc<AtomicBool>,
+    /// 崩溃自愈一次性提示（P0-4）：启动自检发现"死端口仍被系统代理指向"
+    /// 并自动关闭后写入，get_status 读出置 None（前端 toast 一次即消费）。
+    /// Arc 包装：启动自检线程与 AppState 共享同一槽位。
+    self_heal_notice: Arc<Mutex<Option<String>>>,
+}
+
+/// P0-4 启动自检（崩溃自愈）：App 被 kill -9 / 断电时 RunEvent::Exit 不执行，
+/// 系统代理可能残留指向本程序死端口（7891/7892/7893）→ 整机断网且用户不明所以。
+/// 启动时若发现"内核不在跑但系统代理仍指向这三个端口之一"，立即关闭系统代理
+/// 恢复直连，并把情况写入一次性提示。
+/// 端口集合来自常量而非配置，任何情况下不会误关"指向其他代理"的系统代理。
+fn startup_self_check(state: &Arc<Mutex<AppState>>) {
+    let (mihomo, heal_slot) = {
+        let g = state.lock().unwrap();
+        (g.mihomo.clone(), g.self_heal_notice.clone())
+    };
+    if mihomo.status().running {
+        return; // 内核活着（自动启动马上会接管），不是残留场景
+    }
+    let sys = system_proxy::status();
+    if !sys.enabled {
+        return; // 系统代理本来就没开
+    }
+    let ours = [
+        mihomo.port,
+        crate::mihomo::PROXY_PORT,
+        crate::mihomo::DIRECT_PORT,
+    ];
+    if !ours.contains(&sys.http_port) && !ours.contains(&sys.socks_port) {
+        // 指向的是别人的端口——那是第三方代理的状态，不归本自检管
+        // （cleanup_foreign_proxies 会按既有策略处理），绝不能误关他人配置。
+        return;
+    }
+    eprintln!(
+        "[self-check] 检测到系统代理指向本程序死端口（http={} socks={}）但内核未运行，自动关闭以恢复直连",
+        sys.http_port, sys.socks_port
+    );
+    match system_proxy::set_system_proxy(false, mihomo.port) {
+        Ok(r) => {
+            let mut notice = format!(
+                "检测到上次异常退出残留的系统代理（指向已停止的端口 {}），已自动关闭恢复直连。",
+                if sys.http_port != 0 { sys.http_port } else { sys.socks_port }
+            );
+            if !r.all_ok {
+                notice.push_str(&format!(
+                    "注意：{} 个服务未能确认关闭：{}",
+                    r.mismatched.len(),
+                    r.mismatched.join("、")
+                ));
+            }
+            *heal_slot.lock().unwrap() = Some(notice);
+        }
+        Err(e) => {
+            *heal_slot.lock().unwrap() = Some(format!(
+                "检测到系统代理残留指向本程序死端口，但自动关闭失败：{e}。请手动检查网络设置。"
+            ));
+        }
+    }
 }
 
 #[tauri::command]
-async fn get_status(state: tauri::State<'_, Arc<Mutex<AppState>>>, ssh: tauri::State<'_, crate::ssh::SshManager>) -> Result<AppStatus, String> {
+async fn get_status(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    ssh: tauri::State<'_, crate::ssh::SshManager>,
+) -> Result<AppStatus, String> {
     // 同步命令跑主线程：内部 mihomo.status() 会 TcpStream::connect 探端口、
     // system_proxy::status() 会 fork 子进程跑 scutil。被前端每 5 秒轮询，
     // 任一环节慢（端口被防火墙 DROP / 子进程调度）都会让 UI 卡顿。
     // 改 async + spawn_blocking，探测挪到线程池。
-    let (mihomo_state, apps_count, nodes_count) = {
+    let (mihomo_state, apps_count, nodes_count, heal) = {
         let g = state.lock().unwrap();
         let mihomo = g.mihomo.clone();
         let apps_count = g.apps_cache.lock().unwrap().len();
         let nodes_count = g.config.nodes.len();
-        (mihomo, apps_count, nodes_count)
+        // 一次性消费崩溃自愈提示（读取即清空，前端 toast 一次）
+        let heal = g.self_heal_notice.lock().unwrap().take();
+        (mihomo, apps_count, nodes_count, heal)
     };
     // SshManager 内部全 Arc，直接 clone（clone 与 State 生命周期解耦）
     let ssh: crate::ssh::SshManager = ssh.inner().clone();
@@ -317,6 +443,7 @@ async fn get_status(state: tauri::State<'_, Arc<Mutex<AppState>>>, ssh: tauri::S
             apps_count,
             nodes_count,
             ssh: ssh.status(),
+            self_heal_notice: heal,
         }
     })
     .await
@@ -383,8 +510,8 @@ fn proxy_api_blocking(
     let body = body.unwrap_or_default();
     // 通过 TcpStream 直连 127.0.0.1:19091 转发，secret 只在后端内存/本地传递
     let addr = ("127.0.0.1", crate::mihomo::API_PORT);
-    let mut stream = std::net::TcpStream::connect(addr)
-        .map_err(|e| format!("无法连接代理控制 API：{e}"))?;
+    let mut stream =
+        std::net::TcpStream::connect(addr).map_err(|e| format!("无法连接代理控制 API：{e}"))?;
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(15)))
         .map_err(|e| e.to_string())?;
@@ -399,7 +526,9 @@ fn proxy_api_blocking(
         body = body,
     );
     use std::io::{Read, Write};
-    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| e.to_string())?;
 
     let mut resp = Vec::new();
     stream.read_to_end(&mut resp).map_err(|e| e.to_string())?;
@@ -424,7 +553,9 @@ fn parse_http_response(raw: &[u8]) -> (u16, String) {
         .next()
         .and_then(|l| {
             let l = String::from_utf8_lossy(l);
-            l.split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok())
+            l.split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<u16>().ok())
         })
         .unwrap_or(0);
 
@@ -444,10 +575,14 @@ fn parse_http_response(raw: &[u8]) -> (u16, String) {
         let mut rest = body_raw;
         loop {
             // 取长度行（十六进制，可能带 chunk 扩展，用分号分隔）
-            let Some(nl) = find_subslice(rest, b"\r\n") else { break };
+            let Some(nl) = find_subslice(rest, b"\r\n") else {
+                break;
+            };
             let size_str = String::from_utf8_lossy(&rest[..nl]);
             let size_str = size_str.split(';').next().unwrap_or("").trim();
-            let Ok(size) = usize::from_str_radix(size_str, 16) else { break };
+            let Ok(size) = usize::from_str_radix(size_str, 16) else {
+                break;
+            };
             rest = &rest[nl + 2..];
             if size == 0 {
                 break; // 终止块
@@ -485,13 +620,14 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[tauri::command]
-async fn save_config(state: tauri::State<'_, Arc<Mutex<AppState>>>, config: AppConfig) -> Result<AppConfig, String> {
+async fn save_config(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    config: AppConfig,
+) -> Result<AppConfig, String> {
     // 同步命令会卡主线程：热更新要调 mihomo API（秒级）。改 async + spawn_blocking。
     let (api_secret, running, apps_cache) = {
         let g = state.lock().unwrap();
@@ -516,7 +652,12 @@ async fn save_config(state: tauri::State<'_, Arc<Mutex<AppState>>>, config: AppC
     // 安全：SSH 明文密码/私钥内容绝不落盘 config.json。
     // 密码只存 Keychain；私钥内容只存 Keychain，config 里至多保留私钥「路径」。
     config.ssh_password = None;
-    if config.ssh_private_key.as_deref().map(|k| k.contains('\n')).unwrap_or(false) {
+    if config
+        .ssh_private_key
+        .as_deref()
+        .map(|k| k.contains('\n'))
+        .unwrap_or(false)
+    {
         config.ssh_private_key = None;
     }
     // 如果代理正在运行，热更新 rules，让新保存的分流/域名规则立即生效（不重启、不弹授权框）。
@@ -545,7 +686,9 @@ async fn save_config(state: tauri::State<'_, Arc<Mutex<AppState>>>, config: AppC
 }
 
 #[tauri::command]
-async fn scan_apps(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<crate::apps::AppEntry>, String> {
+async fn scan_apps(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<Vec<crate::apps::AppEntry>, String> {
     // 同步命令会卡主线程：全盘扫描 App + lsof（秒级）。改 async + 线程池。
     let settings = {
         let g = state.lock().unwrap();
@@ -565,7 +708,13 @@ async fn scan_apps(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<
     .await
     .map_err(|e| format!("scan_apps 线程异常: {e}"))?;
     // 更新缓存，供 get_status 轻量读取数量 / start_proxy 复用
-    state.lock().unwrap().apps_cache.lock().unwrap().clone_from(&list);
+    state
+        .lock()
+        .unwrap()
+        .apps_cache
+        .lock()
+        .unwrap()
+        .clone_from(&list);
     Ok(list)
 }
 
@@ -640,7 +789,9 @@ pub fn settings_to_app_rules(
 }
 
 #[tauri::command]
-async fn start_proxy(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<MihomoStatus, String> {
+async fn start_proxy(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<MihomoStatus, String> {
     // 同步命令会卡死主线程（启动可达数十秒：停旧进程 + cleanup + 等 API）。
     // 改为 async + spawn_blocking，主线程立即返回，界面不卡。
     let (cfg, already_running, apps_cache) = {
@@ -651,6 +802,17 @@ async fn start_proxy(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Mi
         (cfg, running, cache)
     };
     if already_running {
+        // 即使代理已在运行（App 重启/看门狗重启），也要确保系统代理状态与配置一致。
+        // 否则会出现「mihomo 在跑但系统代理没开」的断网状态。
+        if cfg.system_proxy {
+            let m = MihomoManager::new();
+            // P0-1：不再 let _ = 吞掉失败——逐服务对账结果如实记日志，
+            // 部分服务没设上时 UI 状态面板仍会显示真实的全局视图。
+            match system_proxy::set_system_proxy(true, m.port) {
+                Ok(r) => log_proxy_set_result("start(已运行)", &r),
+                Err(e) => eprintln!("[start_proxy] 系统代理设置失败: {e}"),
+            }
+        }
         let m = MihomoManager::new();
         return Ok(m.status());
     }
@@ -668,7 +830,12 @@ async fn start_proxy(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Mi
         let mihomo = MihomoManager::new();
         let status = mihomo.start(&cfg, &[], &app_rules)?;
         if cfg.system_proxy {
-            let _ = system_proxy::set_system_proxy(true, mihomo.port);
+            // P0-1：启动后设置系统代理并逐服务回读。部分服务没设上不会断网
+            // （那些服务退化为直连），但必须如实记日志，杜绝"报成功实际半套"。
+            match system_proxy::set_system_proxy(true, mihomo.port) {
+                Ok(r) => log_proxy_set_result("start", &r),
+                Err(e) => eprintln!("[start_proxy] 系统代理设置失败: {e}"),
+            }
         }
         Ok(status)
     })
@@ -679,7 +846,11 @@ async fn start_proxy(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<Mi
         *state.lock().unwrap().mihomo.pid.lock().unwrap() = Some(pid);
     }
     // 通知看门狗：用户期望代理在运行，mihomo 崩溃后应自动重启
-    state.lock().unwrap().should_run.store(true, Ordering::Relaxed);
+    state
+        .lock()
+        .unwrap()
+        .should_run
+        .store(true, Ordering::Relaxed);
     Ok(status)
 }
 
@@ -695,7 +866,9 @@ async fn stop_proxy(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(),
     tauri::async_runtime::spawn_blocking(move || {
         let mihomo = MihomoManager::new();
         mihomo.stop();
-        let _ = system_proxy::set_system_proxy(false, port);
+        if let Ok(r) = system_proxy::set_system_proxy(false, port) {
+            log_proxy_set_result("stop_proxy", &r);
+        }
     })
     .await
     .map_err(|e| format!("stop_proxy 线程异常: {e}"))?;
@@ -704,12 +877,16 @@ async fn stop_proxy(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(),
 }
 
 #[tauri::command]
-async fn set_system_proxy(state: tauri::State<'_, Arc<Mutex<AppState>>>, enabled: bool) -> Result<crate::system_proxy::SystemProxyStatus, String> {
+async fn set_system_proxy(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    enabled: bool,
+) -> Result<crate::system_proxy::SystemProxyStatus, String> {
     // networksetup 可能耗时数秒，同步命令会卡主线程 → 改 async + spawn_blocking
     let port = state.lock().unwrap().mihomo.port;
-    let status = tauri::async_runtime::spawn_blocking(move || system_proxy::set_system_proxy(enabled, port))
-        .await
-        .map_err(|e| format!("set_system_proxy 线程异常: {e}"))??;
+    let status =
+        tauri::async_runtime::spawn_blocking(move || system_proxy::set_system_proxy(enabled, port))
+            .await
+            .map_err(|e| format!("set_system_proxy 线程异常: {e}"))??;
     // 同步更新并持久化 config.system_proxy，使 UI 开关与 config 一致。
     // 旧实现只调 networksetup 不改 config，导致 UI 开关后 start_proxy 仍按旧 config 判断，
     // 重启后系统代理状态与用户上次选择脱节。
@@ -725,12 +902,27 @@ async fn set_system_proxy(state: tauri::State<'_, Arc<Mutex<AppState>>>, enabled
 }
 
 #[tauri::command]
-async fn ssh_connect(state: tauri::State<'_, Arc<Mutex<AppState>>>, ssh: tauri::State<'_, crate::ssh::SshManager>, host: String, port: u16, user: String, auth: String, password: Option<String>, key: Option<String>) -> Result<crate::ssh::SshSession, String> {
+async fn ssh_connect(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    ssh: tauri::State<'_, crate::ssh::SshManager>,
+    host: String,
+    port: u16,
+    user: String,
+    auth: String,
+    password: Option<String>,
+    key: Option<String>,
+) -> Result<crate::ssh::SshSession, String> {
     // 连接+认证验证最长十余秒，同步命令会卡死主线程 → 改 async + spawn_blocking。
     // connect 内部已验证登录结果：认证失败会返回 Err，下面的 Keychain/配置写入不会执行，
     // 错误密码/私钥因此永远不会被存进 Keychain 污染后续连接。
     let session = {
-        let (h, u, a, p, k) = (host.clone(), user.clone(), auth.clone(), password.clone(), key.clone());
+        let (h, u, a, p, k) = (
+            host.clone(),
+            user.clone(),
+            auth.clone(),
+            password.clone(),
+            key.clone(),
+        );
         let ssh: crate::ssh::SshManager = ssh.inner().clone(); // clone 共享内部 Arc 状态
         tauri::async_runtime::spawn_blocking(move || ssh.connect(h, port, u, a, p, k))
             .await
@@ -818,9 +1010,16 @@ async fn ssh_connect(state: tauri::State<'_, Arc<Mutex<AppState>>>, ssh: tauri::
 }
 
 #[tauri::command]
-fn select_ssh_server(state: tauri::State<Arc<Mutex<AppState>>>, server_id: String) -> Result<crate::config::ServerInfo, String> {
+fn select_ssh_server(
+    state: tauri::State<Arc<Mutex<AppState>>>,
+    server_id: String,
+) -> Result<crate::config::ServerInfo, String> {
     let mut g = state.lock().unwrap();
-    let server = g.config.servers.iter().find(|s| s.id == server_id)
+    let server = g
+        .config
+        .servers
+        .iter()
+        .find(|s| s.id == server_id)
         .cloned()
         .ok_or("服务器不存在")?;
     g.config.active_server_id = Some(server.id.clone());
@@ -835,12 +1034,27 @@ fn select_ssh_server(state: tauri::State<Arc<Mutex<AppState>>>, server_id: Strin
 }
 
 #[tauri::command]
-fn delete_ssh_server(state: tauri::State<Arc<Mutex<AppState>>>, ssh: tauri::State<crate::ssh::SshManager>, server_id: String) -> Result<(), String> {
+fn delete_ssh_server(
+    state: tauri::State<Arc<Mutex<AppState>>>,
+    ssh: tauri::State<crate::ssh::SshManager>,
+    server_id: String,
+) -> Result<(), String> {
     let mut g = state.lock().unwrap();
-    let idx = g.config.servers.iter().position(|s| s.id == server_id).ok_or("服务器不存在")?;
+    let idx = g
+        .config
+        .servers
+        .iter()
+        .position(|s| s.id == server_id)
+        .ok_or("服务器不存在")?;
     let server = g.config.servers.remove(idx);
-    keychain::delete(&crate::ssh::SshManager::password_account(&server.host, &server.user));
-    keychain::delete(&crate::ssh::SshManager::key_account(&server.host, &server.user));
+    keychain::delete(&crate::ssh::SshManager::password_account(
+        &server.host,
+        &server.user,
+    ));
+    keychain::delete(&crate::ssh::SshManager::key_account(
+        &server.host,
+        &server.user,
+    ));
     // 若删的正是当前激活服务器，且 SSH 交互式会话还连着它，必须同步断开——
     // 否则用户删完服务器在「控制台」页依然看到"已连接"，且底层 ssh 进程仍持有
     // 该服务器凭据的会话，与"已删除"语义矛盾，存在凭据残留风险。
@@ -898,11 +1112,24 @@ fn ssh_disconnect(ssh: tauri::State<crate::ssh::SshManager>) -> Result<(), Strin
 /// 最长可达数十秒，会卡死主线程 → macOS 显示"彩色转圈"（应用无响应）。
 /// 这里用 spawn_blocking 把阻塞 IO 挪到线程池，主线程立即返回。
 #[tauri::command]
-async fn ssh_exec(state: tauri::State<'_, Arc<Mutex<AppState>>>, command: String, timeout_secs: Option<u64>) -> Result<(String, String, i32), String> {
+async fn ssh_exec(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+    command: String,
+    timeout_secs: Option<u64>,
+) -> Result<(String, String, i32), String> {
     let (host, port, user, auth, key_path) = {
         let g = state.lock().unwrap();
-        let s = g.config.active_server().ok_or("尚未配置云服务器：请先在「云服务器」页添加 SSH 连接")?;
-        (s.host.clone(), s.port, s.user.clone(), s.auth.clone(), s.key_path.clone())
+        let s = g
+            .config
+            .active_server()
+            .ok_or("尚未配置云服务器：请先在「云服务器」页添加 SSH 连接")?;
+        (
+            s.host.clone(),
+            s.port,
+            s.user.clone(),
+            s.auth.clone(),
+            s.key_path.clone(),
+        )
     };
     let timeout = timeout_secs.unwrap_or(15).clamp(5, 60);
     // 阻塞 IO 放到独立线程，绝不占用主线程
@@ -921,11 +1148,20 @@ async fn ssh_exec(state: tauri::State<'_, Arc<Mutex<AppState>>>, command: String
 /// 会 SSH 连服务器执行命令（最长 20 秒超时），期间主线程被占 → 点仪表盘时
 /// macOS 显示"彩色转圈"（应用无响应）。挪到线程池后交互不再卡顿。
 #[tauri::command]
-async fn server_metrics(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<serde_json::Value, String> {
-    let (host, port, user, auth, key_path) = {
+async fn server_metrics(
+    state: tauri::State<'_, Arc<Mutex<AppState>>>,
+) -> Result<serde_json::Value, String> {
+    let (server_name, host, port, user, auth, key_path) = {
         let g = state.lock().unwrap();
         let s = g.config.active_server().ok_or("尚未配置云服务器")?;
-        (s.host.clone(), s.port, s.user.clone(), s.auth.clone(), s.key_path.clone())
+        (
+            s.name.clone(),
+            s.host.clone(),
+            s.port,
+            s.user.clone(),
+            s.auth.clone(),
+            s.key_path.clone(),
+        )
     };
     let cmd = r#"
 echo '---CPU---'; top -bn1 | grep 'Cpu(s)' || echo 'n/a'
@@ -937,11 +1173,24 @@ echo '---NET---'; cat /proc/net/dev | grep -E 'eth0|ens|enp' | head -5 || echo '
 "#;
     tauri::async_runtime::spawn_blocking(move || {
         let ssh = crate::ssh::SshManager::new();
-        let (out, err, code) = ssh.exec(host, port, user, auth, cmd.to_string(), 20, key_path)?;
+        let (out, err, code) = ssh.exec(
+            host.clone(),
+            port,
+            user.clone(),
+            auth,
+            cmd.to_string(),
+            20,
+            key_path,
+        )?;
         if code != 0 {
             return Err(format!("探针执行失败 (exit {code}): {err}"));
         }
-        Ok(parse_server_metrics(&out))
+        Ok(attach_server_identity(
+            parse_server_metrics(&out),
+            &server_name,
+            &host,
+            &user,
+        ))
     })
     .await
     .map_err(|e| format!("server_metrics 线程异常: {e}"))?
@@ -971,13 +1220,18 @@ fn parse_server_metrics(raw: &str) -> serde_json::Value {
                 // free -m:  total used free shared buff/cache available
                 let cols: Vec<&str> = t.split_whitespace().collect();
                 if cols.len() >= 7 {
-                    if let (Ok(total), Ok(used), Ok(avail)) =
-                        (cols[1].parse::<f64>(), cols[2].parse::<f64>(), cols[6].parse::<f64>())
-                    {
+                    if let (Ok(total), Ok(used), Ok(avail)) = (
+                        cols[1].parse::<f64>(),
+                        cols[2].parse::<f64>(),
+                        cols[6].parse::<f64>(),
+                    ) {
                         m.insert("mem_total_mb".into(), json!(total));
                         m.insert("mem_used_mb".into(), json!(used));
                         m.insert("mem_avail_mb".into(), json!(avail));
-                        m.insert("mem_usage_pct".into(), json!((used / total * 100.0 * 10.0).round() / 10.0));
+                        m.insert(
+                            "mem_usage_pct".into(),
+                            json!((used / total * 100.0 * 10.0).round() / 10.0),
+                        );
                     }
                 }
             }
@@ -988,7 +1242,10 @@ fn parse_server_metrics(raw: &str) -> serde_json::Value {
                     m.insert("disk_size".into(), json!(cols[1]));
                     m.insert("disk_used".into(), json!(cols[2]));
                     m.insert("disk_avail".into(), json!(cols[3]));
-                    m.insert("disk_usage_pct".into(), json!(cols[4].trim_end_matches('%')));
+                    m.insert(
+                        "disk_usage_pct".into(),
+                        json!(cols[4].trim_end_matches('%')),
+                    );
                 }
             }
             "LOAD" => {
@@ -1023,6 +1280,23 @@ fn parse_server_metrics(raw: &str) -> serde_json::Value {
     serde_json::Value::Object(m)
 }
 
+/// 前端/Python extension 的 server_metrics 契约都包含 server 身份对象。
+/// 单独抽成纯函数，防止 Rust 侧只返回指标、仪表盘却永远进入不了服务器信息分支。
+fn attach_server_identity(
+    mut metrics: serde_json::Value,
+    name: &str,
+    host: &str,
+    user: &str,
+) -> serde_json::Value {
+    if let Some(obj) = metrics.as_object_mut() {
+        obj.insert(
+            "server".to_string(),
+            serde_json::json!({"name": name, "host": host, "user": user}),
+        );
+    }
+    metrics
+}
+
 fn extract_pct(line: &str, key: &str) -> f64 {
     // top 的 CPU 行形如 "%Cpu(s):  5.2 us,  3.1 sy,  0.0 ni, 89.8 id,  1.9 wa"
     // 每段是 "<值> <字段名>"，字段名可能带尾逗号。抓 key 前紧邻的浮点数。
@@ -1032,9 +1306,15 @@ fn extract_pct(line: &str, key: &str) -> f64 {
         for w in p.split_whitespace() {
             let field = w.trim_end_matches(',');
             if field == key {
-                if let Some(v) = prev_val { return v; }
+                if let Some(v) = prev_val {
+                    return v;
+                }
             }
-            prev_val = w.trim_end_matches(',').trim_end_matches('%').parse::<f64>().ok();
+            prev_val = w
+                .trim_end_matches(',')
+                .trim_end_matches('%')
+                .parse::<f64>()
+                .ok();
         }
     }
     0.0
@@ -1053,14 +1333,15 @@ fn self_test(state: tauri::State<Arc<Mutex<AppState>>>) -> Result<String, String
     Ok(lines.join("\n"))
 }
 
-
 pub fn start_proxy_standalone() -> Result<MihomoStatus, String> {
     let cfg = config::load();
     let mihomo = MihomoManager::new();
     let app_rules = effective_app_rules(&cfg);
     let status = mihomo.start(&cfg, &[], &app_rules)?;
     if cfg.system_proxy {
-        let _ = system_proxy::set_system_proxy(true, mihomo.port);
+        if let Ok(r) = system_proxy::set_system_proxy(true, mihomo.port) {
+            log_proxy_set_result("standalone", &r);
+        }
     }
     Ok(status)
 }
@@ -1070,7 +1351,9 @@ pub fn stop_proxy_standalone() -> Result<(), String> {
     let port = mihomo.port;
     // 首选：特权控制器零弹窗（已安装 sudoers 白名单时）
     if MihomoManager::ctl("stop").is_some() {
-        let _ = system_proxy::set_system_proxy(false, port);
+        if let Ok(r) = system_proxy::set_system_proxy(false, port) {
+            log_proxy_set_result("standalone(ctl)", &r);
+        }
         return Ok(());
     }
     // start_proxy_standalone 与 stop_proxy_standalone 各自创建实例无法共享 pid，
@@ -1105,7 +1388,10 @@ pub fn stop_proxy_standalone() -> Result<(), String> {
             .arg(&script)
             .output();
     }
-    let _ = system_proxy::set_system_proxy(false, port);
+    // 关系统代理并回读对账；若有服务没关成，下次启动的 P0-4 自检兜底
+    if let Ok(r) = system_proxy::set_system_proxy(false, port) {
+        log_proxy_set_result("standalone", &r);
+    }
     Ok(())
 }
 
@@ -1117,7 +1403,14 @@ pub fn run() {
         mihomo: MihomoManager::new(),
         apps_cache: Mutex::new(Vec::new()),
         should_run: should_run.clone(),
+        self_heal_notice: Arc::new(Mutex::new(None)),
     }));
+
+    // P0-4 启动自检：崩溃残留的"系统代理指向死端口"会整机断网，
+    // 必须第一时间恢复直连并告知用户。同步跑在 setup 前（百毫秒级，
+    // 仅一次内核端口探测 + 条件性一次 networksetup 批量关），
+    // 放后台线程会与 800ms 后的 cleanup_foreign_proxies 竞态。
+    startup_self_check(&state);
 
     // mihomo 看门狗：每 30s 检查一次。用户启动代理后 should_run=true，
     // 若 mihomo 崩溃（端口探测失败）则自动拉起——但只走特权控制器零弹窗路径
@@ -1127,9 +1420,13 @@ pub fn run() {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(30));
-            if !should_run.load(Ordering::Relaxed) { continue; }
+            if !should_run.load(Ordering::Relaxed) {
+                continue;
+            }
             let mihomo = MihomoManager::new();
-            if mihomo.status().running { continue; }
+            if mihomo.status().running {
+                continue;
+            }
             eprintln!("[watchdog] mihomo 已停止但 should_run=true，尝试自动重启...");
             if let Some(pid_str) = MihomoManager::ctl("start") {
                 if pid_str == "already-running" || pid_str.parse::<u32>().is_ok() {
@@ -1142,10 +1439,15 @@ pub fn run() {
                     }
                 }
             }
-            // 重启失败：关掉系统代理，避免死代理端口导致全机断网
+            // 重启失败：关掉系统代理，避免死代理端口导致全机断网。
+            // P0-1：这里若没关成是真实危险（用户即将断网），必须点名；
+            // 即便本次失败，下次 App 重启时 startup_self_check（P0-4）仍会兜底。
             eprintln!("[watchdog] mihomo 自动重启失败，关闭系统代理以恢复直连");
             let port = watchdog_state.lock().unwrap().mihomo.port;
-            let _ = system_proxy::set_system_proxy(false, port);
+            match system_proxy::set_system_proxy(false, port) {
+                Ok(r) => log_proxy_set_result("watchdog", &r),
+                Err(e) => eprintln!("[watchdog] WARN 关闭系统代理失败（用户可能断网，重启 App 可自愈）: {e}"),
+            }
         }
     });
 
@@ -1218,7 +1520,11 @@ pub fn run() {
                 g.mihomo.stop();
                 // 断开 SSH 会话：不断开则 ssh/expect 子进程变孤儿，继续占着远端连接
                 app.state::<crate::ssh::SshManager>().disconnect();
-                let _ = system_proxy::set_system_proxy(false, g.mihomo.port);
+                // 退出收尾也要对账：没关干净的话日志点名（下次启动 P0-4 自检兜底）
+                match system_proxy::set_system_proxy(false, g.mihomo.port) {
+                    Ok(r) => log_proxy_set_result("exit", &r),
+                    Err(e) => eprintln!("[magic-agent] WARN 退出时关闭系统代理失败: {e}"),
+                }
                 eprintln!("[magic-agent] RunEvent::Exit：收尾完成");
             }
         });
@@ -1317,5 +1623,18 @@ eth0: 1234567890 1000 0 0 0 0 0 0 9876543210 2000 0 0 0 0 0 0
         let m = parse_server_metrics(raw);
         assert_eq!(m["probe_ok"], true);
         assert!(m.get("cpu_usage_pct").is_none());
+    }
+
+    #[test]
+    fn metrics_include_server_identity_for_dashboard() {
+        let m = attach_server_identity(
+            serde_json::json!({"probe_ok": true}),
+            "prod-1",
+            "203.0.113.10",
+            "root",
+        );
+        assert_eq!(m["server"]["name"], "prod-1");
+        assert_eq!(m["server"]["host"], "203.0.113.10");
+        assert_eq!(m["server"]["user"], "root");
     }
 }

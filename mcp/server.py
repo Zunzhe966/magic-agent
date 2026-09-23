@@ -33,7 +33,7 @@ _MIHOMO_RUNTIME_BIN = RUNTIME_DIR + '/bin/mihomo'
 # 而不需要用户额外解释。这是让智能体「根据自己抉择使用魔法代理」的核心机制。
 # 写作纪律（参考 MCP 官方博客 + agentpatterns 工具描述最佳实践）：
 #   1) 讲「何时该用 / 何时不该用」，不只讲「能干嘛」；
-#   2) 讲「两条路怎么选」（坐飞机走代理 / 坐火车直连），这是用户最在意的决策点；
+#   2) 讲「两条路怎么选」（节点代理 7893 / 本机直连 7892），这是用户最在意的决策点；
 #   3) 讲「与其他工具/软件的配合关系」；
 #   4) 简洁、功能导向，不写营销话术。
 # ─────────────────────────────────────────────────────────────────────────────
@@ -41,14 +41,14 @@ SERVER_INSTRUCTIONS = """你是「魔法代理」这个本机代理软件的使�
 
 ## 魔法代理是什么
 一个跑在本机（127.0.0.1）的代理网关，内核是 mihomo。它管理着一组代理节点（VLESS），并把本机网络流量分成两条「物理上分开的路」：
-- 坐飞机（走代理）：http://127.0.0.1:7893 —— 流量从国外节点出去，用于访问被墙/国外网站（如 GitHub、Google、OpenAI、HuggingFace 等）。
-- 坐火车（直连）：http://127.0.0.1:7892 —— 流量直接本机出去，用于访问国内网站（如百度、腾讯、阿里等）。
+- 节点代理：http://127.0.0.1:7893 —— 流量从国外节点出去，用于访问被墙/国外网站（如 GitHub、Google、OpenAI、HuggingFace 等）。
+- 本机直连：http://127.0.0.1:7892 —— 流量直接本机出去，用于访问国内网站（如百度、腾讯、阿里等）。
 
 关键原则：魔法代理**不替你自动判断**该走哪条路。决策权在你——你根据「要访问的目标是国内还是国外」自己拍板，然后把请求送进对应的端口。
 
 ## 什么时候用魔法代理
-- 你要下载/访问**国外**资源（GitHub 仓库、pip/npm 国外源、模型权重、国外 API、Google 等）→ 用 download_proxy 拿两条路地址，走「坐飞机」端口 7893。
-- 你要下载/访问**国内**资源 → 走「坐火车」端口 7892（或直接不用代理）。
+- 你要下载/访问**国外**资源（GitHub 仓库、pip/npm 国外源、模型权重、国外 API、Google 等）→ 用 download_proxy 拿两条路地址，走节点代理端口 7893。
+- 你要下载/访问**国内**资源 → 走本机直连端口 7892（或直接不用代理）。
 - 你要排查「某个软件/域名到底走了代理还是直连」→ 用 list_connections 看实时连接、list_domain_rules 看分流规则。
 - 你要切换节点、看节点延迟、测连通性 → 用 list_nodes / switch_node / test_node_delay / node_health / check_network。
 - 你要实测「两条路到某个目标谁更快」→ 用 probe_route（返回两条路各自的延迟 + 下载速度对比 + 结论）。
@@ -62,7 +62,7 @@ SERVER_INSTRUCTIONS = """你是「魔法代理」这个本机代理软件的使�
 ## 两条路怎么选（核心决策）
 1. 先调用 download_proxy（可选带 url 参数）拿到两条路地址和「建议」。
 2. 拿不准、或这次下载很重要（大文件/模型/关键 API）→ 调 probe_route {"url":"目标地址"}，实测两条路到这个目标的真实延迟 + 下载吞吐，看数据拍板。别再凭「国内/国外」瞎猜：你的本机可能直连国外也通，也可能代理节点比直连还慢。
-3. 建议/实测只是参考，最终由你判断：目标是国内 → 坐火车（7892）；目标是国外 → 坐飞机（7893）。
+3. 建议/实测只是参考，最终由你判断：目标是国内 → 本机直连（7892）；目标是国外 → 节点代理（7893）。
 4. 把下载/请求送进你选定的端口。送进去之后 mihomo 不会再二次判断，你选哪条就是哪条。
 
 ## 注意
@@ -106,8 +106,32 @@ MIHOMO_BIN = _MIHOMO_RUNTIME_BIN if os.path.exists(_MIHOMO_RUNTIME_BIN) \
 # 常放在它们自己的 .app/Contents/Resources/ 下，用 resources 关键词会误杀它们。
 MIHOMO_PGREP_PATTERN = 'magic-agent/runtime/bin/mihomo'
 API = 'http://127.0.0.1:19091'
+# 本地 HTTP 桥接鉴权令牌。首次启动自动生成并持久化，避免任意网页通过
+# localhost CSRF 直接调用代理控制工具。
+HTTP_BRIDGE_TOKEN_PATH = os.path.expanduser('~/Library/Application Support/magic-agent/http-bridge.token')
+HTTP_BRIDGE_TOKEN = ''
+
+
+def load_http_bridge_token():
+    """读取或生成 HTTP 桥接令牌（0600），返回当前令牌。"""
+    global HTTP_BRIDGE_TOKEN
+    try:
+        with open(HTTP_BRIDGE_TOKEN_PATH) as f:
+            token = f.read().strip()
+    except OSError:
+        token = ''
+    if not token:
+        import secrets
+        token = secrets.token_hex(32)
+        os.makedirs(os.path.dirname(HTTP_BRIDGE_TOKEN_PATH), exist_ok=True)
+        with open(HTTP_BRIDGE_TOKEN_PATH, 'w') as f:
+            f.write(token)
+        os.chmod(HTTP_BRIDGE_TOKEN_PATH, 0o600)
+    HTTP_BRIDGE_TOKEN = token
+    return token
+
 # 「两条路」端口（与 src-tauri/src/mihomo.rs 保持一致）：
-#   坐飞机（走代理）→ 无条件 PROXY；坐火车（直连）→ 无条件 DIRECT。
+#   7893 端口 → 无条件 PROXY；7892 端口 → 无条件 DIRECT。
 # 决策权在智能体，mihomo 不做国内外自动分流。
 PROXY_PORT = 7893
 DIRECT_PORT = 7892
@@ -245,12 +269,62 @@ def system_proxy_enabled():
         return False
 
 
-def set_system_proxy(enable, port=7891):
-    """开/关 macOS 系统代理（与 Rust 侧 system_proxy.rs::set_system_proxy 一致）。
-    enable=True 时把 HTTP/HTTPS/SOCKS 都指向 127.0.0.1:port 并开启；
-    enable=False 只关闭开关（不动已配置的地址，便于下次快速恢复）。
-    注意：networksetup 可能需要管理员权限，失败会抛异常。"""
-    # 网络服务列表（跳过蓝牙/USB/Thunderbolt 等虚拟口，避免误设）
+def _parse_proxy_detail(out):
+    """解析 -get*proxy 真实输出（2026-09-23 实机实测，Darwin 25.6）：
+        Enabled: Yes
+        Server: 127.0.0.1
+        Port: 7891
+        Authenticated Proxy Enabled: 0
+    返回 (enabled, port)。末行 "Authenticated Proxy Enabled" 不得被当成 Enabled 行。"""
+    enabled, port = False, 0
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith('Enabled:'):
+            enabled = s.split(':', 1)[1].strip().lower() == 'yes'
+        elif s.startswith('Port:'):
+            try:
+                port = int(s.split(':', 1)[1].strip())
+            except ValueError:
+                port = 0
+    return enabled, port
+
+
+def verify_system_proxy(services, want_port, expect_on):
+    """逐服务读回系统代理真实状态，语义与 Rust 侧 system_proxy.rs::verify_system_proxy 一致：
+    -get*state 系列读命令在真机【不存在】（读写命令集不对称），唯一可靠读法是
+    -getwebproxy/-getsecurewebproxy/-getsocksfirewallproxy。
+    返回的 httpOn/httpsOn/socksOn = 该通道是否【达标】：
+    期望开 → Enabled:Yes 且端口精确等于 want_port；期望关 → Enabled:No。
+    单项读取失败记入 errors，不抛异常。"""
+    states = []
+    for svc in services:
+        errors = []
+        def _get(flag):
+            try:
+                p = subprocess.run(['/usr/sbin/networksetup', flag, svc],
+                                   capture_output=True, text=True, timeout=10)
+                if p.returncode != 0:
+                    errors.append(f'{flag}: {p.stderr.strip()}')
+                    return False
+                enabled, port = _parse_proxy_detail(p.stdout)
+                if enabled and port != want_port:
+                    errors.append(f'{flag}: 指向 127.0.0.1:{port} 而非期望端口 {want_port}')
+                return (enabled and port == want_port) if expect_on else (not enabled)
+            except Exception as e:
+                errors.append(f'{flag}: {e}')
+                return False
+        states.append({
+            'service': svc,
+            'httpOn': _get('-getwebproxy'),
+            'httpsOn': _get('-getsecurewebproxy'),
+            'socksOn': _get('-getsocksfirewallproxy'),
+            'errors': errors,
+        })
+    return states
+
+
+def list_network_services():
+    """网络服务列表（跳过蓝牙/USB/Thunderbolt 等虚拟口，避免误设）。与 Rust 侧 list_services 一致。"""
     out = subprocess.run(['/usr/sbin/networksetup', '-listallnetworkservices'],
                          capture_output=True, text=True, timeout=10).stdout
     services = []
@@ -262,10 +336,23 @@ def set_system_proxy(enable, port=7891):
         if any(k in low for k in ('asterisk', 'bluetooth', 'iphone', 'thunderbolt', 'bridge')):
             continue
         services.append(s)
+    return services
+
+
+def set_system_proxy(enable, port=7891):
+    """开/关 macOS 系统代理并【逐服务回读对账】（与 Rust 侧 set_system_proxy 一致）。
+    旧实现的 any_ok（任一服务任一命令成功即报成功）是"假账"根源，已废弃：
+    现在设置后逐个 -get* 读回，返回如实的
+    {enabled, allOk, mismatched:[服务名], services:[{service,httpOn,httpsOn,socksOn,errors}]}。
+    部分失败不抛异常（系统代理可能改了半套），由调用方看 allOk/mismatched；
+    仅当没有任何服务可操作时才抛。
+    enable=True 把 HTTP/HTTPS/SOCKS 指向 127.0.0.1:port 并开启；
+    enable=False 只关开关（不动地址，便于快速恢复）。"""
+    services = list_network_services()
     if not services:
         raise RuntimeError('未检测到网络服务，无法设置系统代理')
     port_str = str(port)
-    any_ok, first_err = False, ''
+    write_errors = {}
     for svc in services:
         if enable:
             cmds = [['-setwebproxy', svc, '127.0.0.1', port_str],
@@ -280,18 +367,51 @@ def set_system_proxy(enable, port=7891):
                     ['-setsocksfirewallproxystate', svc, 'off']]
         for c in cmds:
             p = subprocess.run(['/usr/sbin/networksetup'] + c, capture_output=True, text=True, timeout=15)
-            if p.returncode == 0:
-                any_ok = True
-            elif not first_err:
-                first_err = p.stderr.strip()
-    if not any_ok:
-        raise RuntimeError(f'设置系统代理失败（可能需管理员权限）：{first_err}')
+            if p.returncode != 0:
+                write_errors.setdefault(svc, []).append(f'{c[0]}: {p.stderr.strip()}')
+    states = verify_system_proxy(services, port, enable)
+    # *_On 语义 = 该通道是否达标（判定已封装在 verify 内），直接三与
+    mismatched = []
+    for st in states:
+        if not (st['httpOn'] and st['httpsOn'] and st['socksOn']) or st['errors']:
+            mismatched.append(st['service'])
+    for svc in write_errors:
+        if svc not in mismatched:
+            mismatched.append(svc)
+    all_ok = bool(states) and not write_errors and not mismatched
+    return {'enabled': system_proxy_enabled(), 'allOk': all_ok,
+            'mismatched': mismatched, 'services': states}
+
+
+def _snake_to_camel(s):
+    """snake_case → camelCase，与 Rust config.rs 的 normalize_keys_to_camel 对齐。"""
+    if '_' not in s:
+        return s
+    parts = s.split('_')
+    return parts[0] + ''.join(p[:1].upper() + p[1:] for p in parts[1:])
+
+
+def _normalize_keys(obj):
+    """递归把 dict 的所有 snake_case 键规整为 camelCase。
+    与 Rust 侧 load() 对齐：旧版 config 可能遗留 snake_case 键，
+    不规整则 MCP 侧 cfg.get('apiSecret') 找不到、误生成新 secret，
+    导致 config 同时出现 apiSecret/api_secret 两个键。"""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            nk = _snake_to_camel(k)
+            # 若 camelCase 键已存在（混合配置），后出现的覆盖先出现的
+            out[nk] = _normalize_keys(v)
+        return out
+    if isinstance(obj, list):
+        return [_normalize_keys(i) for i in obj]
+    return obj
 
 
 def read_config():
     try:
         with open(CONFIG_PATH) as f:
-            return json.load(f)
+            return _normalize_keys(json.load(f))
     except Exception as e:
         return {'error': str(e)}
 
@@ -429,16 +549,20 @@ def generate_config(cfg):
     lines.append('  auto-detect-interface: true')
     lines.append('  dns-hijack:')
     lines.append('    - any:53')
-    # 两条物理上分开的「路」：智能体自己选飞机（走代理）还是火车（直连），
+    # 两条物理上分开的「路」：智能体自己选节点代理(7893)还是本机直连(7892)，
     # 进去后 mihomo 不再二次判断。这与 Rust 侧 build_conf 保持一致。
+    # 安全红线：listeners 必须逐条显式 listen: 127.0.0.1——allow-lan: false 管不到
+    # listeners，不写 listen 时 mihomo 默认绑 0.0.0.0，局域网可匿名白嫖本机节点出口。
     lines.append('listeners:')
     lines.append('  - name: proxy-only')
     lines.append('    type: mixed')
     lines.append(f'    port: {PROXY_PORT}')
+    lines.append('    listen: 127.0.0.1')
     lines.append('    proxy: PROXY')
     lines.append('  - name: direct-only')
     lines.append('    type: mixed')
     lines.append(f'    port: {DIRECT_PORT}')
+    lines.append('    listen: 127.0.0.1')
     lines.append('    proxy: DIRECT')
     lines.append('log-level: info')
     lines.append('allow-lan: false')
@@ -503,9 +627,9 @@ def generate_config(cfg):
         lines.append(f'      - "{_yaml_quote(str(n["name"]))}"')
     lines.append('')
     lines.append('rules:')
-    # 两条「路」的死锁分流（IN-PORT 双保险）：从飞机端口(7893)进来的无条件走 PROXY、
-    # 从火车端口(7892)进来的无条件 DIRECT。优先级高于下面所有规则（含 GEOSITE,cn）。
-    # 用户要求 mihomo 不自动判断国内外，决策权在智能体——自己选坐飞机还是坐火车。
+    # 两条「路」的死锁分流（IN-PORT 双保险）：从 7893 端口进来的无条件走 PROXY、
+    # 从 7892 端口进来的无条件 DIRECT。优先级高于下面所有规则（含 GEOSITE,cn）。
+    # 用户要求 mihomo 不自动判断国内外，决策权在智能体——自己选走代理还是直连。
     lines.append(f'  - IN-PORT,{PROXY_PORT},PROXY')
     lines.append(f'  - IN-PORT,{DIRECT_PORT},DIRECT')
     # 默认直连架构（与 src-tauri/src/mihomo.rs build_rules 保持一致，顺序即优先级）：
@@ -537,7 +661,9 @@ def generate_config(cfg):
         elif t == 'direct':
             target = 'DIRECT'
         else:
-            target = f'NODE-{_sanitize_node_name(str(t))}'
+            valid_nodes = {str(n.get('name', '')).strip() for n in nodes}
+            target = (f'NODE-{_sanitize_node_name(str(t))}'
+                      if str(t).strip() in valid_nodes else 'PROXY')
         lines.append(f'  - DOMAIN-SUFFIX,{domain},{target}')
     # 第2层续：国内域名/IP 清单直连，解决"软件设为代理后访问百度绕美国"
     lines.append('  - GEOSITE,cn,DIRECT')
@@ -549,7 +675,9 @@ def generate_config(cfg):
         paths = app_paths_for(app['id'])
         if app.get('mode') == 'proxy':
             node = app.get('node')
-            target = f'NODE-{_sanitize_node_name(str(node))}' if node else 'PROXY'
+            valid_nodes = {str(n.get('name', '')).strip() for n in nodes}
+            target = (f'NODE-{_sanitize_node_name(str(node))}'
+                      if node and str(node).strip() in valid_nodes else 'PROXY')
         else:
             target = 'DIRECT'
         for p in paths:
@@ -633,6 +761,13 @@ def hot_reload_rules(cfg):
         return False
     except Exception:
         return False
+
+
+def _rule_reload_result(cfg, saved_message):
+    """规则写入后的统一返回：保存成功但热更新失败必须明确暴露，不能假报 ok。"""
+    if mihomo_running() and not hot_reload_rules(cfg):
+        return {'ok': False, 'message': f'{saved_message}，但规则热更新失败；代理仍在运行，请重试或重启代理'}
+    return {'ok': True, 'message': saved_message}
 
 
 def _is_private_or_reserved_ip(ip):
@@ -838,23 +973,23 @@ def download_proxy(args):
     """智能体下载前先看「两条路」并自己拍板，mihomo 不替它自动分流。
 
     返回两条物理上分开的入口（HTTP 代理地址）：
-      - 坐飞机（走代理）：http://127.0.0.1:7893 —— 无条件走节点（PROXY）
-      - 坐火车（直连）：http://127.0.0.1:7892 —— 无条件直连（DIRECT）
+      - 节点代理：http://127.0.0.1:7893 —— 无条件走节点（PROXY）
+      - 本机直连：http://127.0.0.1:7892 —— 进来的流量全部本机直连
     调用方（智能体）根据自己这次下载的目标自己决定走哪条，然后自行把请求
     送进对应端口。两条路是「死锁」的：进去后不再被 mihomo 二次判断国内外。
 
     可选参数 url：若给出，会返回该域名的「建议」（仅建议，不替智能体决定）：
-      - 国内域名/IP → 建议坐火车（direct）
-      - 其余 → 建议坐飞机（proxy）
+      - 国内域名/IP → 建议直连（direct）
+      - 其余 → 建议代理（proxy）
     """
     running = mihomo_running()
     if not running:
         return {'running': False, 'error': '代理未运行，两条路都不可用。请先 start_proxy'}
     resp = {
         'running': True,
-        'proxy': f'http://127.0.0.1:{PROXY_PORT}',      # 坐飞机：无条件走代理
-        'direct': f'http://127.0.0.1:{DIRECT_PORT}',    # 坐火车：无条件直连
-        'note': '两条路物理分开、死锁分流：proxy 端口无条件走节点，direct 端口无条件直连，'
+        'proxy': f'http://127.0.0.1:{PROXY_PORT}',      # 节点代理：进来的流量全部走节点
+        'direct': f'http://127.0.0.1:{DIRECT_PORT}',    # 本机直连：进来的流量全部本机直连
+        'note': '两条路物理分开、死锁分流：proxy 端口进来的流量全部走节点，direct 端口进来的流量全部本机直连，'
                 'mihomo 不做国内外自动判断。请自行决定本次下载走哪条。',
     }
     url = _str_arg(args, 'url')
@@ -886,7 +1021,7 @@ def download_proxy(args):
                 is_cn = False
             suggestion = 'direct' if is_cn else 'proxy'
         resp['suggestion'] = suggestion
-        resp['suggestion_note'] = '仅建议，不替智能体决定：国内域名/IP 建议坐火车(direct)，其余建议坐飞机(proxy)。'
+        resp['suggestion_note'] = '仅建议，不替智能体决定：国内域名/IP 建议直连(direct)，其余建议代理(proxy)。'
     return resp
 
 
@@ -1096,20 +1231,33 @@ def _http_get_via(proxy_port, url, timeout=12, read_bytes=256 * 1024):
         return {'ok': True, 'status': status, 'latency_ms': first_byte_ms,
                 'read_ms': int(read_ms), 'bytes': n, 'speed_mbps': speed_mbps}
     except Exception as e:
-        return {'ok': False, 'latency_ms': int((time.time() - t0) * 1000), 'error': str(e)[:120]}
+        # 友好化常见网络错误：原始 urllib/ssl 堆栈（如 "UNEXPECTED_EOF_WHILE_READING"）
+        # 对调用者没有行动价值，翻译成结论性描述。
+        raw = str(e)
+        if 'UNEXPECTED_EOF' in raw or 'EOF occurred' in raw:
+            msg = 'TLS 连接被中断（目标被墙/链路重置）'
+        elif 'timed out' in raw or 'timeout' in raw.lower():
+            msg = '连接超时'
+        elif 'Connection refused' in raw:
+            msg = '连接被拒绝（本机代理端口未监听？）'
+        elif 'Name or service not known' in raw or 'nodename nor servname' in raw:
+            msg = 'DNS 解析失败'
+        else:
+            msg = raw[:120]
+        return {'ok': False, 'latency_ms': int((time.time() - t0) * 1000), 'error': msg}
 
 
 def probe_route(args):
-    """【拿不准走哪条路时先调这个】实测「坐火车(直连 7892) vs 坐飞机(代理 7893)」
+    """【拿不准走哪条路时先调这个】实测「本机直连(7892) vs 节点代理(7893)」
     到同一个目标 url 的真实延迟 + 下载吞吐，返回对比数据 + 一个明确结论。
 
     这是让两条路「变聪明」的核心：不再凭「国内/国外」规则猜，而是实测路况。
     - 目标国外站时：可能直连也通（你的本机本来就能上外网），但走代理更稳/更快；
     - 目标国内站时：直连几乎必然更快，走代理是绕远路。
-    探完你就知道这次下载/访问该坐飞机还是坐火车，不用猜。
+    探完你就知道这次下载/访问该走代理还是直连，不用猜。
 
     参数 url 必填。可选 timeout（秒，默认 12）、read_bytes（测吞吐读的字节数，默认 256KB）。
-    返回 example：{"url":..., "routes":[{"name":"火车/直连","port":7892,...},{"name":"飞机/代理","port":7893,...}],
+    返回 example：{"url":..., "routes":[{"name":"本机直连 127.0.0.1:7892","port":7892,...},{"name":"节点代理 127.0.0.1:7893","port":7893,...}],
                   "conclusion":"..."}
     """
     url = _str_arg(args, 'url')
@@ -1128,7 +1276,10 @@ def probe_route(args):
     read_bytes = max(1024, min(read_bytes, 4 * 1024 * 1024))  # 兜底：1KB~4MB
 
     routes = []
-    for label, port in (('火车/直连', DIRECT_PORT), ('飞机/代理', PROXY_PORT)):
+    # 命名直白写清「做什么+地址端口」，不再只用比喻：直连（不经过任何节点）
+    # vs 代理（流量从当前选中的国外节点出去）。
+    for label, port in ((f'本机直连 127.0.0.1:{DIRECT_PORT}', DIRECT_PORT),
+                        (f'节点代理 127.0.0.1:{PROXY_PORT}', PROXY_PORT)):
         r = _http_get_via(port, url, timeout=timeout, read_bytes=read_bytes)
         r['name'] = label
         r['port'] = port
@@ -1141,12 +1292,11 @@ def probe_route(args):
     elif len(ok) == 1:
         conclusion = f'只有「{ok[0]["name"]}」能连通，另一条路失败。'
     else:
-        best = max(ok, key=lambda r: (r.get('speed_mbps') or 0))
         direct = routes[0]
         proxy = routes[1]
-        faster = '火车/直连' if (direct.get('speed_mbps') or 0) >= (proxy.get('speed_mbps') or 0) else '飞机/代理'
-        conclusion = (f'两条路都通。实测吞吐：火车/直连 {direct.get("speed_mbps")} Mbps vs '
-                      f'飞机/代理 {proxy.get("speed_mbps")} Mbps，{faster}更快。'
+        faster = direct['name'] if (direct.get('speed_mbps') or 0) >= (proxy.get('speed_mbps') or 0) else proxy['name']
+        conclusion = (f'两条路都通。实测吞吐：{direct["name"]} {direct.get("speed_mbps")} Mbps vs '
+                      f'{proxy["name"]} {proxy.get("speed_mbps")} Mbps，{faster}更快。'
                       f'延迟：直连 {direct.get("latency_ms")}ms / 代理 {proxy.get("latency_ms")}ms。')
     return {'url': url, 'routes': routes, 'conclusion': conclusion}
 
@@ -1166,6 +1316,17 @@ def _keychain_password(host, user):
     if p.returncode != 0:
         return None
     return p.stdout.strip()
+
+
+def _keychain_key(host, user):
+    """从 macOS Keychain 读取 SSH 私钥内容（与 Rust 端 key_account 共用同一 account）。"""
+    account = f'ssh-key-{user}@{host}'
+    p = subprocess.run(['/usr/bin/security', 'find-generic-password',
+                        '-s', KEYCHAIN_SERVICE, '-a', account, '-w'],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        return None
+    return p.stdout
 
 
 def _active_server():
@@ -1222,6 +1383,21 @@ def ssh_exec(command, timeout_secs=15):
     user = srv.get('user', 'root')
     auth = srv.get('auth', 'password')
     key_path = srv.get('keyPath') or srv.get('key_path') or srv.get('private_key')
+    key_tmp = None
+    if auth == 'key':
+        if key_path:
+            key_path = os.path.expanduser(str(key_path))
+        else:
+            key_content = _keychain_key(host, user)
+            if key_content:
+                import tempfile
+                fd, key_tmp = tempfile.mkstemp(prefix='magic-ssh-key-')
+                try:
+                    os.write(fd, key_content.encode())
+                finally:
+                    os.close(fd)
+                os.chmod(key_tmp, 0o600)
+                key_path = key_tmp
 
     args = ['/usr/bin/ssh', '-o', 'StrictHostKeyChecking=accept-new',
             '-o', 'ConnectTimeout=10', '-o', 'BatchMode=no']
@@ -1230,7 +1406,7 @@ def ssh_exec(command, timeout_secs=15):
     # 密钥认证：显式指定 -i 密钥文件（不依赖 ~/.ssh/config 的 Host 别名匹配，
     # 因为这里用的是 host IP 而非别名）。展开 ~ 到绝对路径。
     if auth == 'key' and key_path:
-        args += ['-i', os.path.expanduser(key_path)]
+        args += ['-i', key_path]
     args += [f'{user}@{host}', command]
 
     pw = _keychain_password(host, user) if auth == 'password' else None
@@ -1265,6 +1441,12 @@ def ssh_exec(command, timeout_secs=15):
             return ('', f'SSH 执行超时（>{timeout_secs}s）', -1)
         except FileNotFoundError:
             return ('', '未找到 /usr/bin/ssh。', -1)
+        finally:
+            if key_tmp:
+                try:
+                    os.remove(key_tmp)
+                except OSError:
+                    pass
     return (p.stdout or '', p.stderr or '', p.returncode)
 
 
@@ -1405,6 +1587,50 @@ def doctor():
     return report
 
 
+def check_update(args):
+    """检查更新（只读，不下载）。按 config.updateChannel 选端点拉 latest.json，
+    与编译进 App 的版本号（src-tauri/tauri.conf.json）比较。
+    github 通道经节点代理端口访问（GitHub 直连不通）；local 通道直连本机 7878。"""
+    cfg = read_config()
+    if 'error' in cfg:
+        return cfg
+    channel = cfg.get('updateChannel') or 'github'
+    if channel not in ('local', 'github'):
+        channel = 'github'
+    endpoint = ('http://127.0.0.1:7878/latest.json' if channel == 'local' else
+                'https://github.com/Zunzhe966/magic-agent/releases/latest/download/latest.json')
+    # 当前版本：以源码 tauri.conf.json 为准（与本机开发构建一致）
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, 'src-tauri', 'tauri.conf.json')) as f:
+            current = json.load(f)['version']
+    except Exception as e:
+        return {'error': f'读取当前版本失败: {e}'}
+    # 拉远端 feed：github 走节点代理（被墙），local 直连
+    try:
+        if channel == 'local':
+            feed = json.loads(_OPENER.open(endpoint, timeout=5).read())
+        else:
+            proxy_handler = urllib.request.ProxyHandler(
+                {'http': f'http://127.0.0.1:{PROXY_PORT}', 'https': f'http://127.0.0.1:{PROXY_PORT}'})
+            opener = urllib.request.build_opener(proxy_handler)
+            feed = json.loads(opener.open(endpoint, timeout=15).read())
+    except Exception as e:
+        hint = ('（本地通道需先 cd scripts/updater-feed && python3 -m http.server 7878 --bind 127.0.0.1）'
+                if channel == 'local' else '（GitHub 需要节点代理可用，确认代理已启动）')
+        return {'error': f'检查更新失败: {e} {hint}', 'channel': channel, 'endpoint': endpoint}
+    latest = feed.get('version', '')
+    def _v(s):
+        try:
+            return tuple(int(x) for x in str(s).split('.'))
+        except Exception:
+            return (0,)
+    return {'currentVersion': current, 'latestVersion': latest,
+            'available': _v(latest) > _v(current),
+            'channel': channel, 'endpoint': endpoint,
+            'notes': feed.get('notes')}
+
+
 def check_network():
     results = {}
     # baidu 直连测试
@@ -1447,6 +1673,7 @@ TOOLS = [
     {'name': 'list_apps', 'description': '列出软件分流配置'},
     {'name': 'set_app_mode', 'description': '设置某 App 的代理模式（proxy/direct）'},
     {'name': 'check_network', 'description': '测试国内外网站连通性'},
+    {'name': 'check_update', 'description': '检查 App 是否有新版本（只检查，不下载不安装）。按当前更新通道（local=本机 7878 测试源 / github=正式发布源）拉取版本信息并与当前版本比较。安装更新请让用户在 App 设置页操作'},
     {'name': 'list_domain_rules', 'description': '列出域名分流规则（哪些域名走代理/直连）'},
     {'name': 'add_domain_rule', 'description': '添加或更新域名分流规则，target 支持 proxy（走代理）、direct（直连）或节点名（走指定节点），建议带 reason 注明服务于哪个密钥/软件。如 {"domain":"openai.com","target":"示例节点","reason":"WorkBuddy 的 OpenAI 密钥"}'},
     {'name': 'remove_domain_rule', 'description': '删除域名分流规则，如 {"domain":"github.com"}'},
@@ -1455,44 +1682,147 @@ TOOLS = [
     {'name': 'list_free_models', 'description': '列出 OpenRouter 免费模型台账（读 docs/free_models.json，按厂商分组）。过期时用 scripts/openrouter_free_models.py 刷新。可选 {"vendor":"google"} 按厂商过滤'},
     {'name': 'list_connections', 'description': '实时连接快照：当前每条流量走的主机、命中规则、出口节点、进程、上下行字节，按下载量排序。诊断"某软件流量到底走了哪"用这个，不要裸 curl。可选 {"limit":50}'},
     {'name': 'node_health', 'description': '全部节点健康探测（延迟）+ fallback 组状态（当前实际使用哪个节点）。判断节点是否挂了/故障转移是否生效用这个'},
-    {'name': 'download_proxy', 'description': '【下载/访问网络前先调这个】拿到魔法代理的两条路入口并自己决定走哪条。返回坐飞机=走代理 http://127.0.0.1:7893（访问国外 GitHub/Google/HuggingFace/国外 API 用这条）、坐火车=直连 http://127.0.0.1:7892（访问国内百度/腾讯/阿里用这条）。魔法代理不替你自动分流，决策权在你：目标在国外走 7893，国内走 7892。可选 {"url":"https://..."} 会附带该域名的国内/国外建议（仅建议，最终你拍板）'},
+    {'name': 'download_proxy', 'description': '【下载/访问网络前先调这个】拿到魔法代理的两条路入口并自己决定走哪条。返回节点代理 http://127.0.0.1:7893（访问国外 GitHub/Google/HuggingFace/国外 API 用这条）、本机直连 http://127.0.0.1:7892（访问国内百度/腾讯/阿里用这条）。魔法代理不替你自动分流，决策权在你：目标在国外走 7893，国内走 7892。可选 {"url":"https://..."} 会附带该域名的国内/国外建议（仅建议，最终你拍板）'},
     {'name': 'doctor', 'description': '一键自检（排查任何"代理好像不对劲"先跑这个）：配置完整性、进程与 API 鉴权、fallback 故障转移组、secret、规则顺序、节点健康，返回各检查项 OK/FAIL'},
     {'name': 'install_privileged_helper', 'description': '一次性安装特权控制器（弹一次管理员授权）：root 控制脚本 + sudoers 白名单。安装后代理启停/重载全部零弹窗。强烈建议安装'},
-    {'name': 'probe_route', 'description': '【拿不准走哪条路时先调这个】实测「坐火车(直连 7892) vs 坐飞机(代理 7893)」到同一个目标 url 的真实延迟 + 下载吞吐，返回对比数据和明确结论。不再凭国内/国外规则猜，而是实测路况后拍板。如 {"url":"https://huggingface.co"}，可选 {"timeout":12,"read_bytes":262144}'},
+    {'name': 'probe_route', 'description': '【拿不准走哪条路时先调这个】实测「本机直连(7892) vs 节点代理(7893)」到同一个目标 url 的真实延迟 + 下载吞吐，返回对比数据和明确结论。不再凭国内/国外规则猜，而是实测路况后拍板。如 {"url":"https://huggingface.co"}，可选 {"timeout":12,"read_bytes":262144}'},
     {'name': 'server_metrics', 'description': '云服务器一键探针：远程采集当前激活云服务器的 CPU/内存/磁盘/带宽/负载/在线时长，返回结构化数据。用于远程看清服务器状态（而不是盲敲命令）。未配置服务器时会返回配置指引'},
+    {'name': 'list_servers', 'description': '列出已配置的云服务器（SSH），标出当前激活的一台。server_metrics/ssh_exec 都作用于「当前激活」服务器，想确认或更换作用目标时先用这个看列表'},
+    {'name': 'select_server', 'description': '切换当前激活的云服务器（server_metrics/ssh_exec 的作用目标随之改变），如 {"id":"ssh-1.2.3.4"}。可用 id 从 list_servers 获取'},
+    {'name': 'set_system_proxy', 'description': '开/关 macOS 系统代理（指向 127.0.0.1:7891），如 {"enabled":true}。注意：TUN 模式下内核已接管全局流量，一般不需要开系统代理；单独调整时才用。关系统代理前请确认代理内核在运行，否则用户会断网'},
     {'name': 'ssh_exec', 'description': '在当前激活的云服务器上非交互式执行一条命令并返回 (stdout, stderr, exit_code)。用于远程管理服务器（装软件、看日志、跑脚本）。密码从 macOS Keychain 读取，不落盘。如 {"command":"df -h","timeout_secs":15}'},
     {'name': 'guide', 'description': '返回魔法代理的完整使用手册（是什么、何时用、两条路怎么选、各工具配合关系）。首次接触魔法代理、或不确定该怎么用它时，先调这个了解全貌'},
 ]
 
 
+def _tool_schema(properties=None, required=None):
+    schema = {
+        'type': 'object',
+        'properties': properties or {},
+        'additionalProperties': False,
+    }
+    if required:
+        schema['required'] = list(required)
+    return schema
+
+
+_TOOL_SCHEMAS = {
+    'status': _tool_schema({'verify': {'type': 'boolean',
+                                       'description': 'true 时额外做逐服务 networksetup 读回对账（较慢），返回 services/mismatched/allOk'}}),
+    'start_proxy': _tool_schema(),
+    'stop_proxy': _tool_schema(),
+    'list_nodes': _tool_schema(),
+    'switch_node': _tool_schema({'name': {'type': 'string'}}, ['name']),
+    'list_apps': _tool_schema(),
+    'set_app_mode': _tool_schema({
+        'id': {'type': 'string'},
+        'mode': {'type': 'string', 'enum': ['proxy', 'direct']},
+        'node': {'type': ['string', 'null']},
+    }, ['id', 'mode']),
+    'check_network': _tool_schema(),
+    'check_update': _tool_schema(),
+    'list_domain_rules': _tool_schema(),
+    'add_domain_rule': _tool_schema({
+        'domain': {'type': 'string'},
+        'target': {'type': 'string'},
+        'reason': {'type': 'string'},
+    }, ['domain', 'target']),
+    'remove_domain_rule': _tool_schema({'domain': {'type': 'string'}}, ['domain']),
+    'fetch_subscription': _tool_schema({'url': {'type': 'string'}}, ['url']),
+    'test_node_delay': _tool_schema({'name': {'type': 'string'}}, ['name']),
+    'list_free_models': _tool_schema({'vendor': {'type': 'string'}}),
+    'list_connections': _tool_schema({'limit': {'type': 'integer'}}),
+    'node_health': _tool_schema(),
+    'download_proxy': _tool_schema({'url': {'type': 'string'}}),
+    'doctor': _tool_schema(),
+    'install_privileged_helper': _tool_schema(),
+    'probe_route': _tool_schema({
+        'url': {'type': 'string'},
+        'timeout': {'type': 'integer'},
+        'read_bytes': {'type': 'integer'},
+    }, ['url']),
+    'server_metrics': _tool_schema(),
+    'list_servers': _tool_schema(),
+    'select_server': _tool_schema({'id': {'type': 'string'}}, ['id']),
+    'set_system_proxy': _tool_schema({'enabled': {'type': 'boolean'}}, ['enabled']),
+    'ssh_exec': _tool_schema({
+        'command': {'type': 'string'},
+        'timeout_secs': {'type': 'integer'},
+    }, ['command']),
+    'guide': _tool_schema(),
+}
+
+for _tool in TOOLS:
+    _tool['inputSchema'] = _TOOL_SCHEMAS[_tool['name']]
+
+
 def call_tool(name, args):
+    # 参数加严：多传的未知参数直接报错，不静默吞掉。
+    # 教训：曾误传 policy='direct'（正确参数是 target），旧逻辑静默忽略并存成
+    # 默认值 proxy，规则方向整个反了还不报错。
+    schema = _TOOL_SCHEMAS.get(name)
+    if schema is not None and isinstance(args, dict):
+        allowed = set((schema.get('properties') or {}).keys())
+        unknown = sorted(set(args.keys()) - allowed)
+        if unknown:
+            return {'error': f'未知参数: {unknown}。{name} 支持的参数: {sorted(allowed) or "（无参数）"}'}
     if name == 'status':
         running = mihomo_running()
         cfg = read_config()
         selected = cfg.get('selectedNode', '') if 'error' not in cfg else '?'
         # systemProxy 用【真实】系统状态（scutil），而非 config 里的意图字段，
         # 否则 App 重启后 config 仍是 true 但实际代理已关，会误导调用方。
-        return {'running': running, 'selectedNode': selected,
-                'systemProxy': system_proxy_enabled(),
-                'nodes': len(cfg.get('nodes', [])) if 'error' not in cfg else 0}
+        result = {'running': running, 'selectedNode': selected,
+                  'systemProxy': system_proxy_enabled(),
+                  'nodes': len(cfg.get('nodes', [])) if 'error' not in cfg else 0}
+        # P0-1：verify=true 时做逐服务读回对账（默认关，避免轮询放大 networksetup 开销）。
+        # 达标口径：系统代理开着 → 应精确指向 127.0.0.1:7891；关着 → 应全部 Enabled:No。
+        # 与 set 路径同用 verify_system_proxy(services, want_port, expect_on)。
+        if (args or {}).get('verify'):
+            services = list_network_services()
+            enabled = result['systemProxy']
+            states = verify_system_proxy(services, 7891, enabled)
+            mismatched = [st['service'] for st in states
+                          if not (st['httpOn'] and st['httpsOn'] and st['socksOn']) or st['errors']]
+            result['verify'] = {'allOk': bool(states) and not mismatched,
+                                'mismatched': mismatched, 'services': states}
+        return result
     elif name == 'start_proxy':
         if mihomo_running():
-            # 内核已在运行，但系统代理可能是关的（App 重启/外部改动）。
-            # 旧实现直接返回"已在运行"就不管了 → 用户以为开了实际没开。
-            if not system_proxy_enabled():
+            # 内核已在运行时，把系统代理对齐到 config.systemProxy 声明的秩序：
+            # - systemProxy=true 但实际关着（App 重启/外部改动）→ 补开
+            # - systemProxy=false（TUN）但实际开着（外部软件/手动改动）→ 关掉，
+            #   TUN 已接管全局，系统代理开着是双开冗余。
+            want_proxy = False
+            cfg0 = read_config()
+            if 'error' not in cfg0:
+                want_proxy = bool(cfg0.get('systemProxy'))
+            actual = system_proxy_enabled()
+            if want_proxy and not actual:
                 try:
                     set_system_proxy(True)
                     return {'ok': True, 'message': '内核已在运行，已补开系统代理'}
                 except Exception as e:
                     return {'ok': False, 'message': f'内核在运行但开系统代理失败: {e}'}
+            if not want_proxy and actual:
+                try:
+                    set_system_proxy(False)
+                    return {'ok': True, 'message': '内核已在运行，已关掉多余的系统代理（TUN 模式不需要）'}
+                except Exception as e:
+                    return {'ok': False, 'message': f'内核在运行但关系统代理失败: {e}'}
             return {'ok': True, 'message': '代理已在运行'}
         regenerate_config()
         pid = start_mihomo()
-        try:
-            set_system_proxy(True)
-        except Exception as e:
-            return {'ok': True, 'pid': pid, 'message': f'代理内核已启动，但系统代理开启失败: {e}'}
-        return {'ok': True, 'pid': pid, 'message': '代理已启动（需要管理员授权）'}
+        # 与 Rust 侧 start_proxy 一致：只在 config.systemProxy=true 时才开系统代理。
+        # TUN 模式下不开（TUN 已接管全局，再开系统代理是双开冗余）。
+        cfg2 = read_config()
+        if cfg2.get('systemProxy'):
+            try:
+                set_system_proxy(True)
+            except Exception as e:
+                return {'ok': True, 'pid': pid, 'message': f'代理内核已启动，但系统代理开启失败: {e}'}
+            return {'ok': True, 'pid': pid, 'message': '代理已启动，系统代理已开（需要管理员授权）'}
+        return {'ok': True, 'pid': pid, 'message': '代理已启动（TUN 模式，系统代理保持关闭）'}
     elif name == 'stop_proxy':
         stop_mihomo()
         # 与 Rust 侧 stop_proxy 保持一致：停内核后必须关系统代理，
@@ -1554,11 +1884,11 @@ def call_tool(name, args):
         if not found:
             cfg['apps'].append({'id': app_id, 'mode': mode, 'confirmed': True, 'node': None})
         write_config(cfg)
-        if mihomo_running():
-            hot_reload_rules(cfg)
-        return {'ok': True, 'message': f'{app_id} -> {mode}'}
+        return _rule_reload_result(cfg, f'{app_id} -> {mode}')
     elif name == 'check_network':
         return check_network()
+    elif name == 'check_update':
+        return check_update(args)
     elif name == 'list_domain_rules':
         cfg = read_config()
         if 'error' in cfg:
@@ -1592,12 +1922,10 @@ def call_tool(name, args):
             rules.append(entry)
         cfg['domainRules'] = rules
         write_config(cfg)
-        if mihomo_running():
-            hot_reload_rules(cfg)
         msg = f'域名规则已保存: {domain} -> {target}'
         if reason:
             msg += f'（{reason}）'
-        return {'ok': True, 'message': msg}
+        return _rule_reload_result(cfg, msg)
     elif name == 'remove_domain_rule':
         cfg = read_config()
         if 'error' in cfg:
@@ -1606,9 +1934,7 @@ def call_tool(name, args):
         rules = cfg.get('domainRules', [])
         cfg['domainRules'] = [r for r in rules if r['domain'] != domain]
         write_config(cfg)
-        if mihomo_running():
-            hot_reload_rules(cfg)
-        return {'ok': True, 'message': f'域名规则已删除: {domain}'}
+        return _rule_reload_result(cfg, f'域名规则已删除: {domain}')
     elif name == 'fetch_subscription':
         url = _str_arg(args, 'url')
         if not url:
@@ -1647,8 +1973,14 @@ def call_tool(name, args):
             r = _OPENER.open(req, timeout=8)
             resp = json.loads(r.read())
             return {'node': node_name, 'delay_ms': resp.get('delay')}
+        except urllib.error.HTTPError as e:
+            # mihomo API 对不存在的组返回 404；对超时节点返回 500/503。
+            # 原始 "HTTP Error 404: Not Found" 对智能体不友好，转成可行动的描述。
+            if e.code == 404:
+                return {'node': node_name, 'error': f'节点不存在: {node_name}（用 list_nodes 看可用节点）'}
+            return {'node': node_name, 'error': f'测延迟失败（HTTP {e.code}）：节点可能不可用'}
         except Exception as e:
-            return {'node': node_name, 'error': str(e)}
+            return {'node': node_name, 'error': f'测延迟失败: {e}'}
     elif name == 'list_free_models':
         return list_free_models_impl(args)
     elif name == 'list_connections':
@@ -1677,6 +2009,56 @@ def call_tool(name, args):
         return probe_route(args)
     elif name == 'server_metrics':
         return server_metrics(args)
+    elif name == 'list_servers':
+        # 与 Rust AppConfig::active_server 对齐：activeServerId 优先，缺省取首项
+        cfg = read_config()
+        if 'error' in cfg:
+            return {'error': cfg['error']}
+        servers = cfg.get('servers', [])
+        active_id = cfg.get('activeServerId') or (servers[0].get('id') if servers else None)
+        return {'activeServerId': active_id,
+                'servers': [{'id': s.get('id'), 'name': s.get('name'),
+                             'host': s.get('host'), 'port': s.get('port'),
+                             'user': s.get('user'), 'auth': s.get('auth'),
+                             'active': s.get('id') == active_id} for s in servers]}
+    elif name == 'select_server':
+        # 与 Rust 侧 select_ssh_server 行为对齐：切 activeServerId 并同步 ssh* 旧字段
+        sid = _str_arg(args, 'id')
+        if not sid:
+            return {'error': 'id is required（用 list_servers 看可用 id）'}
+        cfg = read_config()
+        if 'error' in cfg:
+            return {'error': cfg['error']}
+        target = next((s for s in cfg.get('servers', []) if s.get('id') == sid), None)
+        if not target:
+            return {'error': f'服务器不存在: {sid}（用 list_servers 看可用 id）'}
+        cfg['activeServerId'] = target['id']
+        cfg['sshHost'] = target.get('host')
+        cfg['sshPort'] = target.get('port', 22)
+        cfg['sshUser'] = target.get('user', 'root')
+        cfg['sshAuth'] = target.get('auth', 'password')
+        cfg['sshPrivateKey'] = target.get('keyPath')
+        write_config(cfg)
+        return {'ok': True, 'message': f'已切换到服务器 {target.get("name")}（{target.get("host")}）',
+                'activeServerId': target['id']}
+    elif name == 'set_system_proxy':
+        enabled = (args or {}).get('enabled')
+        if not isinstance(enabled, bool):
+            return {'error': 'enabled 必填（true/false），如 {"enabled":true}'}
+        try:
+            result = set_system_proxy(enabled)
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+        # 持久化意图到 config.systemProxy，与 Rust 侧 set_system_proxy 命令保持一致——
+        # 否则 App 重启后按旧意图恢复，实际状态与配置脱节。
+        cfg = read_config()
+        if 'error' not in cfg:
+            cfg['systemProxy'] = enabled
+            write_config(cfg)
+        # P0-1：透出逐服务对账结果，不再只报"开没开"
+        return {'ok': True, 'systemProxy': system_proxy_enabled(),
+                'allOk': result.get('allOk'), 'mismatched': result.get('mismatched'),
+                'services': result.get('services')}
     elif name == 'ssh_exec':
         # 参数健壮化：timeout_secs 可能是字符串/非法值，直接 int() 会抛异常
         try:
@@ -1766,48 +2148,81 @@ def main():
             print(json.dumps(resp, ensure_ascii=False), flush=True)
 
 
-def serve_http(port=19092):
-    """本地 HTTP 桥接：把 HTTP 请求转成 JSON-RPC 调 handle_message。
-
-    支持两种客户端形态：
-    - Streamable HTTP（POST /mcp，Content-Type: application/json，body 为 JSON-RPC）
-    - 简单 POST /rpc（body 为 JSON-RPC），GET /health 健康检查
-
-    仅绑定 127.0.0.1，且强制校验请求来源为本机，避免局域网内其他机器操控代理。
-    """
-    import threading
+def create_http_server(port=19092):
+    """创建本地 HTTP 桥接服务器；端口可注入，便于测试。"""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+    token = HTTP_BRIDGE_TOKEN or load_http_bridge_token()
+    bound_ports = [port]
+
     class Handler(BaseHTTPRequestHandler):
-        server_version = 'magic-agent-mcp/0.1'
+        server_version = 'magic-agent-extension/0.1'
+
+        def _origin_allowed(self):
+            origin = self.headers.get('Origin')
+            if origin is None:
+                return True
+            return origin in (
+                f'http://127.0.0.1:{bound_ports[0]}',
+                f'http://localhost:{bound_ports[0]}',
+                f'http://[::1]:{bound_ports[0]}',
+            )
+
+        def _authenticated(self):
+            return self.headers.get('Authorization', '') == 'Bearer ' + token
+
+        def _request_authorized(self):
+            # 无 Origin = 本机原生客户端（launchd/脚本/CLI）。浏览器请求一定带
+            # Origin，必须同时通过来源白名单和 bearer 校验，保留 CSRF 防护。
+            origin = self.headers.get('Origin')
+            return origin is None or self._authenticated()
 
         def _send(self, code, body, ctype='application/json'):
             try:
                 self.send_response(code)
                 self.send_header('Content-Type', ctype)
                 self.send_header('Content-Length', str(len(body)))
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+                origin = self.headers.get('Origin')
+                if origin and self._origin_allowed():
+                    self.send_header('Access-Control-Allow-Origin', origin)
+                    self.send_header('Vary', 'Origin')
+                    self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+                    self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
                 self.end_headers()
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
         def _read_body(self):
-            length = int(self.headers.get('Content-Length', '0') or '0')
+            try:
+                length = int(self.headers.get('Content-Length', '0') or '0')
+            except ValueError:
+                return b''
             return self.rfile.read(length) if length > 0 else b''
 
         def do_OPTIONS(self):
+            if not self._origin_allowed():
+                self._send(403, b'forbidden origin', ctype='text/plain')
+                return
             self._send(204, b'', ctype='text/plain')
 
         def do_GET(self):
-            if self.path.rstrip('/') in ('', '/health', '/mcp'):
+            if not self._request_authorized():
+                self._send(401, b'bearer token required', ctype='text/plain')
+                return
+            if self.path.rstrip('/') in ('', '/health', '/extension'):
                 self._send(200, json.dumps({'ok': True, 'server': 'magic-agent'}).encode())
             else:
                 self._send(404, b'not found', ctype='text/plain')
 
         def do_POST(self):
-            if self.path.rstrip('/') not in ('/mcp', '/rpc', '/mcp/'):
+            if not self._origin_allowed():
+                self._send(403, b'forbidden origin', ctype='text/plain')
+                return
+            if not self._request_authorized():
+                self._send(401, b'bearer token required', ctype='text/plain')
+                return
+            if self.path.rstrip('/') not in ('/extension', '/rpc'):
                 self._send(404, b'not found', ctype='text/plain')
                 return
             raw = self._read_body()
@@ -1818,22 +2233,27 @@ def serve_http(port=19092):
                 return
             resp = handle_message(msg)
             if resp is None:
-                # 通知类消息（如 notifications/initialized）无需响应，按 MCP 约定返回 202
                 self._send(202, b'', ctype='text/plain')
                 return
             self._send(200, json.dumps(resp, ensure_ascii=False).encode())
 
         def log_message(self, *args):
-            pass  # 静默，避免污染 stdio 输出
+            pass
 
+    server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+    bound_ports[0] = server.server_address[1]
+    server.daemon_threads = True
+    return server
+
+
+def serve_http(port=19092):
+    """本地 HTTP 桥接：把 HTTP 请求转成 JSON-RPC 调 handle_message。"""
     try:
-        # 多线程：并发工具调用（如 list_connections + doctor）互不阻塞
-        server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
-        server.daemon_threads = True
+        server = create_http_server(port)
     except OSError as e:
-        print(f'[magic-agent-mcp] 无法绑定 127.0.0.1:{port}: {e}', file=sys.stderr)
+        print(f'[magic-agent-extension] 无法绑定 127.0.0.1:{port}: {e}', file=sys.stderr)
         sys.exit(1)
-    print(f'[magic-agent-mcp] HTTP bridge listening on http://127.0.0.1:{port}/mcp', file=sys.stderr, flush=True)
+    print(f'[magic-agent-extension] HTTP bridge listening on http://127.0.0.1:{port}/extension', file=sys.stderr, flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

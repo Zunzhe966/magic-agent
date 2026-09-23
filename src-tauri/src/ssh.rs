@@ -52,7 +52,12 @@ impl SshManager {
     /// 1) 显式路径（展开 ~ 且存在）→ 直接用；
     /// 2) 否则回退 Keychain 里保存的私钥内容 → 落成 0600 临时文件。
     /// 返回 (私钥路径, 临时文件)。临时文件用毕必须由调用方 remove_file。
-    fn resolve_key_file(host: &str, user: &str, auth: &str, key: &Option<String>) -> (Option<String>, Option<PathBuf>) {
+    fn resolve_key_file(
+        host: &str,
+        user: &str,
+        auth: &str,
+        key: &Option<String>,
+    ) -> (Option<String>, Option<PathBuf>) {
         if let Some(k) = key.as_deref().map(|k| k.trim()).filter(|k| !k.is_empty()) {
             let expanded = expand_ssh_key(k);
             if expanded.exists() {
@@ -61,7 +66,7 @@ impl SshManager {
         }
         if auth == "key" {
             if let Ok(content) = keychain::get(&Self::key_account(host, user)) {
-                if content.contains("PRIVATE KEY") {
+                if looks_like_private_key(&content) {
                     if let Ok(p) = write_temp_key(&content) {
                         let path = p.to_string_lossy().to_string();
                         return (Some(path), Some(p));
@@ -88,28 +93,45 @@ impl SshManager {
         }
     }
 
-    pub fn connect(&self, host: String, port: u16, user: String, auth: String, password: Option<String>, key: Option<String>) -> Result<SshSession, String> {
+    pub fn connect(
+        &self,
+        host: String,
+        port: u16,
+        user: String,
+        auth: String,
+        password: Option<String>,
+        key: Option<String>,
+    ) -> Result<SshSession, String> {
         self.disconnect();
 
         // 如果调用方没有给明文密码，尝试从 Keychain 读取
         let pw_from_chain = keychain::get(&Self::password_account(&host, &user)).ok();
-        let password = password
-            .filter(|p| !p.trim().is_empty())
-            .or(pw_from_chain);
+        let password = password.filter(|p| !p.trim().is_empty()).or(pw_from_chain);
 
         // 私钥解析：显式路径优先；否则回退 Keychain 中保存的私钥内容
         // （落成 0600 临时文件供 -i 使用，认证通过后即删）
         let (key_file, key_tmp) = Self::resolve_key_file(&host, &user, &auth, &key);
 
         let mut args: Vec<String> = vec![
-            "/usr/bin/ssh".into(), "-tt".into(),
-            "-o".into(), "StrictHostKeyChecking=accept-new".into(),
-            "-o".into(), "ServerAliveInterval=15".into(),
-            "-o".into(), "ServerAliveCountMax=3".into(),
-            "-o".into(), "ConnectTimeout=10".into(),
+            "/usr/bin/ssh".into(),
+            "-tt".into(),
+            "-o".into(),
+            "StrictHostKeyChecking=accept-new".into(),
+            "-o".into(),
+            "ServerAliveInterval=15".into(),
+            "-o".into(),
+            "ServerAliveCountMax=3".into(),
+            "-o".into(),
+            "ConnectTimeout=10".into(),
         ];
-        if port != 22 { args.push("-p".into()); args.push(port.to_string()); }
-        if let Some(ref k) = key_file { args.push("-i".into()); args.push(k.clone()); }
+        if port != 22 {
+            args.push("-p".into());
+            args.push(port.to_string());
+        }
+        if let Some(ref k) = key_file {
+            args.push("-i".into());
+            args.push(k.clone());
+        }
         args.push(format!("{}@{}", user, host));
 
         let use_password = auth == "password" && password.as_deref().unwrap_or("").len() > 0;
@@ -134,11 +156,15 @@ impl SshManager {
             // stdin 保持打开供后续 interact 输入，正好兼任终端输入通道。
             let mut s = Command::new("/usr/bin/expect");
             s.arg("-f").arg("-");
-            s.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            s.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             let mut spawned = match s.spawn() {
                 Ok(c) => c,
                 Err(e) => {
-                    if let Some(p) = &key_tmp { let _ = std::fs::remove_file(p); }
+                    if let Some(p) = &key_tmp {
+                        let _ = std::fs::remove_file(p);
+                    }
                     return Err(format!("启动 SSH 失败: {e}"));
                 }
             };
@@ -151,11 +177,16 @@ impl SshManager {
             spawned
         } else {
             let mut c = Command::new(&args[0]);
-            c.args(&args[1..]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            c.args(&args[1..])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             match c.spawn() {
                 Ok(ch) => ch,
                 Err(e) => {
-                    if let Some(p) = &key_tmp { let _ = std::fs::remove_file(p); }
+                    if let Some(p) = &key_tmp {
+                        let _ = std::fs::remove_file(p);
+                    }
                     return Err(format!("启动 SSH 失败: {e}"));
                 }
             }
@@ -185,7 +216,9 @@ impl SshManager {
             if let Some(msg) = ssh_failure_reason(&text) {
                 let _ = child.kill();
                 let _ = child.wait();
-                if let Some(p) = &key_tmp { let _ = std::fs::remove_file(p); }
+                if let Some(p) = &key_tmp {
+                    let _ = std::fs::remove_file(p);
+                }
                 return Err(msg);
             }
             if ssh_login_confirmed(&text) {
@@ -193,8 +226,17 @@ impl SshManager {
             }
             if let Ok(Some(_)) = child.try_wait() {
                 let _ = child.wait();
-                if let Some(p) = &key_tmp { let _ = std::fs::remove_file(p); }
-                let tail: String = text.chars().rev().take(200).collect::<String>().chars().rev().collect();
+                if let Some(p) = &key_tmp {
+                    let _ = std::fs::remove_file(p);
+                }
+                let tail: String = text
+                    .chars()
+                    .rev()
+                    .take(200)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
                 return Err(if text.trim().is_empty() {
                     "SSH 进程已退出，未建立会话".to_string()
                 } else {
@@ -207,7 +249,9 @@ impl SshManager {
                 if text.trim().is_empty() {
                     let _ = child.kill();
                     let _ = child.wait();
-                    if let Some(p) = &key_tmp { let _ = std::fs::remove_file(p); }
+                    if let Some(p) = &key_tmp {
+                        let _ = std::fs::remove_file(p);
+                    }
                     return Err("SSH 连接超时（12 秒内无任何输出）".to_string());
                 }
                 break;
@@ -215,19 +259,30 @@ impl SshManager {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         // 认证通过后 ssh 已读过私钥，临时文件即可删除
-        if let Some(p) = &key_tmp { let _ = std::fs::remove_file(p); }
+        if let Some(p) = &key_tmp {
+            let _ = std::fs::remove_file(p);
+        }
 
         *self.child.lock().unwrap() = Some(child);
         *self.stdin.lock().unwrap() = Some(stdin);
 
-        let sess = SshSession { id: format!("ssh-{}@{}", user, host), host, port, user, status: "connected".to_string() };
+        let sess = SshSession {
+            id: format!("ssh-{}@{}", user, host),
+            host,
+            port,
+            user,
+            status: "connected".to_string(),
+        };
         *self.session.lock().unwrap() = Some(sess.clone());
         Ok(sess)
     }
 
     pub fn disconnect(&self) {
         let mut child = self.child.lock().unwrap();
-        if let Some(mut c) = child.take() { let _ = c.kill(); let _ = c.wait(); }
+        if let Some(mut c) = child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
         *self.stdin.lock().unwrap() = None;
         *self.session.lock().unwrap() = None;
         if let Ok(mut b) = self.buffer.lock() {
@@ -258,7 +313,9 @@ impl SshManager {
 
     pub fn read(&self) -> Result<Vec<u8>, String> {
         let mut buf = self.buffer.lock().unwrap();
-        if buf.is_empty() { return Ok(vec![]); }
+        if buf.is_empty() {
+            return Ok(vec![]);
+        }
         Ok(std::mem::take(&mut *buf))
     }
 
@@ -284,11 +341,17 @@ impl SshManager {
 
         let mut args = vec![
             "/usr/bin/ssh".to_string(),
-            "-o".to_string(), "StrictHostKeyChecking=accept-new".to_string(),
-            "-o".to_string(), "ConnectTimeout=10".to_string(),
-            "-o".to_string(), "BatchMode=no".to_string(),
+            "-o".to_string(),
+            "StrictHostKeyChecking=accept-new".to_string(),
+            "-o".to_string(),
+            "ConnectTimeout=10".to_string(),
+            "-o".to_string(),
+            "BatchMode=no".to_string(),
         ];
-        if port != 22 { args.push("-p".to_string()); args.push(port.to_string()); }
+        if port != 22 {
+            args.push("-p".to_string());
+            args.push(port.to_string());
+        }
         // 私钥解析：显式路径优先；否则回退 Keychain 中保存的私钥内容
         // （落成 0600 临时文件，用完即删）。修复：此前只认 key_path，
         // 粘贴私钥内容保存的服务器（路径为 None）探测/执行永远失败。
@@ -305,9 +368,12 @@ impl SshManager {
         let output = if use_password {
             let pw = pw_from_chain.unwrap_or_default();
             let escaped = pw
-                .replace('\\', "\\\\").replace('"', "\\\"")
-                .replace('$', "\\$").replace('`', "\\`")
-                .replace('[', "\\[").replace(']', "\\]");
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('$', "\\$")
+                .replace('`', "\\`")
+                .replace('[', "\\[")
+                .replace(']', "\\]");
             // expect 脚本：等 password 提示后送密码，命令跑完自然 eof。
             // 关键修复：`expect eof` 后用 `wait` 取回 spawn 子进程的真实退出码并 `exit $rc`，
             // 否则 expect 进程恒以 0 退出，远端命令失败也报成功，server_metrics 拿空输出却 probe_ok。
@@ -318,11 +384,17 @@ impl SshManager {
                 escaped
             );
             let mut s = Command::new("/usr/bin/expect");
-            s.arg("-f").arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            s.arg("-f")
+                .arg("-")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             let mut spawned = match s.spawn() {
                 Ok(c) => c,
                 Err(e) => {
-                    if let Some(p) = &key_tmp { let _ = std::fs::remove_file(p); }
+                    if let Some(p) = &key_tmp {
+                        let _ = std::fs::remove_file(p);
+                    }
                     return Err(format!("启动 SSH 失败: {e}"));
                 }
             };
@@ -335,19 +407,29 @@ impl SshManager {
             // 用 drain 线程持续读取管道（与 connect 函数同样的模式）。
             let stdout_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
             let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-            let drain_out = spawned.stdout.take().map(|p| spawn_drain(p, stdout_buf.clone()));
-            let drain_err = spawned.stderr.take().map(|p| spawn_drain(p, stderr_buf.clone()));
+            let drain_out = spawned
+                .stdout
+                .take()
+                .map(|p| spawn_drain(p, stdout_buf.clone()));
+            let drain_err = spawned
+                .stderr
+                .take()
+                .map(|p| spawn_drain(p, stderr_buf.clone()));
             // wait_with_output 不设超时会永久挂起（SSH 卡住 / 密码错误等待重试）。
             // 用 try_wait 轮询 + 超时 kill，配合 expect 脚本内 `set timeout`，避免挂死 Tauri 命令线程。
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_secs(timeout_secs + 10);
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs + 10);
             let output: std::process::Output;
             loop {
                 match spawned.try_wait() {
                     Ok(Some(status)) => {
                         // join drain 线程确保所有缓冲输出已收集完毕
-                        if let Some(h) = drain_out { let _ = h.join(); }
-                        if let Some(h) = drain_err { let _ = h.join(); }
+                        if let Some(h) = drain_out {
+                            let _ = h.join();
+                        }
+                        if let Some(h) = drain_err {
+                            let _ = h.join();
+                        }
                         output = std::process::Output {
                             status,
                             stdout: stdout_buf.lock().unwrap().clone(),
@@ -357,14 +439,18 @@ impl SshManager {
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        if let Some(p) = &key_tmp { let _ = std::fs::remove_file(p); }
+                        if let Some(p) = &key_tmp {
+                            let _ = std::fs::remove_file(p);
+                        }
                         return Err(e.to_string());
                     }
                 }
                 if std::time::Instant::now() >= deadline {
                     let _ = spawned.kill();
                     let _ = spawned.wait();
-                    if let Some(p) = &key_tmp { let _ = std::fs::remove_file(p); }
+                    if let Some(p) = &key_tmp {
+                        let _ = std::fs::remove_file(p);
+                    }
                     return Err(format!("SSH 执行超时（>{}s）", timeout_secs));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -385,21 +471,33 @@ impl SshManager {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    if let Some(p) = &key_tmp { let _ = std::fs::remove_file(p); }
+                    if let Some(p) = &key_tmp {
+                        let _ = std::fs::remove_file(p);
+                    }
                     return Err(format!("启动 SSH 失败: {e}"));
                 }
             };
             let stdout_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
             let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-            let drain_out = spawned.stdout.take().map(|p| spawn_drain(p, stdout_buf.clone()));
-            let drain_err = spawned.stderr.take().map(|p| spawn_drain(p, stderr_buf.clone()));
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_secs(timeout_secs + 10);
+            let drain_out = spawned
+                .stdout
+                .take()
+                .map(|p| spawn_drain(p, stdout_buf.clone()));
+            let drain_err = spawned
+                .stderr
+                .take()
+                .map(|p| spawn_drain(p, stderr_buf.clone()));
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs + 10);
             loop {
                 match spawned.try_wait() {
                     Ok(Some(status)) => {
-                        if let Some(h) = drain_out { let _ = h.join(); }
-                        if let Some(h) = drain_err { let _ = h.join(); }
+                        if let Some(h) = drain_out {
+                            let _ = h.join();
+                        }
+                        if let Some(h) = drain_err {
+                            let _ = h.join();
+                        }
                         let output = std::process::Output {
                             status,
                             stdout: stdout_buf.lock().unwrap().clone(),
@@ -409,21 +507,27 @@ impl SshManager {
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        if let Some(p) = &key_tmp { let _ = std::fs::remove_file(p); }
+                        if let Some(p) = &key_tmp {
+                            let _ = std::fs::remove_file(p);
+                        }
                         return Err(e.to_string());
                     }
                 }
                 if std::time::Instant::now() >= deadline {
                     let _ = spawned.kill();
                     let _ = spawned.wait();
-                    if let Some(p) = &key_tmp { let _ = std::fs::remove_file(p); }
+                    if let Some(p) = &key_tmp {
+                        let _ = std::fs::remove_file(p);
+                    }
                     return Err(format!("SSH 执行超时（>{}s）", timeout_secs));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         };
         // 命令已结束，临时私钥文件立即删除
-        if let Some(p) = &key_tmp { let _ = std::fs::remove_file(p); }
+        if let Some(p) = &key_tmp {
+            let _ = std::fs::remove_file(p);
+        }
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -452,8 +556,18 @@ fn write_temp_key(content: &str) -> Result<PathBuf, String> {
     Ok(p)
 }
 
+/// 只认实际 OpenSSH/PEM 私钥头，避免把任意 Keychain 值写成临时密钥文件。
+fn looks_like_private_key(content: &str) -> bool {
+    let t = content.trim_start();
+    t.starts_with("-----BEGIN OPENSSH ") && t.contains("PRIVATE KEY-----")
+        || (t.starts_with("-----BEGIN ") && t.contains("PRIVATE KEY-----"))
+}
+
 /// 后台线程：把管道输出持续汇入共享 buffer（stdout/stderr 共用）
-fn spawn_drain<R: Read + Send + 'static>(mut r: R, buf: Arc<Mutex<Vec<u8>>>) -> std::thread::JoinHandle<()> {
+fn spawn_drain<R: Read + Send + 'static>(
+    mut r: R,
+    buf: Arc<Mutex<Vec<u8>>>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut tmp = [0u8; 4096];
         loop {
@@ -472,10 +586,19 @@ fn spawn_drain<R: Read + Send + 'static>(mut r: R, buf: Arc<Mutex<Vec<u8>>>) -> 
 /// 从 SSH 输出里识别确定性失败指纹，命中即返回用户可读的失败原因
 fn ssh_failure_reason(text: &str) -> Option<String> {
     let checks: &[(&str, &str)] = &[
-        ("MAGIC_AUTH_FAILED", "认证失败：密码错误（服务器拒绝了密码）"),
-        ("MAGIC_AUTH_TIMEOUT", "认证超时：服务器 20 秒内未出现密码提示"),
+        (
+            "MAGIC_AUTH_FAILED",
+            "认证失败：密码错误（服务器拒绝了密码）",
+        ),
+        (
+            "MAGIC_AUTH_TIMEOUT",
+            "认证超时：服务器 20 秒内未出现密码提示",
+        ),
         ("Permission denied", "认证失败：密码或私钥被服务器拒绝"),
-        ("Enter passphrase for key", "私钥带密码短语（passphrase），当前不支持"),
+        (
+            "Enter passphrase for key",
+            "私钥带密码短语（passphrase），当前不支持",
+        ),
         ("Connection refused", "连接被拒：目标端口未开放 SSH 服务"),
         ("Operation timed out", "连接超时：网络不可达或端口被拦"),
         ("Connection timed out", "连接超时：网络不可达或端口被拦"),
@@ -507,13 +630,39 @@ fn ssh_login_confirmed(text: &str) -> bool {
     matches!(text.trim_end().chars().last(), Some('#') | Some('$'))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_key_detection_accepts_openssh_and_pem() {
+        assert!(looks_like_private_key(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nabc"
+        ));
+        assert!(looks_like_private_key(
+            "  -----BEGIN RSA PRIVATE KEY-----\nabc"
+        ));
+        assert!(looks_like_private_key(
+            "-----BEGIN EC PRIVATE KEY-----\nabc"
+        ));
+    }
+
+    #[test]
+    fn private_key_detection_rejects_unrelated_keychain_values() {
+        assert!(!looks_like_private_key("some password"));
+        assert!(!looks_like_private_key("-----BEGIN PUBLIC KEY-----\nabc"));
+    }
+}
+
 pub fn expand_ssh_key(path: &str) -> PathBuf {
     let p = PathBuf::from(path);
     if p.starts_with("~") {
         if let Some(home) = dirs::home_dir() {
             let mut np = home;
             let comps: Vec<_> = p.components().skip(1).collect();
-            for c in comps { np.push(c.as_os_str()); }
+            for c in comps {
+                np.push(c.as_os_str());
+            }
             return np;
         }
     }

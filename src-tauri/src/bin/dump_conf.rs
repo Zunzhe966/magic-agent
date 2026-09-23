@@ -6,7 +6,9 @@ use magic_agent_lib::settings_to_app_rules;
 fn main() {
     use std::io::Read;
     let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input).expect("读取 stdin 失败");
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .expect("读取 stdin 失败");
     let cfg: AppConfig = serde_json::from_str(&input).expect("config JSON 解析失败");
     // bin- 前缀条目不依赖文件系统扫描，两侧引擎可确定性对比；app- 条目跳过（路径需实机扫描）
     let path_lookup = std::collections::HashMap::new();

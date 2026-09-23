@@ -9,7 +9,16 @@ PORT=19092
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SERVER="${PROJECT_DIR}/mcp/server.py"
-[ -f "$SERVER" ] || SERVER="${HOME}/Desktop/魔法代理/mcp/server.py"
+if [ ! -f "$SERVER" ]; then
+  # 兼容安装后的目录名（历史上脚本曾写死「魔法代理」，实际包可能是「尊者魔法代理」）。
+  for candidate in "$HOME/Desktop/魔法代理/mcp/server.py" \
+                   "$HOME/Desktop/尊者魔法代理/mcp/server.py" \
+                   "$HOME/Applications/魔法代理/mcp/server.py" \
+                   "$HOME/Applications/尊者魔法代理/mcp/server.py"; do
+    if [ -f "$candidate" ]; then SERVER="$candidate"; break; fi
+  done
+fi
+[ -f "$SERVER" ] || { echo "找不到 mcp/server.py" >&2; exit 1; }
 PIDFILE="/tmp/magic-agent-mcp.pid"
 LOG="/tmp/magic-agent-mcp.log"
 

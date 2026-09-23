@@ -11,7 +11,15 @@ const SERVICE: &str = "com.magic.agent";
 pub fn store(account: &str, secret: &str) -> Result<String, String> {
     use std::io::Write;
     let mut child = Command::new("/usr/bin/security")
-        .args(["add-generic-password", "-s", SERVICE, "-a", account, "-w", "-U"])
+        .args([
+            "add-generic-password",
+            "-s",
+            SERVICE,
+            "-a",
+            account,
+            "-w",
+            "-U",
+        ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -19,9 +27,13 @@ pub fn store(account: &str, secret: &str) -> Result<String, String> {
         .map_err(|e| format!("调用 security 失败: {e}"))?;
     {
         let stdin = child.stdin.as_mut().ok_or("无法打开 security stdin")?;
-        stdin.write_all(secret.as_bytes()).map_err(|e| format!("写入 secret 失败: {e}"))?;
+        stdin
+            .write_all(secret.as_bytes())
+            .map_err(|e| format!("写入 secret 失败: {e}"))?;
     }
-    let out = child.wait_with_output().map_err(|e| format!("等待 security 失败: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("等待 security 失败: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(format!("写入 Keychain 失败: {err}"));
@@ -39,7 +51,9 @@ pub fn get(account: &str) -> Result<String, String> {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(format!("从 Keychain 读取失败: {err}"));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim_end_matches(['\n', '\r']).to_string())
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .trim_end_matches(['\n', '\r'])
+        .to_string())
 }
 
 /// 从 Keychain 删除。

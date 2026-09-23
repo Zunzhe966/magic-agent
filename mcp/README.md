@@ -5,7 +5,7 @@
 ## 是什么
 
 MCP（Model Context Protocol）是 AI 客户端与外部工具之间的标准协议。
-本 server 通过 stdio 与 AI 客户端通信，暴露 23 个工具，AI 可以：
+本 server 通过 stdio 与 AI 客户端通信，暴露 **27 个工具**（旧文档误写 23，已按 `TOOLS` 数组实际数量更正），AI 可以：
 
 - 查看代理状态、启动/停止代理
 - 列出节点、切换节点、测试节点延迟
@@ -15,6 +15,9 @@ MCP（Model Context Protocol）是 AI 客户端与外部工具之间的标准协
 - 测试国内外网络连通性
 - 双路探测（直连 vs 代理对比延迟/吞吐，用于路由决策）
 - 云服务器远程管理（采集 CPU/内存/磁盘/负载指标、非交互式执行命令）
+- 开关系统代理、切换激活服务器
+
+> 注意：本 server 的 SSH 能力 = 交互执行命令与指标采集，**不含端口转发/隧道**。
 
 ## 工具清单
 
@@ -36,12 +39,16 @@ MCP（Model Context Protocol）是 AI 客户端与外部工具之间的标准协
 | list_free_models | - | 列出可用的 OpenRouter 免费模型 |
 | list_connections | {limit} | 列出当前 mihomo 活动连接 |
 | node_health | - | 汇总各节点健康/延迟 |
-| download_proxy | {url} | 通过代理下载并返回内容 |
+| download_proxy | {url} | 返回两条路入口（7892 直连 / 7893 节点），由 AI 决定走哪条 |
 | doctor | - | 全链路自检（依赖/端口/配置） |
 | install_privileged_helper | - | 安装/校验特权 helper |
 | probe_route | {url} | 双路探测：直连 vs 代理的延迟/吞吐对比 |
 | server_metrics | - | 采集激活云服务器的 CPU/内存/磁盘/负载/网络 |
+| list_servers | - | 列出已保存的云服务器，标出激活的一台 |
+| select_server | {id} | 切换激活服务器（server_metrics/ssh_exec 作用目标随之变） |
 | ssh_exec | {command} | 在激活云服务器上非交互式执行命令 |
+| check_update | - | 只读检查新版本（安装需在 App 设置页操作） |
+| set_system_proxy | {enabled} | 开关 macOS 系统代理（指向 7891） |
 | guide | - | 输出帮助/使用说明 |
 
 ## 配置到 AI 客户端

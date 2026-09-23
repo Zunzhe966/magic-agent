@@ -59,7 +59,7 @@ body { background: var(--bg); color: var(--text); }
 .seg-btn { padding: 9px 14px; background: transparent; color: var(--muted); border: 0; cursor: pointer; font-size: 13px; }
 .seg-btn.on { background: var(--panel2); color: var(--text); }
 .apps-table { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
-.apps-row { display: grid; grid-template-columns: 2.2fr 1fr 1fr 2.8fr; align-items: center; gap: 14px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.apps-row { display: grid; grid-template-columns: 2.2fr .9fr 1fr 1.2fr 1fr 2.8fr; align-items: center; gap: 14px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
 .apps-row.head { background: var(--panel2); color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
 .apps-row:last-child { border-bottom: 0; }
 .app-name { display: flex; align-items: center; gap: 12px; }
@@ -109,3 +109,4 @@ body { background: var(--bg); color: var(--text); }
 .toast-info { border-left: 3px solid #4d7cfe; }
 .toast-success { border-left: 3px solid #3ecf8e; }
 .toast-error { border-left: 3px solid #ef5b6e; }
+.toast-warn { border-left: 3px solid #f5a623; }

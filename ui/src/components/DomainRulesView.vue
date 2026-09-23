@@ -64,7 +64,7 @@ function normalizeDomain(d) {
   s = s.replace(/^\.+/, '').replace(/\.+$/, '').replace(/^\*\./, '');
   return s.trim();
 }
-function save() {
+async function save() {
   const seen = new Set();
   const list = [];
   for (const r of rules.value) {
@@ -82,7 +82,12 @@ function save() {
   rules.value = list.map(r => ({ ...r }));
   dirty.value = false;
   nextTick(() => { ignoreWatch.value = false; });
-  emit('update', { domainRules: list });
+  const ok = await emit('update', { domainRules: list });
+  if (ok === false) {
+    dirty.value = true;
+    savedTip.value = '';
+    return;
+  }
   savedTip.value = '已保存 ' + list.length + ' 条规则';
   setTimeout(() => { savedTip.value = ''; }, 5000);
 }

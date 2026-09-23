@@ -52,20 +52,20 @@
     <section class="panel">
       <div class="panel-head">
         <h2>当前分流策略</h2>
-        <div class="mode-pill">{{ config?.autoGlobal === 'global' ? '全局' : '智能' }}</div>
+        <div class="mode-pill">双路显式选择</div>
       </div>
       <div class="policy-row" v-if="config">
         <div class="policy-item">
           <div class="policy-dot green"></div>
-          <div><strong>本机直连</strong><span>银行、本地服务、内网、系统软件</span></div>
+          <div><strong>本机与内网</strong><span>银行、本地服务、内网、系统软件自动直连</span></div>
         </div>
         <div class="policy-item">
           <div class="policy-dot blue"></div>
-          <div><strong>自动分流</strong><span>按目标域名/GeoIP 判断</span></div>
+          <div><strong>节点代理 / 本机直连</strong><span>端口 7893 全部走节点；端口 7892 全部本机直连</span></div>
         </div>
         <div class="policy-item">
           <div class="policy-dot orange"></div>
-          <div><strong>指定软件代理</strong><span>Chrome、Telegram、AI 工具等</span></div>
+          <div><strong>显式软件/域名规则</strong><span>按软件、域名或指定节点精确分流</span></div>
         </div>
       </div>
     </section>
