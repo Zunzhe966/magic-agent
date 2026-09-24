@@ -697,9 +697,8 @@ mod tests {
     fn load_recovers_real_corrupt_file() {
         // 用本机真实的 .corrupt 文件端到端验证：修复后 load() 应能恢复所有用户数据，
         // 不再因重复键回退默认配置。文件不存在则跳过（CI/其他机器）。
-        let p = std::path::PathBuf::from(
-            "/Users/someuser/Library/Application Support/magic-agent/config.json.corrupt",
-        );
+        // 路径运行时构造（与 config_path 同源），禁止硬编码用户名——本文件会开源推送。
+        let p = config_path().with_extension("json.corrupt");
         if !p.exists() {
             eprintln!("跳过：.corrupt 文件不存在");
             return;
@@ -742,9 +741,8 @@ mod tests {
         //   * backup_once 只在无备份时写，已有 .corrupt 不被坏文件覆盖；
         //   * 解析失败时用坏文件副本触发自愈；
         //   * recover_from_backup 能从真实 .corrupt 恢复全部用户数据。
-        let real_bak = std::path::PathBuf::from(
-            "/Users/someuser/Library/Application Support/magic-agent/config.json.corrupt",
-        );
+        // 路径运行时构造（与 config_path 同源），禁止硬编码用户名——本文件会开源推送。
+        let real_bak = config_path().with_extension("json.corrupt");
         if !real_bak.exists() {
             eprintln!("跳过：真实 .corrupt 不存在");
             return;
