@@ -42,9 +42,22 @@ else
     echo "    （未发现 system/party.mihomo.helper，跳过）"
 fi
 
+echo "==> 5/5 清理 root 权限的 mihomo 内核进程"
+# 只杀 uid=0 且命令行匹配本 App runtime 的 mihomo（绝不碰用户态实例）
+ROOT_MIHOMOS="$(ps -axo pid=,uid=,command= | awk '$2==0 && /mihomo -f .*magic-agent\/runtime\/mihomo\.yaml/ {print $1}')"
+if [ -n "$ROOT_MIHOMOS" ]; then
+    for pid in $ROOT_MIHOMOS; do
+        kill -9 "$pid" 2>/dev/null && echo "    ✅ 已终止 root mihomo PID $pid" || echo "    ⚠️  终止 PID $pid 失败（可能已退出）"
+    done
+else
+    echo "    （未发现 root 权限的 mihomo 进程）"
+fi
+
 echo ""
 echo "==> 卸载完成。验证："
 ls -la /etc/sudoers.d/magic-agent-mihomo 2>/dev/null && echo "  ⚠️  sudoers 仍存在！" || echo "  ✅ sudoers 白名单已删除"
 ls -la /usr/local/lib/magic-agent/mihomo-ctl.sh 2>/dev/null && echo "  ⚠️  控制脚本仍存在！" || echo "  ✅ root 控制脚本已删除"
+ps -axo pid=,uid=,command= | awk '$2==0 && /mihomo/ {print "  ⚠️  root mihomo 仍在: PID "$1}' 
+echo "  ✅ root mihomo 进程清理完成（无输出即已清空）"
 echo ""
 echo "现在可打开「尊者网络管理」App 或调用 MCP 启动代理——全程用户态，不再需要任何 root 授权。"
