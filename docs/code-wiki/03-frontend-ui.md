@@ -11,7 +11,7 @@
 
 ```
 ui/
-├── index.html              # 挂载点 <div id="app">，标题"尊者魔法代理"
+├── index.html              # 挂载点 <div id="app">，标题"尊者网络管理"
 ├── vite.config.js          # 端口 5173 strictPort，target safari13（macOS WebView）
 ├── package.json            # 0.2.10，devDep: vite 5 + @vitejs/plugin-vue
 └── src/

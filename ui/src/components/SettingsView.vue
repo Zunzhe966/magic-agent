@@ -65,7 +65,7 @@
 
     <section class="panel">
       <h2>关于</h2>
-      <p class="muted">尊者魔法代理 / Magic Agent</p>
+      <p class="muted">尊者网络管理 / Network Manager</p>
       <p class="muted">macOS Tauri 2 桌面代理软件 · Rust + Vue3</p>
       <p class="muted">当前更新通道：{{ updaterState.channelLabel }}</p>
     </section>

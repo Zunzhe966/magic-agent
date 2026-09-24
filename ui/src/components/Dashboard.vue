@@ -24,7 +24,7 @@
         <button class="btn small" @click="acceptDrift">接受现状</button>
       </div>
     </div>
-    <!-- 第三方代理清理：启动魔法代理前，把系统里其他代理全部关掉，回到干净状态 -->
+    <!-- 第三方代理清理：启动网络管理前，把系统里其他代理全部关掉，回到干净状态 -->
     <section class="panel" v-if="foreignProxies.length || cleanedNotice">
       <div class="panel-head">
         <h2>第三方代理</h2>

@@ -1,5 +1,5 @@
 #!/bin/bash
-# 魔法代理内核控制器（由 install_privileged_helper 安装到 /usr/local/lib/magic-agent/，root 所有）
+# 网络管理内核控制器（由 install_privileged_helper 安装到 /usr/local/lib/magic-agent/，root 所有）
 # 经 /etc/sudoers.d/ 白名单免密调用，实现零弹窗启停。
 # 以 sudo 运行（root），$HOME 是 /var/root，须从 SUDO_USER 反推真实用户 home，避免硬编码用户名。
 REAL_USER="${SUDO_USER:-$(/usr/bin/stat -f '%Su' /dev/console)}"
@@ -18,9 +18,10 @@ ERR="$RUNTIME/mihomo.err.log"
 PATTERN='magic-agent/runtime/bin/mihomo'
 
 ensure_bin() {
-  # App 安装名可能是「尊者魔法代理.app」或「魔法代理.app」，逐个探测（曾写死后者导致找不到）
+  # App 安装名可能是「尊者网络管理.app」，历史名「尊者魔法代理.app」/「魔法代理.app」也逐个探测（曾写死导致找不到）
   SRC=''
-  for c in "/Applications/尊者魔法代理.app/Contents/Resources/bin/mihomo" \
+  for c in "/Applications/尊者网络管理.app/Contents/Resources/bin/mihomo" \
+           "/Applications/尊者魔法代理.app/Contents/Resources/bin/mihomo" \
            "/Applications/魔法代理.app/Contents/Resources/bin/mihomo"; do
     if [ -f "$c" ]; then SRC="$c"; break; fi
   done

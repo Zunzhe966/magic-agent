@@ -1,5 +1,5 @@
 #!/bin/bash
-# 魔法代理 MCP HTTP 桥接守护脚本
+# 网络管理 MCP HTTP 桥接守护脚本
 # 用法: magic-agent-mcp.sh {start|stop|status|restart}
 # 拉起 mcp/server.py --http 19092，让 WorkBuddy 等 HTTP MCP 客户端接入。
 # 用 launchd（scripts 同级的 plist）或手动 start 常驻。
@@ -10,9 +10,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SERVER="${PROJECT_DIR}/mcp/server.py"
 if [ ! -f "$SERVER" ]; then
-  # 兼容安装后的目录名（历史上脚本曾写死「魔法代理」，实际包可能是「尊者魔法代理」）。
-  for candidate in "$HOME/Desktop/魔法代理/mcp/server.py" \
+  # 兼容安装后的目录名：新名「尊者网络管理」/「网络管理」，历史名「尊者魔法代理」/「魔法代理」也逐个探测
+  for candidate in "$HOME/Desktop/尊者网络管理/mcp/server.py" \
+                   "$HOME/Desktop/网络管理/mcp/server.py" \
+                   "$HOME/Desktop/魔法代理/mcp/server.py" \
                    "$HOME/Desktop/尊者魔法代理/mcp/server.py" \
+                   "$HOME/Applications/尊者网络管理/mcp/server.py" \
+                   "$HOME/Applications/网络管理/mcp/server.py" \
                    "$HOME/Applications/魔法代理/mcp/server.py" \
                    "$HOME/Applications/尊者魔法代理/mcp/server.py"; do
     if [ -f "$candidate" ]; then SERVER="$candidate"; break; fi

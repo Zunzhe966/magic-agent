@@ -110,7 +110,7 @@ PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 SHA256="$(shasum -a 256 "$TARGZ" | awk '{print $1}')"
 
 # ── 发布资产名必须是 ASCII ────────────────────────────────
-# 踩过的坑：GitHub Release 上传中文文件名时会被静默改写（如「尊者魔法代理.app.tar.gz」
+# 踩过的坑：GitHub Release 上传中文文件名时会被静默改写（如「尊者网络管理.app.tar.gz」
 # 变成「app.tar.gz」），导致 latest.json 里写的下载地址 404。
 # 对外发布的资产统一用 ASCII 名：magic-agent_<ver>_<arch>.app.tar.gz
 # 注意 macOS 下 uname -m 是 arm64，而 Tauri 平台标识用 aarch64，这里统一成 aarch64。
@@ -213,7 +213,7 @@ if [ "$PUBLISH" = "--publish" ]; then
   echo "==> 发布到 GitHub Releases（${GH_REPO} @ ${GH_TAG}）..."
   if ! gh release view "$GH_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
     gh release create "$GH_TAG" --repo "$GH_REPO" \
-      --title "尊者魔法代理 $VER" \
+      --title "尊者网络管理 $VER" \
       --notes "release $VER"
   fi
   gh release upload "$GH_TAG" \

@@ -4,8 +4,8 @@
       <div class="brand">
         <div class="brand-mark"></div>
         <div>
-          <div class="brand-name">魔法代理</div>
-          <div class="brand-sub">Magic Agent</div>
+          <div class="brand-name">尊者网络管理</div>
+          <div class="brand-sub">Network Manager</div>
         </div>
       </div>
       <nav class="nav">

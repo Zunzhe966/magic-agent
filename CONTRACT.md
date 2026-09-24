@@ -1,4 +1,4 @@
-# CONTRACT.md — 网络管理（现名：尊者魔法代理）项目宪法
+# CONTRACT.md — 尊者网络管理项目宪法
 
 > 代码合并顺序：改代码 → 更新本文件。本文件与其他文档冲突时，本文件优先。
 > 产品定位与重构路线：`docs/设计.md`（一键归序五步闭环）、`docs/重构计划.md`（P0/P1/P2）。
@@ -19,12 +19,12 @@
 **禁止手工 `cp` 覆盖 `/Applications` 来"发版"。** 必须走 `scripts/release.sh`：
 
 ```bash
-cd "/Volumes/A区/魔法代理" && bash scripts/release.sh <版本号>
+cd /path/to/尊者网络管理 && bash scripts/release.sh <版本号>
 ```
 
 它做三件事，缺一不可：
 1. 同步三处版本号（`tauri.conf.json` / `Cargo.toml` / `ui/package.json`）——必须始终一致。
-2. 构建 + 用 `~/.tauri/magic-agent.key` 签名，产出 `尊者魔法代理.app.tar.gz` + `.sig`。
+2. 构建 + 用 `~/.tauri/magic-agent.key` 签名，产出 `尊者网络管理.app.tar.gz` + `.sig`。
 3. 生成 `scripts/updater-feed/latest.json`（updater 更新源）。
 
 App 已内置 updater（`tauri.conf.json` → `plugins.updater.active=true`，endpoint `http://127.0.0.1:7878/latest.json`，`App.vue::checkForUpdateQuiet` 启动时静默检查）。**升级用户走自动更新，不重新下载安装包。**

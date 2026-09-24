@@ -202,7 +202,7 @@ pub async fn install_channel_update(app: AppHandle) -> Result<(), String> {
         .map_err(|e| format!("检查更新失败: {e}"))?
         .ok_or_else(|| "已是最新版本，无需安装".to_string())?;
 
-    // 让更新下载走魔法代理自己的 mihomo，不走系统直连国际出口。
+    // 让更新下载走网络管理自己的 mihomo，不走系统直连国际出口。
     // 否则几十兆 .app.tar.gz 直连 GitHub 慢得不可用——
     // 一个代理软件自己更新还慢，不可接受。
     //

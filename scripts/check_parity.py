@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """双规则引擎一致性校验：Rust build_rules vs Python generate_config。
 
-背景：魔法代理有两份规则生成逻辑（Rust 冷启动、Python MCP 热重载），
+背景：网络管理有两份规则生成逻辑（Rust 冷启动、Python MCP 热重载），
 历史上漂移过一次（域名/进程规则顺序颠倒）。此脚本用同一份样例配置
 分别喂给两侧引擎，对 rules 段逐行 diff，不一致则退出码 1。
 

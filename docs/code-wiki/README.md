@@ -1,4 +1,4 @@
-# 尊者魔法代理（Magic Agent）· Code Wiki
+# 尊者网络管理（Network Manager）· Code Wiki
 
 > 本目录是项目的**代码级结构化文档**（Code Wiki），面向需要阅读/修改/接手本项目源码的开发者。
 > 与产品文档的分工：`README.md`（怎么用）、`docs/设计.md`（为什么这么设计）、`CONTRACT.md`（架构红线）

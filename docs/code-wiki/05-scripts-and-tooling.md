@@ -95,7 +95,7 @@ scripts/
 - 以 sudo 运行（root），`$HOME` 是 `/var/root`，**从 `SUDO_USER` 反推真实用户 home**（避免硬编码用户名）。
 - 路径：`$USER_HOME/Library/Application Support/magic-agent/runtime/{bin/mihomo,mihomo.yaml,mihomo.log,mihomo.err.log}`。
 - `PATTERN='magic-agent/runtime/bin/mihomo'`——精确匹配本 App 常驻副本。**绝不能用宽泛的 `resources/bin/mihomo`**，否则会误杀 FlClash/Clash Verge 等第三方内核。
-- 命令：`start`（幂等；`ensure_bin` 探测 `/Applications/尊者魔法代理.app` 或 `魔法代理.app` 两处；**umask 077 + 存量日志/轮转 .old chmod 600**（2026-09-23 隐私修复，root 默认 umask 会把全机连接记录落成世界可读）；日志超 10 MB 轮转 `.old`；后台启动并回显 PID）/ `stop`（pkill）/ `reload`（HUP）/ `status`（pgrep）。
+- 命令：`start`（幂等；`ensure_bin` 探测 `/Applications/尊者网络管理.app`，历史名 `尊者魔法代理.app`/`魔法代理.app` 兜底；**umask 077 + 存量日志/轮转 .old chmod 600**（2026-09-23 隐私修复，root 默认 umask 会把全机连接记录落成世界可读）；日志超 10 MB 轮转 `.old`；后台启动并回显 PID）/ `stop`（pkill）/ `reload`（HUP）/ `status`（pgrep）。
 
 ---
 
@@ -104,20 +104,20 @@ scripts/
 让 WorkBuddy 等 **HTTP MCP 客户端**接入：拉起 `mcp/server.py --http 19092`。
 
 `magic-agent-mcp.sh {start|stop|status|restart}`：
-- 自动定位 `mcp/server.py`（优先脚本上级目录；否则回退 `~/Desktop`、`~/Applications` 下的 `魔法代理`/`尊者魔法代理` 两种目录名——历史上曾写死导致找不到）。
+- 自动定位 `mcp/server.py`（优先脚本上级目录；否则回退 `~/Desktop`、`~/Applications` 下的 `网络管理`/`尊者网络管理` 两种目录名——历史上曾写死导致找不到）。
 - `PIDFILE=/tmp/magic-agent-mcp.pid`、`LOG=/tmp/magic-agent-mcp.log`。
 - `start` 用 `nohup python3 … --http 19092 &`，并**轮询 `/health`（最多 20×0.25s）确认就绪**才算启动成功；`health()` 用 `curl --noproxy '*'`（避免被系统代理劫持到自身）。
 
 `com.magic-agent.mcp.plist`（launchd）：
 - Label `com.magic-agent.mcp`，`RunAtLoad=true`，**`KeepAlive=false`**。
 - **2026-09-03 修复注释**：去掉 KeepAlive 常驻——MCP 服务随登录启动即可，崩溃不自动复活。KeepAlive 会造成"App 关了服务还在"的失控感，且掩盖崩溃问题。
-- 需手动把 `/绝对路径/魔法代理/mcp/server.py` 替换为真实路径。
+- 需手动把 `/绝对路径/网络管理/mcp/server.py` 替换为真实路径。
 
 ---
 
 ## 6. `check_parity.py` —— 双规则引擎一致性校验（4.5 KB）
 
-背景：魔法代理有**两份规则生成逻辑**——Rust `mihomo.rs::build_conf`（冷启动）与 Python `server.py::generate_config`（MCP 热重载）。历史上漂移过一次（域名/进程规则顺序颠倒）。本脚本用同一份样例配置喂给两侧，对 `rules` 段**逐行 diff**，不一致则退出码 1。
+背景：网络管理有**两份规则生成逻辑**——Rust `mihomo.rs::build_conf`（冷启动）与 Python `server.py::generate_config`（MCP 热重载）。历史上漂移过一次（域名/进程规则顺序颠倒）。本脚本用同一份样例配置喂给两侧，对 `rules` 段**逐行 diff**，不一致则退出码 1。
 
 ```bash
 cd src-tauri && cargo build          # 前置：生成 target/debug/dump_conf
@@ -147,7 +147,7 @@ python3 scripts/openrouter_free_models.py --all    # 附带付费模型清单
 
 ## 8. `updater-feed/` 与 `updater-feed-publish/`
 
-- **`updater-feed/`**：本地测试更新源。含 `latest.json` + `尊者魔法代理.app.tar.gz` + `.sig`（保留原始文件名，本机 http.server 不改写）。
+- **`updater-feed/`**：本地测试更新源。含 `latest.json` + `尊者网络管理.app.tar.gz` + `.sig`（保留原始文件名，本机 http.server 不改写）。
   启动：`cd scripts/updater-feed && python3 -m http.server 7878 --bind 127.0.0.1`。App 设置页切到"本地开发测试"即可检查更新。
 - **`updater-feed-publish/`**：公开发布源。含历史版本资产（ASCII 名，如 `magic-agent_0.2.5/0.2.6/0.2.7_aarch64.app.tar.gz`）+ 各自 `.sig` + `latest.json`。`--publish` 时上传这些资产到 GitHub Release。
 

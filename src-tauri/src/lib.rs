@@ -57,7 +57,7 @@ pub struct ConflictInfo {
 }
 
 /// 第三方代理应用的特征（进程名关键字 → 显示名）。
-/// 用于启动魔法代理时识别需要清理的"其他代理"。
+/// 用于启动网络管理时识别需要清理的"其他代理"。
 /// 注意：只用足够具体的名字，绝不用宽泛的 "proxy"，避免误杀无关进程。
 const FOREIGN_PROXY_APPS: &[(&str, &str)] = &[
     ("flclash", "FlClash"),
@@ -194,7 +194,7 @@ fn log_proxy_set_result(caller: &str, r: &system_proxy::SystemProxyStatus) {
     }
 }
 
-/// 启动魔法代理前，清理所有第三方代理：
+/// 启动网络管理前，清理所有第三方代理：
 /// 1) 杀掉第三方代理进程（先温和 TERM，1.5 秒后仍在则 KILL）
 /// 2) 关闭系统代理设置，让网络回到"未设代理"的干净状态
 ///

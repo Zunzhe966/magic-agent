@@ -26,7 +26,7 @@ MD_PATH = os.path.join(DOCS, '免费模型清单.md')
 JSON_PATH = os.path.join(DOCS, 'free_models.json')
 MODELS_URL = 'https://openrouter.ai/api/v1/models'
 
-# 直连环境走魔法代理的 openrouter.ai 域名规则；沙箱里 TUN 兜底，无需显式代理
+# 直连环境走网络管理的 openrouter.ai 域名规则；沙箱里 TUN 兜底，无需显式代理
 
 
 def fetch_models(timeout=20):

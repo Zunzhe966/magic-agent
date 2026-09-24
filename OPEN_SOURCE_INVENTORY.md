@@ -167,7 +167,7 @@ App 运行时的配置写在 macOS 用户目录：
 | `magic-agent_0.2.5_aarch64.app.tar.gz.sig` | 420 B | Ed25519 签名 |
 
 > 命名规范：发布资产**必须用 ASCII 名**。
-> GitHub 会静默改写中文文件名（曾把「尊者魔法代理.app.tar.gz」变成「app.tar.gz」），
+> GitHub 会静默改写中文文件名（曾把「尊者网络管理.app.tar.gz」变成「app.tar.gz」），
 > 导致 `latest.json` 里的下载地址 404。已在 `release.sh` 中固化此规则。
 
 ---

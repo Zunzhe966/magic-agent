@@ -1,6 +1,6 @@
-# 魔法代理 MCP Server
+# 网络管理 MCP Server
 
-让 AI 助手（Claude Desktop / Codex / WorkBuddy 等）直接控制魔法代理。
+让 AI 助手（Claude Desktop / Codex / WorkBuddy 等）直接控制网络管理。
 
 ## 是什么
 
@@ -65,13 +65,13 @@ MCP（Model Context Protocol）是 AI 客户端与外部工具之间的标准协
   "mcpServers": {
     "magic-agent": {
       "command": "python3",
-      "args": ["/绝对路径/魔法代理/mcp/server.py"]
+      "args": ["/绝对路径/网络管理/mcp/server.py"]
     }
   }
 }
 ```
 
-> 把 `/绝对路径/魔法代理` 替换为你本地 clone 下来的项目路径（如 `/Users/你的用户名/Desktop/魔法代理`）。
+> 把 `/绝对路径/网络管理` 替换为你本地 clone 下来的项目路径（如 `/Users/你的用户名/Desktop/网络管理`）。
 
 ### Codex / WorkBuddy
 
@@ -79,7 +79,7 @@ MCP（Model Context Protocol）是 AI 客户端与外部工具之间的标准协
 
 ```
 command: python3
-args: /绝对路径/魔法代理/mcp/server.py
+args: /绝对路径/网络管理/mcp/server.py
 ```
 
 ## 直接测试
