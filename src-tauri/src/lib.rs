@@ -938,19 +938,31 @@ async fn start_proxy(
         (cfg, running, cache)
     };
     if already_running {
-        // 即使代理已在运行（App 重启/看门狗重启），也要确保系统代理状态与配置一致。
-        // 否则会出现「mihomo 在跑但系统代理没开」的断网状态。
-        if cfg.system_proxy {
-            let m = MihomoManager::new();
-            // P0-1：不再 let _ = 吞掉失败——逐服务对账结果如实记日志，
-            // 部分服务没设上时 UI 状态面板仍会显示真实的全局视图。
-            match system_proxy::set_system_proxy(true, m.port) {
-                Ok(r) => log_proxy_set_result("start(已运行)", &r),
-                Err(e) => eprintln!("[start_proxy] 系统代理设置失败: {e}"),
+        // P1-A 接管必开入口：内核在跑（App 重启/看门狗重启）时，流量入口（系统代理）
+        // 必须开着。TUN 不承载流量（auto-route=false 红线冻结），系统代理是引擎唯一
+        // 流量入口——入口关着 = 内核空转，正是"点了启动却看不到真实连接"的根因。
+        let m = MihomoManager::new();
+        // P0-1：不吞失败——逐服务对账结果如实记日志。
+        match system_proxy::set_system_proxy(true, m.port) {
+            Ok(r) => log_proxy_set_result("start(已运行)", &r),
+            Err(e) => eprintln!("[start_proxy] 系统代理设置失败: {e}"),
+        }
+        let status = m.status();
+        // 意图对齐落盘：接管生效即入口在开，纠正历史 false 意图（与漂移巡检口径一致）
+        let need_persist = {
+            let mut g = state.lock().unwrap();
+            if !g.config.system_proxy {
+                g.config.system_proxy = true;
+                true
+            } else { false }
+        };
+        if need_persist {
+            let cfg_now = state.lock().unwrap().config.clone();
+            if let Err(e) = config::save(&cfg_now) {
+                eprintln!("[start_proxy] WARN 意图落盘失败: {e}");
             }
         }
-        let m = MihomoManager::new();
-        return Ok(m.status());
+        return Ok(status);
     }
     // 启动的慢操作整体挪到线程池
     let status = tauri::async_runtime::spawn_blocking(move || -> Result<MihomoStatus, String> {
@@ -977,26 +989,28 @@ async fn start_proxy(
                 return Err(e);
             }
         };
-        if cfg.system_proxy {
-            // P0-1 对账 + P1-3 编排：启动后设置系统代理并逐服务回读，
-            // 不达标 = 半套秩序（部分网络走代理部分裸奔），这正是"报假账"要消灭的
-            // 状态——宁可不启：停内核 + 按账本回放系统代理原值 + 结账，并向用户报错。
-            // 已知不可逆项如实声明：cleanup 杀掉的第三方进程不会自动复活。
-            let verify = match system_proxy::set_system_proxy(true, mihomo.port) {
-                Ok(r) => {
-                    log_proxy_set_result("start", &r);
-                    if r.all_ok {
-                        None
-                    } else {
-                        Some(format!(
-                            "系统代理设置未全部达标：{} 等 {} 个服务",
-                            if r.mismatched.is_empty() { "原因见对账明细".to_string() } else { r.mismatched.join("、") },
-                            r.mismatched.len().max(1)
-                        ))
-                    }
+        // P1-A 接管必开入口：内核起来后，系统代理（唯一流量入口）必须打开并逐服务
+        // 对账达标——不设入口的内核 = 空转摆设（v0.3.1 前按 cfg.system_proxy 可关，
+        // 用户因此"点了启动却看不到任何真实连接"）。
+        // 不达标 = 半套秩序（部分网络走代理部分裸奔），这正是"报假账"要消灭的
+        // 状态——宁可不启：停内核 + 按账本回放系统代理原值 + 结账，并向用户报错。
+        // 已知不可逆项如实声明：cleanup 杀掉的第三方进程不会自动复活。
+        let verify = match system_proxy::set_system_proxy(true, mihomo.port) {
+            Ok(r) => {
+                log_proxy_set_result("start", &r);
+                if r.all_ok {
+                    None
+                } else {
+                    Some(format!(
+                        "系统代理设置未全部达标：{} 等 {} 个服务",
+                        if r.mismatched.is_empty() { "原因见对账明细".to_string() } else { r.mismatched.join("、") },
+                        r.mismatched.len().max(1)
+                    ))
                 }
-                Err(e) => Some(format!("系统代理设置失败：{e}")),
-            };
+            }
+            Err(e) => Some(format!("系统代理设置失败：{e}")),
+        };
+        {
             if let Some(why) = verify {
                 eprintln!("[start_proxy] {why}，自动回滚本次接管（宁可不启，不留半套秩序）");
                 mihomo.stop();
@@ -1031,6 +1045,23 @@ async fn start_proxy(
     // 回到状态（这里只做极短的锁写入）
     if let Some(pid) = status.pid {
         *state.lock().unwrap().mihomo.pid.lock().unwrap() = Some(pid);
+    }
+    // P1-A：接管入口已开并对账达标 → 意图对齐落盘（纠正历史 false，
+    // 与漂移巡检"接管生效中入口必须开"口径一致；失败不回滚，仅告警）
+    let need_persist = {
+        let mut g = state.lock().unwrap();
+        if !g.config.system_proxy {
+            g.config.system_proxy = true;
+            true
+        } else {
+            false
+        }
+    };
+    if need_persist {
+        let cfg_now = state.lock().unwrap().config.clone();
+        if let Err(e) = config::save(&cfg_now) {
+            eprintln!("[start_proxy] WARN 意图落盘失败（不影响本次接管）: {e}");
+        }
     }
     // 通知看门狗：用户期望代理在运行，mihomo 崩溃后应自动重启
     {
@@ -1172,13 +1203,13 @@ async fn restore_network(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Resul
 /// P1-4 漂移处置 [重新归位]：接管仍在生效（账本 open）但系统代理被外部改离
 /// 接管态时，用户点归位 = 把系统代理恢复到【本次接管声明的秩序】并回读对账。
 /// 前提校验一：内核必须在跑——对着死端口设系统代理 = 亲手制造断网，绝不做。
-/// 前提校验二：按接管意图分模式归位——systemProxy=true（系统代理模式）归位到
-/// 指向 127.0.0.1:接管端口；systemProxy=false（TUN 模式）的"达标态"是系统代理
-/// 全关（TUN 已全局接管，再开系统代理是双开冗余），归位 = 关掉，绝不能反向
-/// 把系统代理打开（真机验收抓出的护栏缺陷：曾无条件 set(true)）。
+/// 前提校验二（P1-A 更新）：接管生效中的达标态恒为"系统代理开着并指向本程序
+/// 端口"——TUN 不承载流量（auto-route=false 红线冻结），系统代理是引擎唯一流量
+/// 入口，入口被关 = 内核空转。归位一律回开，不再按历史意图分模式
+/// （旧逻辑按 systemProxy=false 归位成"关闭"，把接管态归回了空转态，已废弃）。
 #[tauri::command]
 async fn reapply_takeover(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<crate::system_proxy::SystemProxyStatus, String> {
-    let (port, want_system_proxy, drift_slot, drift_ack) = {
+    let (port, drift_slot, drift_ack) = {
         let g = state.lock().unwrap();
         let mihomo = g.mihomo.clone();
         if !mihomo.status().running {
@@ -1187,9 +1218,9 @@ async fn reapply_takeover(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Resu
         if ledger::LedgerFile::default().open_session().is_none() {
             return Err("无未结接管账本，系统代理当前不归本程序管辖，拒绝改写".to_string());
         }
-        (g.mihomo.port, g.config.system_proxy, g.drift.clone(), g.drift_ack.clone())
+        (g.mihomo.port, g.drift.clone(), g.drift_ack.clone())
     };
-    let status = tauri::async_runtime::spawn_blocking(move || system_proxy::set_system_proxy(want_system_proxy, port))
+    let status = tauri::async_runtime::spawn_blocking(move || system_proxy::set_system_proxy(true, port))
         .await
         .map_err(|e| format!("reapply_takeover 线程异常: {e}"))??;
     log_proxy_set_result("reapply", &status);
@@ -1672,10 +1703,10 @@ pub fn start_proxy_standalone() -> Result<MihomoStatus, String> {
     let mihomo = MihomoManager::new();
     let app_rules = effective_app_rules(&cfg);
     let status = mihomo.start(&cfg, &[], &app_rules)?;
-    if cfg.system_proxy {
-        if let Ok(r) = system_proxy::set_system_proxy(true, mihomo.port) {
-            log_proxy_set_result("standalone", &r);
-        }
+    // P1-A：接管必开入口（与 start_proxy 同语义）——TUN 不承载流量，
+    // 系统代理是引擎唯一流量入口，不设入口的内核 = 空转摆设。
+    if let Ok(r) = system_proxy::set_system_proxy(true, mihomo.port) {
+        log_proxy_set_result("standalone", &r);
     }
     Ok(status)
 }
@@ -1796,6 +1827,32 @@ pub fn run() {
                         eprintln!("[watchdog] mihomo 自动重启成功");
                         if let Ok(pid) = pid_str.parse::<u32>() {
                             *watchdog_state.lock().unwrap().mihomo.pid.lock().unwrap() = Some(pid);
+                        }
+                        // v0.3.2 修复（用户真机报障：内核在跑但实时连接全空）：
+                        // 旧逻辑重启成功就 continue，系统代理无人恢复 →
+                        // "内核活着但流量没进隧道"的半套秩序（内核统计 0 字节）。
+                        // P1-A 红线口径：接管生效中达标态恒为"入口开着指向本程序端口"，
+                        // 不看历史意图（should_run=true 本身即"接管生效中"）。
+                        // 且【先记账后动手】（CONTRACT 接管账本红线；begin 幂等——
+                        // 接管仍生效时绝不覆盖最初原值）。
+                        let port = {
+                            let g = watchdog_state.lock().unwrap_or_else(|e| e.into_inner());
+                            g.mihomo.port
+                        };
+                        if let Err(e) = ledger::LedgerFile::default()
+                            .begin_takeover("watchdog 恢复系统代理", system_proxy::snapshot_system_proxy())
+                        {
+                            eprintln!("[watchdog] WARN begin_takeover 失败（联动不设代理，宁可不写）: {e}");
+                        } else {
+                            match system_proxy::set_system_proxy(true, port) {
+                                Ok(r) => {
+                                    log_proxy_set_result("watchdog 重启联动", &r);
+                                    if !r.all_ok {
+                                        eprintln!("[watchdog] 重启后系统代理未全部达标，漂移巡检将接力提示");
+                                    }
+                                }
+                                Err(e) => eprintln!("[watchdog] WARN 重启后系统代理联动失败: {e}"),
+                            }
                         }
                         continue;
                     }

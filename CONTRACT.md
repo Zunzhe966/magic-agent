@@ -7,6 +7,9 @@
 
 - 架构：Tauri 2 + mihomo 内核。组合根 = `src-tauri/src/lib.rs::run()`；内核管理 = `mihomo.rs::MihomoManager`（深模块，接口只增不删）。
 - 分流设计：系统代理 + 进程级分流；TUN 仅按规则拉「该走代理」的流量（auto-route: false, strict-route: true）；两条死锁端口 7893(无条件 PROXY)/7892(无条件 DIRECT)。
+- **接管入口红线（P1-A，2026-09-24）**：因 auto-route: false 冻结，TUN 不承载日常流量，**系统代理是分流引擎唯一的全机流量入口**。故接管生效中（内核在跑）达标态恒为"系统代理开着并指向本程序端口"，不看 config.systemProxy 历史意图：start_proxy（含已运行分支/standalone 探针）无条件开入口并在成功后把意图纠正落盘为 true；漂移归位一律回开。入口开不成 = 半套秩序 → 宁可不启（停内核+按账本回滚+结账）。config.systemProxy 仅作 UI 显示态与用户手动开关（set_system_proxy）的落点，不再是"接管是否设入口"的开关。Python 侧有三向锁测试钉死（成功开/失败回滚/已运行补开）。
+  - 原因（真机取证）：v0.3.1 及之前按意图可关，用户点启动后内核空转、实时连接页零记录，被当成"启动没响应"。旧文案"TUN 已接管全局，系统代理不需要"是虚假声称，已全部清理。
+  - 推论：P1-4 漂移巡检/归位的达标口径 expect_on 恒为 true（接管中入口必须开）与本红线同语义；看门狗重启内核成功后必须走【begin_takeover 记账 → set_system_proxy(true) 对账】联动（v0.3.2 修复：旧逻辑只恢复 pid 不恢复入口，是真机"实时连接 0 条"的直接触发路径）。
 - **监听红线（2026-09-23）**：所有 `listeners` 条目必须显式 `listen: 127.0.0.1`。实测证伪两个旧假设：①`allow-lan: false` 管不到 listeners 段；②`bind-address` 字段对 listener 无效——缺 `listen:` 时内核绑 0.0.0.0，局域网可匿名白嫖节点出口。Rust 单测已锁死断言，升级 mihomo 版本后须重跑 docs/设计.md §七 验收实验。
 - **日志权限红线（2026-09-23）**：root 启动路径（osascript shell_cmd 与 mihomo-ctl.sh start）必须 `umask 077` 并对存量日志/轮转 .old `chmod 600`。日志含全机连接记录，世界可读 = 同机隐私泄露。
 - 回归基线：`cd src-tauri && cargo test` 全绿（含 `generated_conf_is_valid_mihomo_yaml` 用 `mihomo -t` 真校验配置）。

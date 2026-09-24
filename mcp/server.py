@@ -2147,7 +2147,7 @@ def check_network():
 
 TOOLS = [
     {'name': 'status', 'description': '查看魔法代理当前是否在运行、当前选中节点、系统代理状态、节点数量。不确定代理状态时先调这个'},
-    {'name': 'start_proxy', 'description': '启动代理（TUN 模式，需管理员授权）'},
+    {'name': 'start_proxy', 'description': '启动代理并接管流量入口（系统代理指向 127.0.0.1:7891，需管理员授权）。接管后所有走系统代理的 App 流量进入分流引擎：按你的软件规则/域名规则决定直连或走哪个节点。'},
     {'name': 'stop_proxy', 'description': '停止代理'},
     {'name': 'list_nodes', 'description': '列出代理节点'},
     {'name': 'switch_node', 'description': '切换当前节点'},
@@ -2171,7 +2171,7 @@ TOOLS = [
     {'name': 'server_metrics', 'description': '云服务器一键探针：远程采集当前激活云服务器的 CPU/内存/磁盘/带宽/负载/在线时长，返回结构化数据。用于远程看清服务器状态（而不是盲敲命令）。未配置服务器时会返回配置指引'},
     {'name': 'list_servers', 'description': '列出已配置的云服务器（SSH），标出当前激活的一台。server_metrics/ssh_exec 都作用于「当前激活」服务器，想确认或更换作用目标时先用这个看列表'},
     {'name': 'select_server', 'description': '切换当前激活的云服务器（server_metrics/ssh_exec 的作用目标随之改变），如 {"id":"ssh-1.2.3.4"}。可用 id 从 list_servers 获取'},
-    {'name': 'set_system_proxy', 'description': '开/关 macOS 系统代理（指向 127.0.0.1:7891），如 {"enabled":true}。注意：TUN 模式下内核已接管全局流量，一般不需要开系统代理；单独调整时才用。关系统代理前请确认代理内核在运行，否则用户会断网'},
+    {'name': 'set_system_proxy', 'description': '开/关 macOS 系统代理（指向 127.0.0.1:7891），如 {"enabled":true}。接管生效期间系统代理就是流量入口，请勿手动关闭（关了内核就空转，界面会提示漂移）。单独调整时才用。关系统代理前请确认代理内核在运行，否则用户会断网'},
     {'name': 'ssh_exec', 'description': '在当前激活的云服务器上非交互式执行一条命令并返回 (stdout, stderr, exit_code)。用于远程管理服务器（装软件、看日志、跑脚本）。密码从 macOS Keychain 读取，不落盘。如 {"command":"df -h","timeout_secs":15}'},
     {'name': 'restore_network', 'description': '【一键还原】停止代理内核，并按接管账本把系统代理逐服务回放到接管前的原值、结账。是 start_proxy 接管的逆操作；账本中"接管时关闭的第三方进程"不可逆，返回里如实列出。无未结账本时只停内核+关系统代理回直连并说明局限。'},
     {'name': 'reapply_takeover', 'description': '【漂移归位】接管期间系统代理被外部改动（status 的 drift 字段非空）时，重新逐服务设回 127.0.0.1:7891 并回读对账。前提：内核在跑且有未结接管账本，否则拒绝改写。'},
@@ -2285,27 +2285,32 @@ def call_tool(name, args):
         return result
     elif name == 'start_proxy':
         if mihomo_running():
-            # 内核已在运行时，把系统代理对齐到 config.systemProxy 声明的秩序：
-            # - systemProxy=true 但实际关着（App 重启/外部改动）→ 补开
-            # - systemProxy=false（TUN）但实际开着（外部软件/手动改动）→ 关掉，
-            #   TUN 已接管全局，系统代理开着是双开冗余。
-            want_proxy = False
-            cfg0 = read_config()
-            if 'error' not in cfg0:
-                want_proxy = bool(cfg0.get('systemProxy'))
+            # P1-A（与 Rust start_proxy 同语义）：接管生效中达标态恒为
+            # "系统代理开着指向本程序端口"——TUN 不承载流量（auto-route=false
+            # 红线冻结），系统代理是引擎唯一流量入口，入口关着 = 内核空转。
+            # 旧逻辑按 systemProxy=false 反而"关掉多余系统代理"，把接管态归回
+            # 空转态（用户看不到任何真实连接的根因），已废弃。
             actual = system_proxy_enabled()
-            if want_proxy and not actual:
+            cfg0 = read_config()
+            if not actual:
                 try:
                     set_system_proxy(True)
-                    return {'ok': True, 'message': '内核已在运行，已补开系统代理'}
+                    if 'error' not in cfg0 and not cfg0.get('systemProxy'):
+                        cfg0['systemProxy'] = True
+                        try:
+                            write_config(cfg0)
+                        except Exception as e:
+                            print(f'[start_proxy] WARN 意图落盘失败: {e}', file=sys.stderr)
+                    return {'ok': True, 'message': '内核已在运行，已补开系统代理（接管入口）'}
                 except Exception as e:
                     return {'ok': False, 'message': f'内核在运行但开系统代理失败: {e}'}
-            if not want_proxy and actual:
+            # 入口已开：意图对齐落盘（纠正历史 false，与 Rust 侧一致）
+            if 'error' not in cfg0 and not cfg0.get('systemProxy'):
+                cfg0['systemProxy'] = True
                 try:
-                    set_system_proxy(False)
-                    return {'ok': True, 'message': '内核已在运行，已关掉多余的系统代理（TUN 模式不需要）'}
+                    write_config(cfg0)
                 except Exception as e:
-                    return {'ok': False, 'message': f'内核在运行但关系统代理失败: {e}'}
+                    print(f'[start_proxy] WARN 意图落盘失败: {e}', file=sys.stderr)
             return {'ok': True, 'message': '代理已在运行'}
         # P1-2 显式接管入口：内核即将启动+可能改系统代理 = 改变系统状态，
         # 必须先记账（快照逐服务原值）再动手。失败路径结账，不留幽灵账本。
@@ -2322,37 +2327,41 @@ def call_tool(name, args):
             except Exception as le:
                 print(f'[ledger] WARN 启动失败后结账失败: {le}', file=sys.stderr)
             raise
-        # 与 Rust 侧 start_proxy 一致：只在 config.systemProxy=true 时才开系统代理。
-        # TUN 模式下不开（TUN 已接管全局，再开系统代理是双开冗余）。
-        cfg2 = read_config()
-        if cfg2.get('systemProxy'):
-            # 与 Rust 侧同语义（P1-3 编排）：设置系统代理后逐服务对账，
-            # 不达标 = 半套秩序——宁可不启：停内核 + 按账本回放原值 + 结账 + 如实报错。
-            # 已知不可逆项（cleanup 杀的第三方进程）绝不假装恢复。
-            restore_note = ''
+        # P1-A（与 Rust start_proxy 同语义）：接管必开入口——内核起来后，
+        # 系统代理（唯一流量入口）必须打开并逐服务对账达标，不看历史意图。
+        # 不达标 = 半套秩序——宁可不启：停内核 + 按账本回放原值 + 结账 + 如实报错。
+        # 已知不可逆项（cleanup 杀的第三方进程）绝不假装恢复。
+        restore_note = ''
+        try:
+            result = set_system_proxy(True)
+            if not result.get('allOk'):
+                mismatch = result.get('mismatched') or []
+                raise RuntimeError(
+                    f"系统代理设置未全部达标：{'、'.join(mismatch) if mismatch else '原因见对账明细'}")
+        except Exception as e:
+            stop_mihomo()
             try:
-                result = set_system_proxy(True)
-                if not result.get('allOk'):
-                    mismatch = result.get('mismatched') or []
-                    raise RuntimeError(
-                        f"系统代理设置未全部达标：{'、'.join(mismatch) if mismatch else '原因见对账明细'}")
+                errs, had_ledger, had_procs = ledger_rollback(f'mcp:start_proxy 对账不达标，自动回滚：{e}')
+                parts = ['内核已停止']
+                parts.append('系统代理已按账本还原为接管前原值' if had_ledger
+                             else '账本无未结账目，系统代理未能还原原值（请手动检查网络设置）')
+                if errs:
+                    parts.append('还原存在失败项：' + '；'.join(errs))
+                if had_procs:
+                    parts.append('接管时关闭的第三方代理进程不会自动复活')
+                return {'ok': False, 'message': f'{e}。已自动回滚：' + '；'.join(parts), 'rolledBack': True}
+            except Exception as le:
+                restore_note = f'；且自动回滚异常：{le}'
+            return {'ok': False, 'message': f'代理启动失败：{e}{restore_note}', 'rolledBack': False}
+        # 入口开成功并达标：意图对齐落盘（纠正历史 false）
+        cfg2 = read_config()
+        if 'error' not in cfg2 and not cfg2.get('systemProxy'):
+            cfg2['systemProxy'] = True
+            try:
+                write_config(cfg2)
             except Exception as e:
-                stop_mihomo()
-                try:
-                    errs, had_ledger, had_procs = ledger_rollback(f'mcp:start_proxy 对账不达标，自动回滚：{e}')
-                    parts = [f'内核已停止']
-                    parts.append('系统代理已按账本还原为接管前原值' if had_ledger
-                                 else '账本无未结账目，系统代理未能还原原值（请手动检查网络设置）')
-                    if errs:
-                        parts.append('还原存在失败项：' + '；'.join(errs))
-                    if had_procs:
-                        parts.append('接管时关闭的第三方代理进程不会自动复活')
-                    return {'ok': False, 'message': f'{e}。已自动回滚：' + '；'.join(parts), 'rolledBack': True}
-                except Exception as le:
-                    restore_note = f'；且自动回滚异常：{le}'
-                return {'ok': False, 'message': f'代理启动失败：{e}{restore_note}', 'rolledBack': False}
-            return {'ok': True, 'pid': pid, 'message': '代理已启动，系统代理已开并通过对账（需要管理员授权）'}
-        return {'ok': True, 'pid': pid, 'message': '代理已启动（TUN 模式，系统代理保持关闭）'}
+                print(f'[start_proxy] WARN 意图落盘失败（不影响本次接管）: {e}', file=sys.stderr)
+        return {'ok': True, 'pid': pid, 'message': '代理已启动，系统代理已开并通过对账（接管入口就绪，需管理员授权）'}
     elif name == 'stop_proxy':
         stop_mihomo()
         # 与 Rust 侧 stop_proxy 保持一致：停内核后必须关系统代理，
@@ -2647,17 +2656,15 @@ def call_tool(name, args):
         # P1-4 漂移归位（与 Rust reapply_takeover 同语义）：接管生效中系统代理被
         # 外部改动后，恢复到【本次接管声明的秩序】并对账。前提双检：内核在跑
         # （对死端口设代理=亲手制造断网）、有未结账本（无账=系统代理不归本程序管，拒写）。
-        # 方向按接管意图 cfg.systemProxy：true=系统代理模式→设回指向 7891；
-        # false=TUN 模式→达标态是系统代理全关，归位=关掉（真机验收抓出的护栏缺陷：
-        # 曾无条件 set(True)，TUN 下把"外部关掉"归位成"打开双开冗余"）。
+        # P1-A：接管生效中的达标态恒为"系统代理开着指向 7891"（TUN 不承载流量，
+        # 系统代理是唯一入口），归位一律回开；旧"按意图分方向"会把接管态归回
+        # 空转态，已废弃。
         if not mihomo_running():
             return {'ok': False, 'error': '代理内核未在运行，无法归位（请改用 start_proxy 重新接管）'}
         if ledger_open_session() is None:
             return {'ok': False, 'error': '无未结接管账本，系统代理当前不归本程序管辖，拒绝改写'}
-        cfg0 = read_config()
-        want_on = bool(cfg0.get('systemProxy')) if 'error' not in cfg0 else True
         try:
-            result = set_system_proxy(want_on)
+            result = set_system_proxy(True)
         except Exception as e:
             return {'ok': False, 'error': f'归位失败：{e}'}
         return {'ok': True, 'systemProxy': system_proxy_enabled(),

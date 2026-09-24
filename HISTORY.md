@@ -355,7 +355,23 @@
 | 根因 | 体检卡（前端）引用 `audit.ownPortLanExposed.length`，而 Rust `NetworkAuditReport`【没有这个字段】（只有 MCP 侧 audit_network 有该键——GUI 不消费 MCP）→ undefined 取 .length 抛异常 → Vue 渲染崩溃整树卸载 → **白/黑屏，且同一 WebView 里所有页面（含启动按钮、实时连接）全部失去响应**。三个现象一个根因：不是代理没工作——真机取证内核在跑、`mihomo.log` 有真实 [TCP] 转发记录、`/connections` API 数据正常。属 P1-1 接线时的**双引擎字段漂移第三次实例**（GUI 消费面此前无契约锁）。 |
 | fix(33c0416) | ① Rust 报告补 `ExposedPort` 结构 + `own_port_lan_exposed` 字段（own_ports ∩ lan_exposed LISTEN，与 MCP ownPortLanExposed 同形）；② Dashboard 体检卡全部消费点加可选链/默认值防御（后端字段再漂移不崩整页）；③ 契约锁测试 `report_json_keys_match_frontend_contract`：断言前端消费的 13 个顶层键 + 嵌套消费点（staleProxy.detected / ownPortLanExposed[].port），改字段名=测试挡。验证：Rust 79 全绿（+1 契约锁）、Python 32 全绿、parity 0、前端构建过。 |
 | chore(release) | **v0.3.1 已构建安装（未 --publish）**。首跑 release.sh 在 bundle_dmg 阶段失败：0.2.11/0.3.1 两轮构建各遗留未卸载的打包临时卷（/Volumes/dmg.*）与 rw.*.dmg 临时镜像，重挂撞车——detach 残留卷 + 清理 target 内临时镜像后重跑成功（对账通过、双通道 feed=0.3.1）。**遗留项**：release.sh 可加"构建前自动 detach 残留 dmg 挂载"防呆（P2 一并做）。 |
-| 教训固化 | GUI 消费的后端字段【必须】有编译期/测试期契约锁——check_parity 只管 Rust↔MCP 的规则引擎，管不到 Tauri 命令返回值与 Vue 模板的漂移；本次起 audit_network 报告纳入契约锁，后续新命令接 GUI 时同样先写锁再画页面。 |
+| 教训固化 | GUI 消费的后端字段【必须】有编译期/测试期契约锁——check_parity 只管 Rust↔MCP 的规则引擎，管不到 Tauri 命令返回值与 Vue 模板的漂移；本次起 audit_network 报告纳入契约锁，后续新命令接 GUI 时同样先写契约锁。 |
+
+---
+
+### 2026-09-24（用户实测反馈 2）· 接管必开入口（P1-A）+ 看门狗重启联动 + v0.3.2
+
+| 类型 | 做了什么 |
+|------|----------|
+| 现象 | 用户装 0.3.1 再报：**实时连接页持续"共 0 条"**，代理像没工作（黑屏已在 0.3.1 解决，本次是独立的真实功能缺陷）。 |
+| 取证 | 内核在跑（当日 06:42 被看门狗拉起）、7891/7892/7893 全 LISTEN、控制 API 正常；但系统代理 **Enabled: No**（scutil 全 0）、内核 downloadTotal=0 空转；config 意图 systemProxy=True 与现实脱节。App 昨晚 20:44 接管过（账本已 settled），之后内核停摆、看门狗拉回但入口没恢复。 |
+| 根因（两层） | ① **产品语义错误（P1-A 定性）**：auto-route=false 冻结 ⇒ TUN 不承载日常流量，**系统代理是分流引擎唯一的全机流量入口**；v0.3.1 及之前 start/已运行/standalone/归位 四条路径都按 `config.systemProxy` 历史意图决定开不关，false 时内核以"无入口空转态"交付，用户看到的就是"启动了但没有任何真实连接"。旧文案"TUN 已接管全局，系统代理不需要"属虚假声称。② **看门狗缺口（本次真机触发的直接原因）**：重启成功分支只恢复 pid 就 continue，从不重设系统代理（旧设计只有"重启失败→关代理"的反向保护，漏了对称的另一半）。 |
+| fix(P1-A) | 接管生效中达标态恒为"入口开着指向本程序端口"，四条路径全改无条件开：start_proxy（新启 + 已运行分支）、start_proxy_standalone、reapply_takeover（归位一律回开，不再按历史意图分模式）、set_system_proxy 工具描述改口径；成功后把 config.systemProxy 纠正落盘 true（意图与现实对齐）；入口开不成 = 半套秩序 → 宁可不启（停内核 + 按账本回滚 + 结账 + 如实报错）。App.vue：内核在跑时手动关入口给 warn toast 点名后果。CONTRACT 新增「接管入口红线」。MCP 侧同语义同步（Rust+MCP 双引擎一致红线）。测试：方向锁改 P1-A 语义 + 新增 3 条（成功开+意图纠正落盘 / 失败必回滚不留账 / 已运行必补开）。 |
+| fix(看门狗) | 重启成功后先 `begin_takeover` 记账（幂等，绝不覆盖最初原值）再 `set_system_proxy(true)` 逐服务对账；不达标交给 P1-4 漂移巡检接力提示。P1-A 红线落进看门狗：无条件开，不看 should_run 之外的任何意图。 |
+| 现场处置 | 用户当次报障已通过 MCP `set_system_proxy{enabled:true}` 恢复：allOk 逐服务达标，内核连接表随即开始计数（downloadTotal 262KB→271KB，13→17 条，含"千问.app"进程分流命中与 cn 直连规则——分流引擎真实工作）。系统代理现状：Wi-Fi Enabled: Yes → 127.0.0.1:7891。 |
+| 验证 | Rust 79 / Python 35 全绿、parity 0、vite build 过。 |
+
+**下一步**：用户装 0.3.2 复验（重点：点启动代理后实时连接页应出现真实流量记录；内核被看门狗重启后入口自动恢复）→ P1-5 GUI 人工项收尾 → `--publish` 发布 → P2-1。
 
 ---
 

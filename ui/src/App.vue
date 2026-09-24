@@ -149,6 +149,10 @@ async function stopProxy() {
 async function toggleSystemProxy(enabled) {
   try {
     const r = await invoke('set_system_proxy', { enabled });
+    // P1-A：系统代理是接管期唯一流量入口——内核在跑时手动关闭 = 引擎空转，如实提醒
+    if (!enabled && status.value?.proxyRunning) {
+      toast('已关闭流量入口：代理内核仍在运行，但浏览器等 App 的流量不再经过分流引擎（实时连接将为空）。重新点「启动代理」即可恢复接管。', 'warn');
+    }
     // P0-1：部分服务未达标时如实提示，不再默认"成功"
     if (r && r.allOk === false && r.mismatched && r.mismatched.length) {
       toast(`系统代理${enabled ? '开启' : '关闭'}不完全：${r.mismatched.join('、')} 未生效，请检查这些网络的服务设置`, 'warn');

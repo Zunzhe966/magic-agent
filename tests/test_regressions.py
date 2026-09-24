@@ -656,22 +656,23 @@ def test_reapply_takeover_guardrails(tmp_path, monkeypatch):
 
 
 def test_reapply_takeover_tunnel_mode_restores_closed(tmp_path, monkeypatch):
-    """护栏回归（真机验收抓出）：TUN 接管下达标态=系统代理全关，
-    漂移归位必须【关掉】而不是打开——无条件 set(True) 会制造双开冗余。"""
+    """P1-A 方向锁（取代旧 TUN 语义锁）：接管生效中达标态恒为"入口开着"，
+    归位一律回开指向接管端口——历史 systemProxy=false 不得把归位方向带回空转态。"""
     path = str(tmp_path / 'ledger.json')
     monkeypatch.setattr(server, 'LEDGER_PATH', path)
     monkeypatch.setattr(server.subprocess, 'run', _networksetup_full())
     server.ledger_begin('mcp:start_proxy')
     monkeypatch.setattr(server, 'mihomo_running', lambda: True)
-    monkeypatch.setattr(server, 'read_config', lambda: {'systemProxy': False})  # TUN 模式
+    monkeypatch.setattr(server, 'read_config', lambda: {'systemProxy': False})  # 历史意图 false
     calls = []
     monkeypatch.setattr(server, 'set_system_proxy',
-                        lambda enable=True, port=7891: calls.append(enable) or
+                        lambda *a, **kw: calls.append((a, kw)) or
                         {'allOk': True, 'mismatched': [], 'services': []})
     monkeypatch.setattr(server, 'system_proxy_enabled', lambda: False)
     r = server.call_tool('reapply_takeover', {})
     assert r['ok'] is True
-    assert calls == [False], 'TUN 模式的归位方向必须是关闭系统代理'
+    assert calls and calls[0][0] and calls[0][0][0] is True, \
+        'P1-A：接管态归位必须无条件回开系统代理（入口），不得按历史意图关闭'
 
 
 def test_probe_drift_only_when_taking_over(tmp_path, monkeypatch):
@@ -701,6 +702,70 @@ def test_status_exposes_drift(tmp_path, monkeypatch):
     r = server.call_tool('status', {})
     assert r.get('drift') and 'Wi-Fi' in r['drift']['services']
     assert r.get('openLedger') is True
+
+
+def test_p1a_start_proxy_always_opens_entrance(tmp_path, monkeypatch):
+    """P1-A 核心方向锁：接管不看历史意图——systemProxy=false 时 start 也必须
+    打开系统代理入口并纠正意图落盘；入口开不成（异常）必须回滚不留半套。"""
+    path = str(tmp_path / 'ledger.json')
+    monkeypatch.setattr(server, 'LEDGER_PATH', path)
+    monkeypatch.setattr(server.subprocess, 'run', _networksetup_full())
+    # 意图为 false（v0.3.1 时代残留），但接管必须照开入口
+    monkeypatch.setattr(server, 'read_config', lambda: {'systemProxy': False})
+    saved = []
+    monkeypatch.setattr(server, 'write_config', lambda cfg: saved.append(dict(cfg)))
+    calls = []
+    monkeypatch.setattr(server, 'set_system_proxy',
+                        lambda enable=True, port=7891: calls.append(enable) or
+                        {'allOk': True, 'mismatched': [], 'services': []})
+    monkeypatch.setattr(server, 'mihomo_running', lambda: False)
+    monkeypatch.setattr(server, 'regenerate_config', lambda: None)
+    monkeypatch.setattr(server, 'start_mihomo', lambda: 4242)
+    monkeypatch.setattr(server, 'stop_mihomo', lambda: None)
+    r = server.call_tool('start_proxy', {})
+    assert r['ok'] is True
+    assert calls == [True], '接管必须无条件开系统代理入口'
+    assert saved and saved[0]['systemProxy'] is True, '接管成功后意图必须纠正落盘'
+
+
+def test_p1a_start_entrance_failure_rolls_back(tmp_path, monkeypatch):
+    """入口开不成 = 引擎空转且是半套秩序：必须停内核 + 回滚 + 结账，报失败。"""
+    path = str(tmp_path / 'ledger.json')
+    monkeypatch.setattr(server, 'LEDGER_PATH', path)
+    monkeypatch.setattr(server.subprocess, 'run', _networksetup_full())
+    monkeypatch.setattr(server, 'read_config', lambda: {'systemProxy': False})
+    monkeypatch.setattr(server, 'write_config', lambda cfg: None)
+    monkeypatch.setattr(server, 'mihomo_running', lambda: False)
+    monkeypatch.setattr(server, 'regenerate_config', lambda: None)
+    monkeypatch.setattr(server, 'start_mihomo', lambda: 4242)
+    stopped = []
+    monkeypatch.setattr(server, 'stop_mihomo', lambda: stopped.append(1))
+    monkeypatch.setattr(server, 'set_system_proxy',
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError('networksetup 拒绝')))
+    r = server.call_tool('start_proxy', {})
+    assert r['ok'] is False and r['rolledBack'] is True
+    assert stopped == [1], '入口失败必须停内核'
+    assert server.ledger_open_session() is None, '回滚后不得留未结账本'
+
+
+def test_p1a_running_branch_reopens_entrance(tmp_path, monkeypatch):
+    """内核已在跑但入口关着（App 重启/外部关闭）：start 必须补开入口并纠正意图。"""
+    path = str(tmp_path / 'ledger.json')
+    monkeypatch.setattr(server, 'LEDGER_PATH', path)
+    monkeypatch.setattr(server.subprocess, 'run', _networksetup_full())
+    monkeypatch.setattr(server, 'read_config', lambda: {'systemProxy': False})
+    saved = []
+    monkeypatch.setattr(server, 'write_config', lambda cfg: saved.append(dict(cfg)))
+    calls = []
+    monkeypatch.setattr(server, 'set_system_proxy',
+                        lambda enable=True, port=7891: calls.append(enable) or
+                        {'allOk': True, 'mismatched': [], 'services': []})
+    monkeypatch.setattr(server, 'system_proxy_enabled', lambda: False)
+    monkeypatch.setattr(server, 'mihomo_running', lambda: True)
+    r = server.call_tool('start_proxy', {})
+    assert r['ok'] is True
+    assert calls == [True], '已运行分支也必须保证入口开着'
+    assert saved and saved[0]['systemProxy'] is True
 
 
 def test_p14_tools_registered():
