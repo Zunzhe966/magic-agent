@@ -2127,6 +2127,113 @@ def check_update(args):
             'notes': feed.get('notes')}
 
 
+# ── 更新验签（与 App 内置 updater 同一把 minisign ed25519 公钥）────────────────
+# 私钥 ~/.tauri/magic-agent.key 绝不入库；公钥 32 字节 ed25519 可公开。
+# 签名格式（minisign-verify 0.2.5）：文件 blake2b-512 预哈希后做 Ed25519。
+_MAGIC_AGENT_PUB32_HEX = '503929e6ddaa360d140ee72797fedfcb875849527052382be605b87af79518fc'
+_MAGIC_AGENT_KEYID_HEX = '74202349fc8d43f3'
+_VERIFY_PYTHON = '/usr/local/bin/python3'  # 主进程只依赖标准库；验签子进程带 cryptography
+
+_VERIFY_SCRIPT = r'''
+import base64, sys, hashlib
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+tar_path, sig_text, pub32_hex = sys.argv[1], sys.argv[2], sys.argv[3]
+data = open(tar_path, 'rb').read()
+inner = base64.b64decode(sig_text.strip()).decode()
+lines = inner.splitlines()
+block = base64.b64decode(lines[1])
+keyid, sig64 = block[2:10].hex(), block[10:74]
+h = hashlib.blake2b(data, digest_size=64).digest()
+Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub32_hex)).verify(sig64, h)
+print(keyid)
+'''
+
+
+def apply_update(args):
+    """通过 MCP 触发 App 自更新（智能体可控的升级手段）。
+    流程：拉 feed → 下载 darwin-aarch64 包与签名 → Blake2b-512+Ed25519 验签
+    （硬门：验签不过绝不安装）→ 停运行中的旧 App → 解压覆盖 /Applications。
+    args 可带 {"channel": "github"|"local"} 覆盖当前通道。"""
+    import tempfile
+    cfg = read_config()
+    if 'error' in cfg:
+        return cfg
+    channel = _str_arg(args, 'channel') or cfg.get('updateChannel') or 'github'
+    if channel not in ('local', 'github'):
+        channel = 'github'
+    feed_url = ('http://127.0.0.1:7878/latest.json' if channel == 'local' else
+                'https://github.com/Zunzhe966/magic-agent/releases/latest/download/latest.json')
+    try:
+        if channel == 'local':
+            feed = json.loads(_OPENER.open(feed_url, timeout=5).read())
+        else:
+            proxy_handler = urllib.request.ProxyHandler(
+                {'http': f'http://127.0.0.1:{PROXY_PORT}', 'https': f'http://127.0.0.1:{PROXY_PORT}'})
+            feed = json.loads(urllib.request.build_opener(proxy_handler).open(feed_url, timeout=20).read())
+    except Exception as e:
+        hint = '（本地通道需先起 7878 测试源）' if channel == 'local' else '（github 通道需节点代理可用）'
+        return {'error': f'拉取更新信息失败: {e} {hint}'}
+    machine = os.uname().machine
+    platform = 'darwin-aarch64' if machine in ('arm64', 'aarch64') else f'darwin-{machine}'
+    plat = feed.get('platforms', {}).get(platform)
+    if not plat or not plat.get('url') or not plat.get('signature'):
+        return {'error': f'feed 缺少 {platform} 平台条目', 'feedVersion': feed.get('version')}
+    pkg_url = plat['url']
+    if channel == 'local':
+        if not pkg_url.startswith('http://127.0.0.1:7878/'):
+            return {'error': f'local 通道包 URL 不在 loopback: {pkg_url}'}
+    elif not pkg_url.startswith('https://github.com/Zunzhe966/magic-agent/releases/download/'):
+        return {'error': f'github 通道包 URL 不在允许域名: {pkg_url}'}
+    tmpdir = tempfile.mkdtemp(prefix='magic-agent-update-')
+    tar_path = os.path.join(tmpdir, 'update.tar.gz')
+    try:
+        if channel == 'local':
+            with open(tar_path, 'wb') as f:
+                f.write(_OPENER.open(pkg_url, timeout=180).read())
+        else:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler(
+                {'http': f'http://127.0.0.1:{PROXY_PORT}', 'https': f'http://127.0.0.1:{PROXY_PORT}'}))
+            with opener.open(pkg_url, timeout=180) as r, open(tar_path, 'wb') as f:
+                shutil.copyfileobj(r, f)
+    except Exception as e:
+        return {'error': f'下载更新包失败: {e}'}
+    try:
+        out = subprocess.run([_VERIFY_PYTHON, '-c', _VERIFY_SCRIPT, tar_path,
+                              plat['signature'], _MAGIC_AGENT_PUB32_HEX],
+                             capture_output=True, text=True, timeout=60)
+        if out.returncode != 0:
+            return {'error': f'验签失败，已拒绝安装: {(out.stderr or out.stdout).strip()}'}
+        if out.stdout.strip() != _MAGIC_AGENT_KEYID_HEX:
+            return {'error': f"签名 keyid 不匹配: {out.stdout.strip()}，拒绝安装"}
+    except FileNotFoundError:
+        return {'error': f'验签解释器不存在: {_VERIFY_PYTHON}（需 cryptography 库）'}
+    extract_dir = os.path.join(tmpdir, 'extract')
+    os.makedirs(extract_dir, exist_ok=True)
+    subprocess.run(['tar', '-xzf', tar_path, '-C', extract_dir], check=True)
+    app_path = None
+    for root, dirs, _ in os.walk(extract_dir):
+        for d in dirs:
+            if d.endswith('.app'):
+                app_path = os.path.join(root, d)
+                break
+        if app_path:
+            break
+    if not app_path:
+        return {'error': '压缩包内未找到 .app'}
+    app_name = os.path.basename(app_path)
+    dest = os.path.join('/Applications', app_name)
+    try:
+        subprocess.run(['pkill', '-f', app_name], capture_output=True, timeout=10)
+        time.sleep(1)
+    except Exception:
+        pass
+    if os.path.exists(dest):
+        shutil.rmtree(dest, ignore_errors=True)
+    shutil.move(app_path, dest)
+    return {'installed': True, 'version': feed.get('version'), 'appPath': dest,
+            'channel': channel, 'note': '已安装到 /Applications，请重新打开 App'}
+
+
 def check_network():
     results = {}
     # baidu 直连测试
@@ -2170,6 +2277,7 @@ TOOLS = [
     {'name': 'set_app_mode', 'description': '设置某 App 的代理模式（proxy/direct）'},
     {'name': 'check_network', 'description': '测试国内外网站连通性'},
     {'name': 'check_update', 'description': '检查 App 是否有新版本（只检查，不下载不安装）。按当前更新通道（local=本机 7878 测试源 / github=正式发布源）拉取版本信息并与当前版本比较。安装更新请让用户在 App 设置页操作'},
+    {'name': 'apply_update', 'description': '通过 MCP 直接升级 App（智能体可控的安装手段）：按当前通道拉取最新包 → Blake2b-512+Ed25519 验签（同一把发布公钥，验签不过绝不安装）→ 停运行中的旧 App → 覆盖安装到 /Applications。可用 {"channel": "local"|"github"} 覆盖通道。升级完成后用户重新打开 App 即可。'},
     {'name': 'list_domain_rules', 'description': '列出域名分流规则（哪些域名走代理/直连）'},
     {'name': 'add_domain_rule', 'description': '添加或更新域名分流规则，target 支持 proxy（走代理）、direct（直连）或节点名（走指定节点），建议带 reason 注明服务于哪个密钥/软件。如 {"domain":"openai.com","target":"示例节点","reason":"WorkBuddy 的 OpenAI 密钥"}'},
     {'name': 'remove_domain_rule', 'description': '删除域名分流规则，如 {"domain":"github.com"}'},
@@ -2220,6 +2328,7 @@ _TOOL_SCHEMAS = {
     }, ['id', 'mode']),
     'check_network': _tool_schema(),
     'check_update': _tool_schema(),
+    'apply_update': _tool_schema({'channel': {'type': 'string', 'description': 'github 或 local；缺省读 App 当前通道'}}),
     'list_domain_rules': _tool_schema(),
     'add_domain_rule': _tool_schema({
         'domain': {'type': 'string'},
@@ -2466,6 +2575,8 @@ def call_tool(name, args):
         return check_network()
     elif name == 'check_update':
         return check_update(args)
+    elif name == 'apply_update':
+        return apply_update(args)
     elif name == 'list_domain_rules':
         cfg = read_config()
         if 'error' in cfg:
