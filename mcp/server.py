@@ -159,59 +159,41 @@ CN_DOMAIN_SUFFIXES = (
 for _k in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
     os.environ.pop(_k, None)
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-# 特权控制器：root 脚本 + sudoers 白名单，装一次后启停零弹窗
+# 旧特权控制器（v0.4.1 起废弃）：以下常量仅用于 remove_privileged_helper 判断卸载目标是否存在
 CTL_PATH = '/usr/local/lib/magic-agent/mihomo-ctl.sh'
-CTL_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                       'scripts', 'mihomo-ctl.sh')
-SUDOERS_LINE = f'{os.environ.get("USER", "your_username")} ALL=(root) NOPASSWD: {CTL_PATH}'
 
 # 保命直连名单：这些目标永远走系统原生路由，绝不进 TUN/代理端口（与 Rust 侧一致）。
 # 尤其 AI 助手访问的中转站——模型请求是超长流式 JSON，被应用层代理"拆-组"会损坏请求体。
+# 保命直连哨兵（P2-9，v0.4.1）：203.0.113.74 属 RFC 5737 TEST-NET-3 文档保留段，
+# 真实互联网不可路由。作用 = 保证第 0 层直连名单非空、规则可解析（与 Rust 侧
+# PROTECTED_DIRECT_DOMAINS 一一对应，双引擎一致）。接入真实 AI 中转站时把真实
+# 出口 IP 替换/追加在此；切勿清空最后一项。
 PROTECTED_DIRECT_DOMAINS = ['203.0.113.74']
 
 
-def ctl_installed():
-    return os.path.exists(CTL_PATH)
-
-
-def install_privileged_helper():
-    """一次性安装（弹一次管理员授权）：放置 root 控制脚本 + sudoers 白名单。
-    校验通过才落盘，避免写坏 sudoers。"""
-    if not os.path.exists(CTL_SRC):
-        return {'error': f'找不到控制脚本: {CTL_SRC}'}
-    # 桌面目录受 TCC 保护（root 也读不了），先由当前用户暂存到 /tmp
-    stage = '/tmp/magic-agent-mihomo-ctl.sh'
-    try:
-        shutil.copyfile(CTL_SRC, stage)
-    except OSError as e:
-        return {'error': f'暂存脚本失败: {e}'}
-    sudoers_tmp = '/etc/sudoers.d/magic-agent-mihomo.tmp'
-    lines = [
-        'set -e',
-        'mkdir -p /usr/local/lib/magic-agent',
-        f"cp '{stage}' '{CTL_PATH}.tmp'",
-        f"chown root:wheel '{CTL_PATH}.tmp' && chmod 755 '{CTL_PATH}.tmp'",
-        f"echo '{SUDOERS_LINE}' > {sudoers_tmp}",
-        f'chmod 440 {sudoers_tmp}',
-        f'/usr/sbin/visudo -cf {sudoers_tmp}',
-        f'mv {sudoers_tmp} /etc/sudoers.d/magic-agent-mihomo',
-        f"mv '{CTL_PATH}.tmp' '{CTL_PATH}'",
-        f'rm -f {stage}',
-    ]
-    shell_body = '\n'.join(lines)
+def remove_privileged_helper():
+    """v0.4.1 安全整改：卸载旧特权控制器（弹一次管理员授权）。
+    删除 /etc/sudoers.d/magic-agent-mihomo 白名单与 /usr/local/lib/magic-agent/mihomo-ctl.sh。
+    背景：sudoers 免密 root 通道 = 系统后门级风险（脚本可被替换即免密 root 任意命令）；
+    内核已用户态化（TUN 关闭、全普通端口），root 通道不再需要。卸载即封死该攻击面。"""
+    script = (
+        'set -e; '
+        'rm -f /etc/sudoers.d/magic-agent-mihomo '
+        '/etc/sudoers.d/magic-agent-mihomo.tmp; '
+        'rm -f /usr/local/lib/magic-agent/mihomo-ctl.sh; '
+        'rmdir /usr/local/lib/magic-agent 2>/dev/null || true'
+    )
     apple = 'do shell script "%s" with administrator privileges' % (
-        shell_body.replace('\\', '\\\\').replace('"', '\\"'))
-    p = subprocess.run(['/usr/bin/osascript', '-e', apple], capture_output=True, text=True, timeout=300)
+        script.replace('\\', '\\\\').replace('"', '\\"'))
+    p = subprocess.run(['/usr/bin/osascript', '-e', apple], capture_output=True, text=True, timeout=120)
     if p.returncode != 0:
         err = (p.stderr or '').strip()
         if 'cancel' in err.lower() or 'user canceled' in err.lower():
-            return {'error': '用户取消了管理员授权'}
-        return {'error': f'安装失败: {err[:150]}'}
-    # 验证免密可用
-    v = subprocess.run(['sudo', '-n', CTL_PATH, 'status'], capture_output=True, text=True, timeout=30)
-    if v.returncode != 0:
-        return {'error': f'安装完成但免密验证失败: {(v.stderr or "")[:120]}'}
-    return {'ok': True, 'message': '特权控制器已安装，此后代理启停零弹窗', 'pid': v.stdout.strip()}
+            return {'error': '用户取消了管理员授权，特权控制器未被卸载'}
+        return {'error': f'卸载失败: {err[:150]}'}
+    gone = not os.path.exists(CTL_PATH) and not os.path.exists('/etc/sudoers.d/magic-agent-mihomo')
+    return {'ok': True, 'removed': gone,
+            'message': '特权控制器已卸载（sudoers 白名单与 root 控制脚本已删除），代理内核已完全用户态化'}
 
 
 def rotate_log(path, max_bytes=10 * 1024 * 1024):
@@ -293,9 +275,13 @@ def verify_system_proxy(services, want_port, expect_on):
     """逐服务读回系统代理真实状态，语义与 Rust 侧 system_proxy.rs::verify_system_proxy 一致：
     -get*state 系列读命令在真机【不存在】（读写命令集不对称），唯一可靠读法是
     -getwebproxy/-getsecurewebproxy/-getsocksfirewallproxy。
+    P1-7 口径（v0.4.1）：开关态以 scutil 全局视图为唯一权威（真机实测出现
+    全局 HTTPEnable:0 而服务级 Enabled:Yes 的矛盾态，服务级 Enabled 不可信）。
     返回的 httpOn/httpsOn/socksOn = 该通道是否【达标】：
-    期望开 → Enabled:Yes 且端口精确等于 want_port；期望关 → Enabled:No。
+    期望开 → 全局开且服务级端口精确等于 want_port；期望关 → 全局关且服务级
+    端口不等于 want_port（残留指向本程序端口仍点名）。
     单项读取失败记入 errors，不抛异常。"""
+    global_enabled = system_proxy_enabled()
     states = []
     for svc in services:
         errors = []
@@ -306,10 +292,10 @@ def verify_system_proxy(services, want_port, expect_on):
                 if p.returncode != 0:
                     errors.append(f'{flag}: {p.stderr.strip()}')
                     return False
-                enabled, port = _parse_proxy_detail(p.stdout)
-                if enabled and port != want_port:
+                _enabled, port = _parse_proxy_detail(p.stdout)
+                if port != want_port and port != 0:
                     errors.append(f'{flag}: 指向 127.0.0.1:{port} 而非期望端口 {want_port}')
-                return (enabled and port == want_port) if expect_on else (not enabled)
+                return (global_enabled and port == want_port) if expect_on else (not global_enabled and port != want_port)
             except Exception as e:
                 errors.append(f'{flag}: {e}')
                 return False
@@ -690,20 +676,14 @@ def mihomo_running():
 
 
 def stop_mihomo():
-    # 首选：特权控制器零弹窗（沙箱内 sudo 被禁时回退 osascript）
-    if ctl_installed():
-        try:
-            p = subprocess.run(['sudo', '-n', CTL_PATH, 'stop'], capture_output=True, text=True, timeout=60)
-            if p.returncode == 0:
-                return
-        except (PermissionError, OSError):
-            pass
+    # v0.4.1：用户态直接结束内核进程（内核是普通用户进程，无需特权控制器/osascript）
     p = subprocess.run(['/usr/bin/pgrep', '-f', MIHOMO_PGREP_PATTERN],
                        capture_output=True, text=True)
     for pid in p.stdout.strip().split():
-        script = f'do shell script "/bin/kill {pid}" with administrator privileges'
-        subprocess.run(['/usr/bin/osascript', '-e', script],
-                       capture_output=True, text=True, timeout=120)
+        try:
+            subprocess.run(['/bin/kill', pid], capture_output=True, text=True, timeout=10)
+        except Exception:
+            pass
 
 
 def ensure_runtime_bin():
@@ -727,27 +707,19 @@ def ensure_runtime_bin():
 
 
 def start_mihomo():
-    # 首选：特权控制器零弹窗（已安装 sudoers 白名单时）
-    # 注意：受限沙箱环境可能连 sudo 都禁止执行（PermissionError），须兜底回退
-    if ctl_installed():
-        try:
-            p = subprocess.run(['sudo', '-n', CTL_PATH, 'start'], capture_output=True, text=True, timeout=60)
-            if p.returncode == 0:
-                return p.stdout.strip() or 'already-running'
-        except (PermissionError, OSError):
-            pass
+    # v0.4.1：用户态直接启动（内核零特权需求——TUN 已关闭、全部端口为普通端口，
+    # 无需 sudoers 特权控制器、无需 osascript 弹窗提权）
     ensure_runtime_bin()
     conf = RUNTIME_DIR + '/mihomo.yaml'
     log = RUNTIME_DIR + '/mihomo.log'
     err = RUNTIME_DIR + '/mihomo.err.log'
     rotate_log(log)
     rotate_log(err)
-    shell = f"'{MIHOMO_BIN}' -f '{conf}' -d '{RUNTIME_DIR}' > '{log}' 2> '{err}' & echo $!"
-    escaped = shell.replace('\\', '\\\\').replace('"', '\\"')
-    script = f'do shell script "{escaped}" with administrator privileges'
-    p = subprocess.run(['/usr/bin/osascript', '-e', script],
-                       capture_output=True, text=True, timeout=300)
-    return p.stdout.strip()
+    lf = open(log, 'ab')
+    ef = open(err, 'ab')
+    p = subprocess.Popen([MIHOMO_BIN, '-f', conf, '-d', RUNTIME_DIR],
+                         stdout=lf, stderr=ef, start_new_session=True)
+    return str(p.pid)
 
 
 def _yaml_quote(s):
@@ -785,14 +757,11 @@ def generate_config(cfg):
     # TUN 只接管「明确要代理」的流量，绝不碰直连流量（默认直连架构）：
     #   auto-route: false 不再改系统默认路由，所有未指名的流量走系统原生直连，
     #   不被网络管理"进-出"污染（尤其 AI 助手的超长流式 JSON 请求）。
+    # v0.4.1：TUN 彻底关闭（enable:true 需要 root，且 dns-hijack any:53 绑定特权端口；
+    # 本项目红线冻结 auto-route=false，TUN 不承载日常流量，系统代理是唯一流量入口）。
+    # 关闭后内核零特权需求，普通用户态即可运行（与 Rust 侧 build_conf 保持一致）。
     lines.append('tun:')
-    lines.append('  enable: true')
-    lines.append('  stack: system')
-    lines.append('  auto-route: false')
-    lines.append('  strict-route: true')
-    lines.append('  auto-detect-interface: true')
-    lines.append('  dns-hijack:')
-    lines.append('    - any:53')
+    lines.append('  enable: false')
     # 两条物理上分开的「路」：智能体自己选节点代理(7893)还是本机直连(7892)，
     # 进去后 mihomo 不再二次判断。这与 Rust 侧 build_conf 保持一致。
     # 安全红线：listeners 必须逐条显式 listen: 127.0.0.1——allow-lan: false 管不到
@@ -836,22 +805,55 @@ def generate_config(cfg):
     lines.append('')
     lines.append('proxies:')
     for n in nodes:
+        proto = str(n.get('proto', 'vless'))
         lines.append(f'  - name: "{_yaml_quote(str(n["name"]))}"')
-        lines.append(f'    type: vless')
-        lines.append(f'    server: "{_yaml_quote(str(n["server"]))}"')
-        lines.append(f'    port: {n["port"]}')
-        lines.append(f'    uuid: "{_yaml_quote(str(n["uuid"]))}"')
-        lines.append(f'    network: {_yaml_quote(str(n.get("network", "tcp")))}')
-        lines.append(f'    tls: {n.get("tls", True)}')
-        lines.append(f'    udp: {n.get("udp", True)}')
-        lines.append(f'    flow: "{_yaml_quote(str(n.get("flow", "")))}"')
-        lines.append(f'    client-fingerprint: "{_yaml_quote(str(n.get("fingerprint", "chrome")))}"')
-        if n.get('sni'):
-            lines.append(f'    servername: "{_yaml_quote(str(n["sni"]))}"')
-        if n.get('publicKey'):
-            lines.append('    reality-opts:')
-            lines.append(f'      public-key: "{_yaml_quote(str(n["publicKey"]))}"')
-            lines.append(f'      short-id: "{_yaml_quote(str(n.get("shortId", "")))}"')
+        if proto == 'vmess':
+            # P2-11（v0.4.1）：vmess 分支（uuid/alterId/cipher + ws-opts）
+            lines.append(f'    type: vmess')
+            lines.append(f'    server: "{_yaml_quote(str(n["server"]))}"')
+            lines.append(f'    port: {n["port"]}')
+            lines.append(f'    uuid: "{_yaml_quote(str(n.get("uuid", "")))}"')
+            lines.append('    alterId: 0')
+            lines.append('    cipher: auto')
+            lines.append(f'    network: {_yaml_quote(str(n.get("network", "tcp")))}')
+            lines.append(f'    tls: {n.get("tls", True)}')
+            lines.append(f'    udp: {n.get("udp", True)}')
+            lines.append(f'    client-fingerprint: "{_yaml_quote(str(n.get("fingerprint", "chrome")))}"')
+            if n.get('sni'):
+                lines.append(f'    servername: "{_yaml_quote(str(n["sni"]))}"')
+            if str(n.get('network', 'tcp')) == 'ws' and n.get('wsPath'):
+                lines.append('    ws-opts:')
+                lines.append(f'      path: "{_yaml_quote(str(n["wsPath"]))}"')
+                lines.append('      headers:')
+                lines.append(f'        Host: "{_yaml_quote(str(n["server"]))}"')
+        elif proto == 'trojan':
+            # trojan 分支（password + tls/sni）
+            lines.append(f'    type: trojan')
+            lines.append(f'    server: "{_yaml_quote(str(n["server"]))}"')
+            lines.append(f'    port: {n["port"]}')
+            lines.append(f'    password: "{_yaml_quote(str(n.get("password", "")))}"')
+            lines.append(f'    udp: {n.get("udp", True)}')
+            lines.append(f'    network: {_yaml_quote(str(n.get("network", "tcp")))}')
+            if n.get('tls') or n.get('sni'):
+                lines.append(f'    tls: {n.get("tls", True)}')
+                lines.append(f'    sni: "{_yaml_quote(str(n.get("sni", "")))}"')
+        else:
+            # vless（默认）
+            lines.append(f'    type: vless')
+            lines.append(f'    server: "{_yaml_quote(str(n["server"]))}"')
+            lines.append(f'    port: {n["port"]}')
+            lines.append(f'    uuid: "{_yaml_quote(str(n["uuid"]))}"')
+            lines.append(f'    network: {_yaml_quote(str(n.get("network", "tcp")))}')
+            lines.append(f'    tls: {n.get("tls", True)}')
+            lines.append(f'    udp: {n.get("udp", True)}')
+            lines.append(f'    flow: "{_yaml_quote(str(n.get("flow", "")))}"')
+            lines.append(f'    client-fingerprint: "{_yaml_quote(str(n.get("fingerprint", "chrome")))}"')
+            if n.get('sni'):
+                lines.append(f'    servername: "{_yaml_quote(str(n["sni"]))}"')
+            if n.get('publicKey'):
+                lines.append('    reality-opts:')
+                lines.append(f'      public-key: "{_yaml_quote(str(n["publicKey"]))}"')
+                lines.append(f'      short-id: "{_yaml_quote(str(n.get("shortId", "")))}"')
     lines.append('')
     lines.append('proxy-groups:')
     # PROXY 组：fallback 类型——选中节点优先，探测失败自动落到下一个可用节点（与 mihomo.rs 保持一致）
@@ -1093,27 +1095,37 @@ def fetch_subscription_from_url(url):
     if p.returncode != 0:
         return {'error': f'curl 拉取失败 rc={p.returncode}: {p.stderr[:100]}'}
     text = p.stdout
-    if 'vless://' not in text:
+    if not any(x in text for x in ('vless://', 'vmess://', 'trojan://')):
         # 尝试 base64 解码
         try:
             decoded = base64.b64decode(text).decode('utf-8')
-            if 'vless://' in decoded:
+            if any(x in decoded for x in ('vless://', 'vmess://', 'trojan://')):
                 text = decoded
         except Exception:
             pass
     nodes = []
     for line in text.splitlines():
-        idx = line.find('vless://')
-        if idx < 0:
+        # 每行扫描任意协议前缀，取最早出现位置
+        found = None
+        for proto in ('vless://', 'vmess://', 'trojan://'):
+            i = line.find(proto)
+            if i >= 0 and (found is None or i < found[0]):
+                found = (i, proto)
+        if found is None:
             continue
-        uri = line[idx:].strip().split()[0]
-        # 去掉末尾可能带的反斜杠/引号
+        _idx, proto = found
+        uri = line[_idx:].strip().split()[0]
         uri = uri.rstrip('\\"\'').rstrip(',')
-        node = parse_vless_uri_py(uri)
+        if proto == 'vmess://':
+            node = parse_vmess_uri_py(uri[len('vmess://'):])
+        elif proto == 'trojan://':
+            node = parse_trojan_uri_py(uri[len('trojan://'):])
+        else:
+            node = parse_vless_uri_py(uri)
         if node:
             nodes.append(node)
     if not nodes:
-        return {'error': '订阅中未解析到 VLESS 节点'}
+        return {'error': '订阅中未解析到节点（支持 vless://、vmess://、trojan://）'}
     return nodes
 
 
@@ -1507,8 +1519,11 @@ def probe_route(args):
     url = _str_arg(args, 'url')
     if not url:
         return {'error': 'url 必填，如 probe_route {"url":"https://huggingface.co"}'}
+    # 参数校验（P1-5）：只接受 http/https，其余 scheme（file://、ftp:// 等）直接拒绝——
+    # 防探测器被诱导去请求本机/内网文件路径等非预期目标。
     if not url.startswith(('http://', 'https://')):
-        url = 'https://' + url
+        return {'error': f'url 仅支持 http/https scheme（收到: {url[:80]}）'}
+    # 拒绝把任何非 URL 文本静默拼成 https（旧行为会把 file:///etc/passwd 变成无意义探测）
     if not mihomo_running():
         return {'error': '代理未运行，两条路都不可用。请先 start_proxy'}
     try:
@@ -2166,7 +2181,7 @@ TOOLS = [
     {'name': 'download_proxy', 'description': '【下载/访问网络前先调这个】拿到网络管理的两条路入口并自己决定走哪条。返回节点代理 http://127.0.0.1:7893（访问国外 GitHub/Google/HuggingFace/国外 API 用这条）、本机直连 http://127.0.0.1:7892（访问国内百度/腾讯/阿里用这条）。网络管理不替你自动分流，决策权在你：目标在国外走 7893，国内走 7892。可选 {"url":"https://..."} 会附带该域名的国内/国外建议（仅建议，最终你拍板）'},
     {'name': 'doctor', 'description': '一键自检（排查任何"代理好像不对劲"先跑这个）：配置完整性、进程与 API 鉴权、fallback 故障转移组、secret、规则顺序、节点健康，返回各检查项 OK/FAIL'},
     {'name': 'audit_network', 'description': '【网络体检，纯只读零副作用】看清本机网络秩序现状：第三方代理进程、本程序端口被谁占/是否对局域网暴露、崩溃残留的系统代理死端口、默认路由与 TUN 接口、DNS 出口、PAC、环境变量代理。返回 summary 一句话结论 + degraded 列出采集降级的维度。开代理前或怀疑"网络被人接管"时先跑这个；改状态请走 start_proxy/stop_proxy。'},
-    {'name': 'install_privileged_helper', 'description': '一次性安装特权控制器（弹一次管理员授权）：root 控制脚本 + sudoers 白名单。安装后代理启停/重载全部零弹窗。强烈建议安装'},
+    {'name': 'remove_privileged_helper', 'description': 'v0.4.1 安全整改：卸载旧特权控制器（弹一次管理员授权）：删除 sudoers 免密 root 白名单与 /usr/local/lib/magic-agent 下的 root 控制脚本。内核已用户态化（TUN 关闭、全普通端口），root 通道不再需要；卸载即封死系统后门级风险。旧版升级用户建议执行一次'},
     {'name': 'probe_route', 'description': '【拿不准走哪条路时先调这个】实测「本机直连(7892) vs 节点代理(7893)」到同一个目标 url 的真实延迟 + 下载吞吐，返回对比数据和明确结论。不再凭国内/国外规则猜，而是实测路况后拍板。如 {"url":"https://huggingface.co"}，可选 {"timeout":12,"read_bytes":262144}'},
     {'name': 'server_metrics', 'description': '云服务器一键探针：远程采集当前激活云服务器的 CPU/内存/磁盘/带宽/负载/在线时长，返回结构化数据。用于远程看清服务器状态（而不是盲敲命令）。未配置服务器时会返回配置指引'},
     {'name': 'list_servers', 'description': '列出已配置的云服务器（SSH），标出当前激活的一台。server_metrics/ssh_exec 都作用于「当前激活」服务器，想确认或更换作用目标时先用这个看列表'},
@@ -2220,7 +2235,7 @@ _TOOL_SCHEMAS = {
     'download_proxy': _tool_schema({'url': {'type': 'string'}}),
     'doctor': _tool_schema(),
     'audit_network': _tool_schema(),
-    'install_privileged_helper': _tool_schema(),
+    'remove_privileged_helper': _tool_schema(),
     'probe_route': _tool_schema({
         'url': {'type': 'string'},
         'timeout': {'type': 'integer'},
@@ -2297,6 +2312,9 @@ def call_tool(name, args):
                     set_system_proxy(True)
                     if 'error' not in cfg0 and not cfg0.get('systemProxy'):
                         cfg0['systemProxy'] = True
+                    if 'error' not in cfg0:
+                        cfg0['userStopped'] = False  # P2-1：启动 = 期望运行，清停用仲裁标记
+                    if 'error' not in cfg0:
                         try:
                             write_config(cfg0)
                         except Exception as e:
@@ -2304,9 +2322,12 @@ def call_tool(name, args):
                     return {'ok': True, 'message': '内核已在运行，已补开系统代理（接管入口）'}
                 except Exception as e:
                     return {'ok': False, 'message': f'内核在运行但开系统代理失败: {e}'}
-            # 入口已开：意图对齐落盘（纠正历史 false，与 Rust 侧一致）
+            # 入口已开：意图对齐落盘（纠正历史 false，与 Rust 侧一致）；P2-1 清停用标记
             if 'error' not in cfg0 and not cfg0.get('systemProxy'):
                 cfg0['systemProxy'] = True
+            if 'error' not in cfg0:
+                cfg0['userStopped'] = False
+            if 'error' not in cfg0:
                 try:
                     write_config(cfg0)
                 except Exception as e:
@@ -2357,11 +2378,14 @@ def call_tool(name, args):
         cfg2 = read_config()
         if 'error' not in cfg2 and not cfg2.get('systemProxy'):
             cfg2['systemProxy'] = True
+        if 'error' not in cfg2:
+            cfg2['userStopped'] = False  # P2-1：启动 = 期望运行，清停用仲裁标记
+        if 'error' not in cfg2:
             try:
                 write_config(cfg2)
             except Exception as e:
                 print(f'[start_proxy] WARN 意图落盘失败（不影响本次接管）: {e}', file=sys.stderr)
-        return {'ok': True, 'pid': pid, 'message': '代理已启动，系统代理已开并通过对账（接管入口就绪，需管理员授权）'}
+        return {'ok': True, 'pid': pid, 'message': '代理已启动，系统代理已开并通过对账（接管入口就绪）'}
     elif name == 'stop_proxy':
         stop_mihomo()
         # 与 Rust 侧 stop_proxy 保持一致：停内核后必须关系统代理，
@@ -2370,14 +2394,21 @@ def call_tool(name, args):
             set_system_proxy(False)
         except Exception as e:
             return {'ok': False, 'message': f'内核已停止，但关系统代理失败: {e}'}
+        # P2-1（v0.4.1 已修）：落盘 userStopped=true——App 看门狗读到此标记
+        # 绝不 30 秒内复活内核（旧行为 PID 34747→40591 实锤"我停了它又活了"）。
+        cfg = read_config()
+        if 'error' not in cfg:
+            cfg['userStopped'] = True
+            try:
+                write_config(cfg)
+            except Exception as e:
+                print(f'[stop_proxy] WARN userStopped 落盘失败: {e}', file=sys.stderr)
         # P1-2：正常停止 = 接管结束，结账（只结账不回滚，与 Rust 同语义）。
-        # 注意：Rust App 看门狗可能随后复活内核（CONTRACT 已登记的已知缺陷），
-        # 账本视角 stop 已结账如实；仲裁属 P2-1。
         try:
             ledger_settle('mcp:stop_proxy')
         except Exception as e:
             print(f'[ledger] WARN settle 失败: {e}', file=sys.stderr)
-        return {'ok': True, 'message': '代理已停止'}
+        return {'ok': True, 'message': '代理已停止（已落盘 userStopped 仲裁标记，App 看门狗不会复活内核）'}
     elif name == 'list_nodes':
         cfg = read_config()
         if 'error' in cfg:
@@ -2448,6 +2479,14 @@ def call_tool(name, args):
         target = _str_arg(args, 'target', 'proxy')
         if not domain:
             return {'error': 'domain is required'}
+        # 参数校验（P1-5）：域名必须是合法域名/IP，且不含换行/逗号/引号等注入字符。
+        # 旧实现不校验：localhost、含换行注入串都会"保存成功"（规则静默失效/注入）。
+        if len(domain) > 253 or any(c in domain for c in '\n\r,"\''):
+            return {'error': f'domain 含非法字符或过长（收到 {len(domain)} 字符）'}
+        if _sanitize_rule_field(domain) != domain:
+            return {'error': f'domain 含非法字符: {domain[:80]}（只允许字母数字和 .-_:*/#[]）'}
+        if domain.lower() in ('localhost',) or domain.lower().endswith('.localhost'):
+            return {'error': 'domain 不能是 localhost（本机回环不经过代理内核，规则无意义）'}
         # target 支持 proxy / direct / 节点名（走指定节点）
         if target not in ('proxy', 'direct'):
             node_names = [n.get('name') for n in cfg.get('nodes', [])]
@@ -2551,8 +2590,8 @@ def call_tool(name, args):
         return doctor()
     elif name == 'audit_network':
         return audit_network(args)
-    elif name == 'install_privileged_helper':
-        return install_privileged_helper()
+    elif name == 'remove_privileged_helper':
+        return remove_privileged_helper()
     elif name == 'probe_route':
         return probe_route(args)
     elif name == 'server_metrics':
@@ -2642,10 +2681,12 @@ def call_tool(name, args):
                 message += '；' + '；'.join(notes)
             message += '。若接管前的设置并非直连，请手动恢复'
             errs = []
-        # 意图落盘：防止 App 启动联动又自动开系统代理覆盖还原结果（与 Rust 同语义）
+        # 意图落盘：防止 App 启动联动又自动开系统代理覆盖还原结果（与 Rust 同语义）；
+        # P2-1：还原 = 明确停用，落盘仲裁标记防 App 看门狗复活内核
         cfg = read_config()
         if 'error' not in cfg:
             cfg['systemProxy'] = False
+            cfg['userStopped'] = True
             try:
                 write_config(cfg)
             except Exception as e:

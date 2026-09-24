@@ -145,17 +145,26 @@ pub fn set_system_proxy(enable: bool, port: u16) -> Result<SystemProxyStatus, St
 ///   Server: 127.0.0.1
 ///   Port: 7891
 ///   Authenticated Proxy Enabled: 0
-/// 对账标准（管理员级）：开 = Enabled:Yes 且 Server=127.0.0.1 且 Port=期望端口
-/// （"开着但指向别人的端口"同样是失控状态，必须点名）；关 = Enabled:No。
+///
+/// P1-7 口径修正（v0.4.1）：**开关态以 scutil 全局视图为唯一权威**——真机实测
+/// 出现过矛盾态（scutil 全局 HTTPEnable: 0 而服务级 -getwebproxy 仍回
+/// Enabled: Yes），从服务级 Enabled 推断开关态会虚报 mismatched。因此：
+///   - 开（expect_on=true）：达标 = 全局开（HTTPEnable:1/SOCKSEnable:1）
+///     且服务级 Port=期望端口（"开着但指向别人的端口"同样点名）；
+///   - 关（expect_on=false）：达标 = 全局关 且服务级 Port≠期望端口
+///     （服务级 Enabled 字段不参与判定；残留指向本程序端口仍点名）。
 /// 单项读取失败记入该服务 errors，不影响其他服务（绝不 panic、绝不静默吞错）。
 pub fn verify_system_proxy(services: &[String], want_port: u16, expect_on: bool) -> Vec<ServiceProxyState> {
+    // 全局权威只读一次（秒级传播延迟存在，但 set 完成后已过重写+短暂窗口；
+    // 与服务级联合判定避免"全局已传播、服务级矛盾"的虚报）
+    let global_enabled = status().enabled;
     services
         .iter()
         .map(|svc| {
             let mut errors = Vec::new();
-            let http = get_proxy_detail(svc, "-getwebproxy", want_port, expect_on, &mut errors);
-            let https = get_proxy_detail(svc, "-getsecurewebproxy", want_port, expect_on, &mut errors);
-            let socks = get_proxy_detail(svc, "-getsocksfirewallproxy", want_port, expect_on, &mut errors);
+            let http = get_proxy_detail(svc, "-getwebproxy", want_port, expect_on, global_enabled, &mut errors);
+            let https = get_proxy_detail(svc, "-getsecurewebproxy", want_port, expect_on, global_enabled, &mut errors);
+            let socks = get_proxy_detail(svc, "-getsocksfirewallproxy", want_port, expect_on, global_enabled, &mut errors);
             ServiceProxyState {
                 service: svc.clone(),
                 http_on: http.0,
@@ -167,18 +176,21 @@ pub fn verify_system_proxy(services: &[String], want_port: u16, expect_on: bool)
         .collect()
 }
 
-/// 返回 (是否达标, 读到的端口)。达标 = 开关符合期望；开启时还要求指向 127.0.0.1:期望端口。
-fn get_proxy_detail(svc: &str, flag: &str, want_port: u16, expect_on: bool, errors: &mut Vec<String>) -> (bool, u16) {
+/// 返回 (是否达标, 读到的端口)。
+/// 达标口径（P1-7）：开关态由 scutil 全局视图决定（global_enabled），服务级只核对端口；
+/// 开启时还要求服务级精确指向期望端口。
+fn get_proxy_detail(svc: &str, flag: &str, want_port: u16, expect_on: bool, global_enabled: bool, errors: &mut Vec<String>) -> (bool, u16) {
     match run(NETWORKSETUP, &[flag, svc]) {
         Ok(out) => {
-            let (enabled, port) = parse_proxy_detail(&out);
+            let (_enabled, port) = parse_proxy_detail(&out);
             let ok = if expect_on {
-                enabled && port == want_port
+                global_enabled && port == want_port
             } else {
-                !enabled
+                !global_enabled && port != want_port
             };
-            if !ok && enabled && port != want_port {
-                // 开着但指向别的端口：把事实塞进 errors 供点名排查
+            if port != want_port && port != 0 {
+                // 服务级指向别的端口：把事实塞进 errors 供点名排查（开着时指向
+                // 非期望端口 = 失控；关着时仍指向期望端口 = 残留，都点名）
                 errors.push(format!("{}: 指向 {}:{} 而非期望端口 {}", flag, "127.0.0.1", port, want_port));
             }
             (ok, port)

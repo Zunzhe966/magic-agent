@@ -13,7 +13,7 @@
         </div>
         <div class="stat-card">
           <div class="stat-label">更新状态</div>
-          <div class="stat-value" :class="{ good: updaterState.state === 'idle' || updaterState.state === 'latest' }">{{ statusText }}</div>
+          <div class="stat-value" :class="{ good: updaterState.state === 'idle' || updaterState.state === 'latest', warn: updaterState.state === 'available' }">{{ statusText }}</div>
           <div class="stat-sub">{{ updaterState.state === 'available' ? `新版本 ${updaterState.latestVersion}` : updaterState.channelLabel }}</div>
           <button class="btn primary" :disabled="updaterState.busy" @click="checkUpdate({ manual: true })">{{ updaterState.busy ? '处理中…' : '检查更新' }}</button>
         </div>

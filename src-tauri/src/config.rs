@@ -22,6 +22,20 @@ pub struct ProxyNode {
     /// 地区标签（如 美国/日本/香港），空则展示时从名称猜测
     #[serde(default)]
     pub region: String,
+    /// 节点协议（P2-11，v0.4.1）："vless"（默认）| "vmess" | "trojan"。
+    /// 订阅解析按协议分支生成 mihomo 配置；手动添加默认 vless。
+    #[serde(default = "default_proto")]
+    pub proto: String,
+    /// trojan 节点密码（proto=trojan 时使用；其余协议为空）。
+    #[serde(default)]
+    pub password: String,
+    /// vmess WebSocket 路径（proto=vmess 且 network=ws 时使用；空则不带 ws-opts）。
+    #[serde(default)]
+    pub ws_path: String,
+}
+
+fn default_proto() -> String {
+    "vless".to_string()
 }
 
 fn default_source() -> String {
@@ -120,6 +134,11 @@ pub struct AppConfig {
     /// false（默认）= 快速模式，沿用直接接管行为。
     #[serde(default, alias = "confirm_takeover")]
     pub confirm_takeover: bool,
+    /// P2-1 双引擎停用仲裁（v0.4.1）：MCP 侧 stop_proxy / restore_network 会把此标记
+    /// 置 true 落盘（App 内存 should_run 改不了），App 看门狗读到此标记 = 用户/AI
+    /// 明确要停，绝不 30 秒内自动复活内核。start_proxy（含已运行分支）置回 false。
+    #[serde(default, alias = "user_stopped")]
+    pub user_stopped: bool,
 }
 
 impl Default for AppConfig {
@@ -136,6 +155,7 @@ impl Default for AppConfig {
             active_server_id: None,
             domain_rules: vec![],
             api_secret: None,
+            user_stopped: false,
             // 缺省 GitHub 通道：开源版面向真实用户
             update_channel: Some("github".to_string()),
             ssh_host: None,
@@ -474,12 +494,16 @@ pub fn is_private_or_reserved_ipv4(v4: std::net::Ipv4Addr) -> bool {
     is_private_or_reserved(std::net::IpAddr::V4(v4))
 }
 
-/// 从订阅文本中解析 VLESS 节点。
-/// 订阅内容可能是：明文 vless:// 链接、每行一个，或 base64 编码的整段内容。
-pub fn parse_vless_subscription(text: &str) -> Result<Vec<ProxyNode>, String> {
-    // 若文本不含 vless://，尝试 base64 解码（macOS 自带 base64 -D）
+/// 从订阅文本中解析代理节点（P2-11，v0.4.1 起支持 vless / vmess / trojan）。
+/// 订阅内容可能是：明文 vless:// / vmess:// / trojan:// 链接、每行一个，
+/// 或 base64 编码的整段内容。
+pub fn parse_subscription(text: &str) -> Result<Vec<ProxyNode>, String> {
+    // 文本里没有任何已知协议前缀时，尝试 base64 解码（macOS 自带 base64 -D）
     let mut content = text.to_string();
-    if !content.contains("vless://") {
+    if !content.contains("vless://")
+        && !content.contains("vmess://")
+        && !content.contains("trojan://")
+    {
         let cleaned: String = content.chars().filter(|c| !c.is_whitespace()).collect();
         if !cleaned.is_empty() {
             let out = std::process::Command::new("/usr/bin/base64")
@@ -508,22 +532,161 @@ pub fn parse_vless_subscription(text: &str) -> Result<Vec<ProxyNode>, String> {
     let mut seen = std::collections::HashSet::new();
     for line in content.lines() {
         let line = line.trim();
-        let Some(idx) = line.find("vless://") else {
-            continue;
-        };
-        let uri = &line[idx..];
-        if let Ok(node) = parse_vless_uri(uri) {
-            // 按 server:port 去重：订阅可能重复返回同一节点，避免重复添加
-            let key = format!("{}:{}", node.server, node.port);
-            if seen.insert(key) {
-                nodes.push(node);
+        let mut offset = 0;
+        while let Some((idx, _proto)) = ["vless://", "vmess://", "trojan://"]
+            .iter()
+            .filter_map(|p| line[offset..].find(p).map(|i| (i + offset, p)))
+            .min_by_key(|(i, _)| *i)
+        {
+            let uri = &line[idx..];
+            let node = if uri.starts_with("vless://") {
+                // parse_vless_uri 内部自行 strip 前缀（旧函数契约）
+                parse_vless_uri(uri)
+            } else if let Some(rest) = uri.strip_prefix("vmess://") {
+                parse_vmess_uri(rest)
+            } else if let Some(rest) = uri.strip_prefix("trojan://") {
+                parse_trojan_uri(rest)
+            } else {
+                Err("未知协议".to_string())
+            };
+            if let Ok(n) = node {
+                // 按 server:port 去重：订阅可能重复返回同一节点，避免重复添加
+                let key = format!("{}:{}", n.server, n.port);
+                if seen.insert(key) {
+                    nodes.push(n);
+                }
             }
+            // 跳到本行末尾（每行一个链接，避免重复扫描同一行）
+            offset = line.len();
         }
     }
     if nodes.is_empty() {
-        return Err("未能从订阅中解析出任何 VLESS 节点".to_string());
+        return Err("未能从订阅中解析出任何节点（支持 vless://、vmess://、trojan://）".to_string());
     }
     Ok(nodes)
+}
+
+/// 兼容旧入口：旧调用点名称（lib.rs fetch_subscription_blocking）保留转发。
+pub fn parse_vless_subscription(text: &str) -> Result<Vec<ProxyNode>, String> {
+    parse_subscription(text)
+}
+
+/// 解析单个 vmess:// URI 为 ProxyNode。
+/// 标准 V2Ray share link：vmess://<base64(JSON)>，JSON 字段
+/// {v, ps(名称), add(地址), port, id(uuid), aid, net, type, host, path, tls, sni, fp}。
+fn parse_vmess_uri(rest: &str) -> Result<ProxyNode, String> {
+    // vmess:// 后是 base64（可能带尾随字符）
+    let b64: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '=')
+        .collect();
+    if b64.is_empty() {
+        return Err("vmess base64 为空".to_string());
+    }
+    let out = std::process::Command::new("/usr/bin/base64")
+        .arg("-D")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut c| {
+            use std::io::Write;
+            if let Some(mut stdin) = c.stdin.take() {
+                let _ = stdin.write_all(b64.as_bytes());
+            }
+            c.wait_with_output()
+        })
+        .map_err(|e| format!("base64 子进程失败: {e}"))?;
+    if !out.status.success() {
+        return Err("vmess base64 解码失败（JSON 应可解码）".to_string());
+    }
+    let json_text = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value =
+        serde_json::from_str(&json_text).map_err(|e| format!("vmess JSON 解析失败: {e}"))?;
+    let host = v.get("add").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    let port: u16 = v
+        .get("port")
+        .and_then(|x| {
+            x.as_str()
+                .map(|s| s.to_string())
+                .or_else(|| x.as_u64().map(|n| n.to_string()))
+        })
+        .and_then(|s| s.parse().ok())
+        .ok_or("vmess 端口无效")?;
+    if host.is_empty() {
+        return Err("vmess 缺少 add 字段".to_string());
+    }
+    let name = v.get("ps").and_then(|x| x.as_str()).unwrap_or(&host).to_string();
+    let network = v.get("net").and_then(|x| x.as_str()).unwrap_or("tcp").to_string();
+    let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let tls = v.get("tls").and_then(|x| x.as_str()).map(|s| s == "tls" || s == "true").unwrap_or(false);
+    let sni = v.get("sni").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    Ok(ProxyNode {
+        region: guess_region(&name),
+        name,
+        server: host,
+        port,
+        uuid: v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        flow: String::new(),
+        network,
+        tls,
+        udp: true,
+        fingerprint: v.get("fp").and_then(|x| x.as_str()).unwrap_or("chrome").to_string(),
+        public_key: String::new(),
+        short_id: String::new(),
+        sni,
+        source: "subscription".to_string(),
+        proto: "vmess".to_string(),
+        password: String::new(),
+        ws_path: path,
+    })
+}
+
+/// 解析单个 trojan:// URI 为 ProxyNode。
+/// trojan://password@host:port?security=tls&sni=...&type=tcp#name
+/// 注意顺序：先拆 fragment（#），再拆 query（?）——否则 host:port#name 的
+/// 端口串会混入 fragment 导致解析失败（实测 bug，已由单测锁住）。
+fn parse_trojan_uri(rest: &str) -> Result<ProxyNode, String> {
+    let (no_frag, fragment) = match rest.find('#') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    let (auth_part, query) = match no_frag.find('?') {
+        Some(i) => (&no_frag[..i], &no_frag[i + 1..]),
+        None => (no_frag, ""),
+    };
+    let (password, hostport) = auth_part.rsplit_once('@').ok_or("trojan 缺少 @")?;
+    let (host, port_str) = hostport.rsplit_once(':').ok_or("trojan 缺少端口")?;
+    let port: u16 = port_str.parse().map_err(|_| "trojan 端口无效")?;
+    let mut params = std::collections::HashMap::new();
+    for kv in query.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            params.insert(k, url_decode(v));
+        }
+    }
+    let name = if fragment.is_empty() {
+        host.to_string()
+    } else {
+        url_decode(fragment)
+    };
+    Ok(ProxyNode {
+        region: guess_region(&name),
+        name,
+        server: host.to_string(),
+        port,
+        uuid: String::new(),
+        flow: String::new(),
+        network: params.get("type").cloned().unwrap_or_else(|| "tcp".to_string()),
+        tls: params.get("security").map(|s| s == "tls" || s == "reality").unwrap_or(false),
+        udp: true,
+        fingerprint: String::new(),
+        public_key: String::new(),
+        short_id: String::new(),
+        sni: params.get("sni").cloned().unwrap_or_default(),
+        source: "subscription".to_string(),
+        proto: "trojan".to_string(),
+        password: password.to_string(),
+        ws_path: String::new(),
+    })
 }
 
 /// 解析单个 vless:// URI 为 ProxyNode。
@@ -560,6 +723,9 @@ fn parse_vless_uri(uri: &str) -> Result<ProxyNode, String> {
 
     Ok(ProxyNode {
         region: guess_region(&name),
+            proto: "vless".to_string(),
+            password: String::new(),
+            ws_path: String::new(),
         name,
         server: host.to_string(),
         port,
@@ -833,6 +999,55 @@ mod tests {
     }
 
     #[test]
+    fn parse_subscription_supports_vmess_and_trojan() {
+        // P2-11（v0.4.1）：vmess://（base64 JSON）与 trojan:// 解析。
+        use std::process::Command as Cmd;
+        // 构造 vmess share link：base64(JSON)
+        let json = r#"{"v":"2","ps":"东京-测试","add":"198.51.100.9","port":"443","id":"uuid-1","aid":"0","net":"ws","type":"none","host":"cdn.example.com","path":"/ws-path","tls":"tls","sni":"cdn.example.com"}"#;
+        let b64 = {
+            // 用 base64 子进程编码（与解析路径对称）
+            let mut c = Cmd::new("/usr/bin/base64")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            c.stdin.take().unwrap().write_all(json.as_bytes()).unwrap();
+            String::from_utf8(c.wait_with_output().unwrap().stdout).unwrap()
+        };
+        let text = format!("vmess://{}", b64.trim());
+        let nodes = parse_subscription(&text).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].proto, "vmess");
+        assert_eq!(nodes[0].server, "198.51.100.9");
+        assert_eq!(nodes[0].port, 443);
+        assert_eq!(nodes[0].ws_path, "/ws-path");
+        assert!(nodes[0].tls);
+
+        // trojan://password@host:port?sni=...#name
+        let t = parse_subscription(
+            "trojan://pass-123@198.51.100.10:443?security=tls&sni=t.example.com#东京",
+        )
+        .unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].proto, "trojan");
+        assert_eq!(t[0].password, "pass-123");
+        assert_eq!(t[0].server, "198.51.100.10");
+        assert_eq!(t[0].sni, "t.example.com");
+        assert!(t[0].tls);
+
+        // 混合订阅：vless + vmess + trojan 一行一个
+        let mixed = "vless://uuid-1@198.51.100.1:443?security=reality&pbk=AAA&sid=1#节点A
+vmess://".to_string() + &b64.trim() + "
+trojan://pass-x@198.51.100.2:8443#节点C";
+        let ms = parse_subscription(&mixed).unwrap();
+        assert_eq!(ms.len(), 3);
+        assert!(ms.iter().any(|n| n.proto == "vless"));
+        assert!(ms.iter().any(|n| n.proto == "vmess"));
+        assert!(ms.iter().any(|n| n.proto == "trojan"));
+    }
+
+    #[test]
     fn parse_vless_uri_reality() {
         let uri = "vless://00000000-0000-4000-8000-000000000000@1.1.1.1:443?encryption=none&security=reality&sni=www.example.com&fp=chrome&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0000000000000000&flow=xtls-rprx-vision&type=tcp#%E7%A4%BA%E4%BE%8B%E8%8A%82%E7%82%B9";
         let node = parse_vless_uri(uri).expect("parse should succeed");
@@ -894,6 +1109,9 @@ mod tests {
                 sni: String::new(),
                 source: "manual".into(),
                 region: String::new(),
+            proto: "vless".to_string(),
+            password: String::new(),
+            ws_path: String::new(),
             }],
             selected_node: Some("示例节点".into()),
             servers: vec![],
@@ -932,6 +1150,9 @@ mod tests {
                 sni: String::new(),
                 source: "manual".into(),
                 region: String::new(),
+            proto: "vless".to_string(),
+            password: String::new(),
+            ws_path: String::new(),
             }],
             selected_node: Some("node-a".into()),
             servers: vec![ServerInfo {

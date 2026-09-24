@@ -48,6 +48,7 @@ body { background: var(--bg); color: var(--text); }
 .stat-label { font-size: 13px; color: var(--muted); }
 .stat-value { font-size: 26px; font-weight: 700; margin: 10px 0 6px; }
 .stat-value.good { color: var(--green); }
+.stat-value.warn { color: var(--danger); }
 .stat-sub { font-size: 12px; color: var(--muted); }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
 .panel-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }

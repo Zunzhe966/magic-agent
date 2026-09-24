@@ -3,15 +3,16 @@
 > 代码合并顺序：改代码 → 更新本文件。本文件与其他文档冲突时，本文件优先。
 > 产品定位与重构路线：`docs/设计.md`（一键归序五步闭环）、`docs/重构计划.md`（P0/P1/P2）。
 
-## 冻结的正确状态（2026-09-03 起；2026-09-23 增补安全红线）
+## 冻结的正确状态（2026-09-03 起；2026-09-23 增补安全红线；2026-09-24 v0.4.1 内核用户态化）
 
 - 架构：Tauri 2 + mihomo 内核。组合根 = `src-tauri/src/lib.rs::run()`；内核管理 = `mihomo.rs::MihomoManager`（深模块，接口只增不删）。
-- 分流设计：系统代理 + 进程级分流；TUN 仅按规则拉「该走代理」的流量（auto-route: false, strict-route: true）；两条死锁端口 7893(无条件 PROXY)/7892(无条件 DIRECT)。
+- **内核用户态化红线（v0.4.1，2026-09-24）**：mihomo 以**普通用户态**运行（App/MCP 直接 spawn，stop 直接 kill），**任何路径都禁止恢复 sudoers 免密控制器 / osascript root 启动 / root 内核**。旧特权架构（`/etc/sudoers.d/magic-agent-mihomo` + `/usr/local/lib/magic-agent/mihomo-ctl.sh`）是系统后门级风险（脚本可被替换即免密 root 任意命令），已卸载入口 `remove_privileged_helper`（MCP）+ `scripts/uninstall-privileged-helper.sh`。
+- 分流设计：系统代理 + 进程级分流；TUN 已**彻底关闭**（`tun.enable: false`——enable:true 需 root 且 dns-hijack any:53 绑定特权端口；auto-route:false 红线冻结，系统代理是唯一流量入口，TUN 不承载日常流量）；两条死锁端口 7893(无条件 PROXY)/7892(无条件 DIRECT)。
 - **接管入口红线（P1-A，2026-09-24）**：因 auto-route: false 冻结，TUN 不承载日常流量，**系统代理是分流引擎唯一的全机流量入口**。故接管生效中（内核在跑）达标态恒为"系统代理开着并指向本程序端口"，不看 config.systemProxy 历史意图：start_proxy（含已运行分支/standalone 探针）无条件开入口并在成功后把意图纠正落盘为 true；漂移归位一律回开。入口开不成 = 半套秩序 → 宁可不启（停内核+按账本回滚+结账）。config.systemProxy 仅作 UI 显示态与用户手动开关（set_system_proxy）的落点，不再是"接管是否设入口"的开关。Python 侧有三向锁测试钉死（成功开/失败回滚/已运行补开）。
   - 原因（真机取证）：v0.3.1 及之前按意图可关，用户点启动后内核空转、实时连接页零记录，被当成"启动没响应"。旧文案"TUN 已接管全局，系统代理不需要"是虚假声称，已全部清理。
   - 推论：P1-4 漂移巡检/归位的达标口径 expect_on 恒为 true（接管中入口必须开）与本红线同语义；看门狗重启内核成功后必须走【begin_takeover 记账 → set_system_proxy(true) 对账】联动（v0.3.2 修复：旧逻辑只恢复 pid 不恢复入口，是真机"实时连接 0 条"的直接触发路径）。
 - **监听红线（2026-09-23）**：所有 `listeners` 条目必须显式 `listen: 127.0.0.1`。实测证伪两个旧假设：①`allow-lan: false` 管不到 listeners 段；②`bind-address` 字段对 listener 无效——缺 `listen:` 时内核绑 0.0.0.0，局域网可匿名白嫖节点出口。Rust 单测已锁死断言，升级 mihomo 版本后须重跑 docs/设计.md §七 验收实验。
-- **日志权限红线（2026-09-23）**：root 启动路径（osascript shell_cmd 与 mihomo-ctl.sh start）必须 `umask 077` 并对存量日志/轮转 .old `chmod 600`。日志含全机连接记录，世界可读 = 同机隐私泄露。
+- **日志权限红线（2026-09-23；v0.4.1 起为用户态日志）**：内核已用户态化后，日志为用户进程文件（受用户 umask 控制），不再存在 root 世界可读问题；启动路径仍须轮转超 10MB 日志（`.log.old`）。**禁止恢复 root 启动路径**（否则重新引入 0644 世界可读全机连接记录问题）。
 - 回归基线：`cd src-tauri && cargo test` 全绿（含 `generated_conf_is_valid_mihomo_yaml` 用 `mihomo -t` 真校验配置）。
 
 ## 发版流程铁律（2026-09-19 起，**这是唯一正确的发布方式**）
@@ -79,7 +80,7 @@ App 已内置 updater（`tauri.conf.json` → `plugins.updater.active=true`，en
 - 不得把 `tun.auto-route` 改回 true（会接管系统默认路由，重演劫持事故）。
 - 不得删除/绕过 `PROTECTED_DIRECT_DOMAINS` 保命直连名单及其测试。
 - 不得删除 `RunEvent::Exit` 收尾钩子。
-- mihomo 以 root 运行是 TUN 的硬约束；一切「App 退出后仍需内核活着」的需求必须走显式的后台服务（launchd），不许靠孤儿进程。
+- **不得把 mihomo 恢复为 root 运行 / 恢复 sudoers 免密控制器 / osascript root 启动**（v0.4.1 用户态化红线；内核零特权需求——TUN 关闭、全普通端口、DNS 走 127.0.0.1:1054）。
 - 组名/规则引用必须同源 `sanitize_node_name`（有回归测试钉死）。
 - 图标唯一母版必须是 `src-tauri/icons/source-icon.png`，全部尺寸只能通过 `scripts/make-icons.sh` 生成；禁止手工替换单个尺寸后直接发版。
 - **不得给 listeners 缺省 `listen:` 字段或用 `bind-address` 替代**（见上方监听红线；违反 = 局域网裸奔）。
@@ -88,28 +89,64 @@ App 已内置 updater（`tauri.conf.json` → `plugins.updater.active=true`，en
 
 ## 已知待修缺陷（修复后移入 HISTORY）
 
-- **`-getwebproxy` 的 `Enabled:` 字段语义在真机不可靠**（2026-09-23 MCP 实机实测）：
+- **`-getwebproxy` 的 `Enabled:` 字段语义在真机不可靠**（2026-09-23 MCP 实机实测，**v0.4.1 已修**）：
   `-set*state off` 后立刻读回显示 `Enabled: No`，但同一台机器另一时点出现
   scutil 全局 `HTTPEnable: 0` 而服务级仍回 `Enabled: Yes` 的矛盾态；
   `-get*state` 系列读命令真机又不存在（读写命令集不对称）。
   后果：`set_system_proxy(false)` 的对账可能虚报未达标（漏报方向安全但违反
-  "状态如实"红线）。修法：**达标口径改为"scutil 全局视图为准 + 服务级仅核对
-  Server/Port 精确匹配"**，不再从服务级 Enabled 字段推断开关态；需真机多状态
-  取证（开/关/半关）后再定判定表。
-- **MCP stop_proxy 会被 App 看门狗 30 秒内复活**（同轮实测）：App 在跑且
+  "状态如实"红线）。修法（已落地）：**达标口径改为"scutil 全局视图为准 + 服务级仅核对
+  Server/Port 精确匹配"**，不再从服务级 Enabled 字段推断开关态；Rust 与 MCP
+  两侧 verify_system_proxy 已同步改造并有回归覆盖（开=全局开且端口精确匹配；
+  关=全局关且端口≠期望端口，残留指向本程序端口仍点名）。
+- **MCP stop_proxy 会被 App 看门狗 30 秒内复活**（同轮实测，**v0.4.1 已修**）：App 在跑且
   should_run=true 时，MCP `stop_proxy` 杀掉内核后，App 看门狗按设计自动拉起
   （PID 变化 34747→40591 证实）。单看是"预期行为"，但从 AI 入口视角
-  "我停了它又活了"= 失控。这是双引擎共享状态缺仲裁的实例，P2-1 收敛时一并解决；
-  过渡修法：MCP stop 同时把 should_run 落盘（config 增 userStopped 标记），App 看门狗读取。
-- **MCP add_domain_rule 域名入参无校验**（同轮实测）：`localhost` 与含换行的
+  "我停了它又活了"= 失控。修法（已落地）：MCP stop/restore_network 与 Rust
+  stop_proxy/restore_network 均落盘 `config.userStopped=true`，App 看门狗重启前
+  读到即放弃复活并同步内存 should_run=false；start_proxy（含已运行分支）清回 false。
+- **MCP add_domain_rule 域名入参无校验**（同轮实测，**v0.4.1 已修**）：`localhost` 与含换行的
   `evil.com\nallow-lan: true` 都返回"已保存"原样入库。配置生成器两侧都会把
   非法域名静默丢弃（dump_conf/generate_config 双验证未发生注入），但"保存成功
-  却永不生效"就是静默失效。修法：add 时即校验拒绝、明确报错。
-- **MCP probe_route 无参数校验**（同轮实测）：url=`file:///etc/passwd` 被拼成
+  却永不生效"就是静默失效。修法（已落地）：add 时即校验拒绝（长度 ≤253、无换行/逗号/引号、
+  净化往返一致、拒绝 localhost）、明确报错。
+- **MCP probe_route 无参数校验**（同轮实测，**v0.4.1 已修**）：url=`file:///etc/passwd` 被拼成
   `https://file:///etc/passwd` 照常发起探测；url 传数字 12345 被拼成
-  `https://12345`。无注入风险但结果全是误导。修法：scheme 白名单 + 类型校验。
+  `https://12345`。无注入风险但结果全是误导。修法（已落地）：scheme 白名单（仅 http/https），
+  非 http(s) 直接拒绝，不再静默拼接。
 - **SSH auth:key 缺私钥时退化为 10 秒 TCP 超时**（同轮实测）：Keychain 无对应
   私钥时未快速失败提示"缺凭据"，而是等 connect 超时报网络错误，误导排查方向。
+
+## 2026-09-24 v0.4.1 审计修复记录（P2 工程项）
+
+- **P2-9 硬编码例外 IP 文档化（已落地）**：`203.0.113.74` 属 RFC 5737 TEST-NET-3
+  文档保留段（真实互联网不可路由），它是**保命直连哨兵**——保证第 0 层直连名单
+  非空、规则可解析、回归测试锚点；真实 AI 中转站接入时替换/追加即可，切勿清空。
+  已写入 mihomo.rs / server.py 双引擎注释（含与搬瓦工服务器 <REDACTED_SERVER_IP> 的语义区分：
+  那是 SSH/节点服务器，走第 1 层"节点服务器流量直连"，信息只在本地 config 与
+  `.workbuddy/memory`，代码无硬编码）。
+- **P2-10 历史 App 名探测（核实为已消除/兼容保留）**：Rust `bin_path()` 只查
+  runtime 常驻副本 → resources/bin/mihomo → /usr/local/bin/mihomo，**无任何 App 名
+  探测**；MCP `_MIHOMO_RUNTIME_BIN` 同理。`scripts/magic-agent-mcp.sh` 探测历史
+  目录名是**有意的向后兼容**（老安装目录仍可找到 server.py），注释已说明；
+  `scripts/mihomo-ctl.sh` 属待卸载特权脚本（v0.4.1 起 MCP 不再调用），随
+  uninstall-privileged-helper.sh 一并删除。
+- **P2-11 订阅扩展 + 节点可用性预检（已落地）**：订阅解析由仅 vless 扩展为
+  vless/vmess/trojan 三协议（Rust parse_subscription + MCP parse_vmess_uri_py/
+  parse_trojan_uri_py），mihomo 配置生成器按 proto 分支（vmess：alterId/cipher/
+  ws-opts；trojan：password/sni），双引擎同步 + 真实 `mihomo -t` 回归锁
+  （multi_proto_proxies_generate_valid_mihomo_yaml）。**节点预检**：MCP
+  fetch_subscription 拉取后直连 TCP 探测新节点可达性（并发 5、单节点 2s、上限 10），
+  返回 reachable/probeMs 标记，不可用节点不会被误当出口。
+- **P2-12 更新静默（已核实提示链完整 + 补可见态）**：`dialog:false` 只禁用
+  updater 插件系统对话框；App 内提示链（ask 弹窗 + 设置页状态卡）一直存在，但
+  发现新版本后从不置 `state=available`，设置页"新版本 X"文案永不显示（真缺口）。
+  已修：updater.js 检查命中先置 available，设置页状态卡红色强调（warn 样式），
+  弹窗/跳过/下载/重启链路不变。
+- **P2-13 看门狗仅覆盖 App 运行期（记录边界，不改架构）**：看门狗在 App 主进程内
+  （App 运行期间监视内核健康+30s 复活），MCP 启动的内核由 MCP 自己管理生命周期——
+  这是用户态红线下的设计（无常驻系统服务）。组合覆盖：App 运行期=看门狗；
+  App 退出=SIGTERM 信号收尾（#13）；MCP 停核=userStopped 仲裁（#14）。边界写入本
+  记录，禁止为"全覆盖"重新引入 root 常驻服务。
 
 ## 状态如实红线（P0-1 修复后新增）
 

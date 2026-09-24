@@ -9,6 +9,16 @@ mod ssh;
 mod system_proxy;
 mod updater;
 
+
+/// P0-2 信号收尾标志（v0.4.1）：SIGTERM/SIGHUP 到达时置位，由 run() 内的
+/// 监听线程轮询后执行与 RunEvent::Exit 相同的收尾（停内核+关系统代理+结账）。
+/// SIGKILL 无法拦截，仍靠启动自检（startup_self_check）兜底。
+static TERM_SIGNAL_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn handle_term_signal(_: libc::c_int) {
+    TERM_SIGNAL_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -948,7 +958,8 @@ async fn start_proxy(
             Err(e) => eprintln!("[start_proxy] 系统代理设置失败: {e}"),
         }
         let status = m.status();
-        // 意图对齐落盘：接管生效即入口在开，纠正历史 false 意图（与漂移巡检口径一致）
+        // 意图对齐落盘：接管生效即入口在开，纠正历史 false 意图（与漂移巡检口径一致）；
+        // 同时清 P2-1 双引擎停用仲裁标记（MCP 侧可能曾置 userStopped=true）
         let need_persist = {
             let mut g = state.lock().unwrap();
             if !g.config.system_proxy {
@@ -956,6 +967,19 @@ async fn start_proxy(
                 true
             } else { false }
         };
+        let us = {
+            let mut g = state.lock().unwrap();
+            if g.config.user_stopped {
+                g.config.user_stopped = false;
+                true
+            } else { false }
+        };
+        if need_persist || us {
+            let cfg_now = state.lock().unwrap().config.clone();
+            if let Err(e) = config::save(&cfg_now) {
+                eprintln!("[start_proxy] WARN 意图落盘失败: {e}");
+            }
+        }
         if need_persist {
             let cfg_now = state.lock().unwrap().config.clone();
             if let Err(e) = config::save(&cfg_now) {
@@ -1065,11 +1089,17 @@ async fn start_proxy(
     }
     // 通知看门狗：用户期望代理在运行，mihomo 崩溃后应自动重启
     {
-        let g = state.lock().unwrap();
+        let mut g = state.lock().unwrap();
         g.should_run.store(true, Ordering::Relaxed);
         // P1-4：新一次接管开始，恢复漂移巡检（清掉上一次的"已接受"与旧黄条）
         g.drift_ack.store(false, Ordering::Relaxed);
         *g.drift.lock().unwrap() = None;
+        // P2-1：用户启动 = 明确期望运行，清双引擎停用仲裁标记
+        g.config.user_stopped = false;
+    }
+    let cfg_now = state.lock().unwrap().config.clone();
+    if let Err(e) = config::save(&cfg_now) {
+        eprintln!("[start_proxy] WARN userStopped 落盘失败: {e}");
     }
     Ok(status)
 }
@@ -1082,6 +1112,15 @@ async fn stop_proxy(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<(),
         g.should_run.store(false, Ordering::Relaxed);
         g.mihomo.port
     };
+    // P2-1：双引擎停用仲裁——落盘 userStopped=true，MCP 侧 stop 也能阻止看门狗复活
+    {
+        let mut g = state.lock().unwrap();
+        g.config.user_stopped = true;
+        let cfg_now = g.config.clone();
+        if let Err(e) = config::save(&cfg_now) {
+            eprintln!("[stop_proxy] WARN userStopped 落盘失败: {e}");
+        }
+    }
     // 停进程 + 关系统代理（慢操作）放线程池
     tauri::async_runtime::spawn_blocking(move || {
         let mihomo = MihomoManager::new();
@@ -1126,8 +1165,14 @@ pub struct RestoreResult {
 async fn restore_network(state: tauri::State<'_, Arc<Mutex<AppState>>>) -> Result<RestoreResult, String> {
     // 先通知看门狗：用户要求还原 = 不再期望代理运行（与 stop_proxy 同语义）
     {
-        let g = state.lock().unwrap();
+        let mut g = state.lock().unwrap();
         g.should_run.store(false, Ordering::Relaxed);
+        // P2-1：还原 = 明确停用，落盘仲裁标记防看门狗复活
+        g.config.user_stopped = true;
+        let cfg_now = g.config.clone();
+        if let Err(e) = config::save(&cfg_now) {
+            eprintln!("[restore_network] WARN userStopped 落盘失败: {e}");
+        }
     }
     let result = tauri::async_runtime::spawn_blocking(|| -> Result<RestoreResult, String> {
         let mihomo = MihomoManager::new();
@@ -1714,45 +1759,9 @@ pub fn start_proxy_standalone() -> Result<MihomoStatus, String> {
 pub fn stop_proxy_standalone() -> Result<(), String> {
     let mihomo = MihomoManager::new();
     let port = mihomo.port;
-    // 首选：特权控制器零弹窗（已安装 sudoers 白名单时）
-    if MihomoManager::ctl("stop").is_some() {
-        if let Ok(r) = system_proxy::set_system_proxy(false, port) {
-            log_proxy_set_result("standalone(ctl)", &r);
-        }
-        return Ok(());
-    }
-    // start_proxy_standalone 与 stop_proxy_standalone 各自创建实例无法共享 pid，
-    // 这里改为按启动参数（runtime 下的 mihomo.yaml）精确查找并提权结束 mihomo 进程。
-    let runtime = mihomo.runtime_dir;
-    let conf_path = runtime.join("mihomo.yaml");
-    let conf_str = conf_path.to_string_lossy().to_string();
-    let mut pids = Vec::new();
-    if let Ok(out) = std::process::Command::new("/bin/ps")
-        .args(["-axo", "pid=,args="])
-        .output()
-    {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            if line.contains("mihomo") && line.contains(&conf_str) {
-                if let Some(pid_str) = line.split_whitespace().next() {
-                    if let Ok(pid) = pid_str.parse::<i32>() {
-                        pids.push(pid);
-                    }
-                }
-            }
-        }
-    }
-    for pid in pids {
-        // mihomo 以 root 运行，普通 kill 会被拒；用 osascript 提权 kill
-        let script = format!(
-            "do shell script \"/bin/kill {}\" with administrator privileges",
-            pid
-        );
-        let _ = std::process::Command::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(&script)
-            .output();
-    }
+    // v0.4.1：用户态直接结束内核进程（stop() 内部含 PID 发现与 SIGKILL 兜底，
+    // 无需特权控制器 sudoers、无需 osascript 提权——内核是普通用户进程）
+    mihomo.stop();
     // 关系统代理并回读对账；若有服务没关成，下次启动的 P0-4 自检兜底
     if let Ok(r) = system_proxy::set_system_proxy(false, port) {
         log_proxy_set_result("standalone", &r);
@@ -1763,6 +1772,17 @@ pub fn stop_proxy_standalone() -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let should_run = Arc::new(AtomicBool::new(false));
+
+    // P0-2 生命周期（v0.4.1）：RunEvent::Exit 只覆盖 GUI 正常退出路径
+    // （关窗/Cmd+Q/app.exit()/系统注销）；外部 `kill <pid>` / launchctl kill 发
+    // SIGTERM 时 Tauri 不触发 Exit → mihomo 孤儿 + 系统代理残留指向死端口。
+    // 注册 libc 信号 handler（handler 只置原子标志，信号安全），监听线程轮询
+    // 标志后执行同一收尾逻辑再显式 exit(0)。SIGKILL 无法拦截，由启动自检兜底。
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGTERM, handle_term_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGHUP, handle_term_signal as *const () as libc::sighandler_t);
+    }
     let state = Arc::new(Mutex::new(AppState {
         config: config::load(),
         mihomo: MihomoManager::new(),
@@ -1772,6 +1792,34 @@ pub fn run() {
         drift: Arc::new(Mutex::new(None)),
         drift_ack: Arc::new(AtomicBool::new(false)),
     }));
+
+    // 信号监听线程：SIGTERM/SIGHUP 置位后执行与 RunEvent::Exit 相同的收尾
+    // （先通知看门狗停止 → 停内核 → 关系统代理 → 结账）再显式退出。
+    // 与 Exit 路径唯一差异：不做 SSH 断连（信号线程无 app handle；SSH 子进程
+    // 随 App 进程终止自然回收，属可接受的极小残留）。
+    let signal_state = state.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if !TERM_SIGNAL_FLAG.load(Ordering::Relaxed) {
+                continue;
+            }
+            eprintln!("[magic-agent] 收到 SIGTERM/SIGHUP：执行退出收尾");
+            let g = signal_state.lock().unwrap_or_else(|e| e.into_inner());
+            g.should_run.store(false, Ordering::Relaxed);
+            g.mihomo.stop();
+            match system_proxy::set_system_proxy(false, g.mihomo.port) {
+                Ok(r) => log_proxy_set_result("signal-exit", &r),
+                Err(e) => eprintln!("[magic-agent] WARN 信号退出时关闭系统代理失败: {e}"),
+            }
+            match ledger::LedgerFile::default().settle_open("signal_exit") {
+                Ok(true) => eprintln!("[ledger] 接管已结账（signal_exit）"),
+                Ok(false) => {}
+                Err(e) => eprintln!("[ledger] WARN 信号退出结账失败: {e}"),
+            }
+            std::process::exit(0);
+        }
+    });
 
     // P0-4 启动自检：崩溃残留的"系统代理指向死端口"会整机断网，
     // 必须第一时间恢复直连并告知用户。同步跑在 setup 前（百毫秒级，
@@ -1804,8 +1852,8 @@ pub fn run() {
     }
 
     // mihomo 看门狗：每 30s 检查一次。用户启动代理后 should_run=true，
-    // 若 mihomo 崩溃（端口探测失败）则自动拉起——但只走特权控制器零弹窗路径
-    // （ctl("start")），不弹 osascript 反复骚扰用户。重启失败则关掉系统代理，
+    // 若 mihomo 崩溃（端口探测失败）则自动拉起（v0.4.1：用户态直接 start，
+    // 无需特权控制器/osascript）。重启失败则关掉系统代理，
     // 避免 mihomo 死了但系统代理仍指向 127.0.0.1:7891 导致全机断网。
     let watchdog_state = state.clone();
     // P1-4 漂移巡检也要读 should_run，先 clone 一份（下一条线程会 move 原件）
@@ -1820,52 +1868,66 @@ pub fn run() {
             if mihomo.status().running {
                 continue;
             }
-            eprintln!("[watchdog] mihomo 已停止但 should_run=true，尝试自动重启...");
-            if let Some(pid_str) = MihomoManager::ctl("start") {
-                if pid_str == "already-running" || pid_str.parse::<u32>().is_ok() {
-                    if mihomo.wait_api() {
-                        eprintln!("[watchdog] mihomo 自动重启成功");
-                        if let Ok(pid) = pid_str.parse::<u32>() {
-                            *watchdog_state.lock().unwrap().mihomo.pid.lock().unwrap() = Some(pid);
-                        }
-                        // v0.3.2 修复（用户真机报障：内核在跑但实时连接全空）：
-                        // 旧逻辑重启成功就 continue，系统代理无人恢复 →
-                        // "内核活着但流量没进隧道"的半套秩序（内核统计 0 字节）。
-                        // P1-A 红线口径：接管生效中达标态恒为"入口开着指向本程序端口"，
-                        // 不看历史意图（should_run=true 本身即"接管生效中"）。
-                        // 且【先记账后动手】（CONTRACT 接管账本红线；begin 幂等——
-                        // 接管仍生效时绝不覆盖最初原值）。
-                        let port = {
-                            let g = watchdog_state.lock().unwrap_or_else(|e| e.into_inner());
-                            g.mihomo.port
-                        };
-                        if let Err(e) = ledger::LedgerFile::default()
-                            .begin_takeover("watchdog 恢复系统代理", system_proxy::snapshot_system_proxy())
-                        {
-                            eprintln!("[watchdog] WARN begin_takeover 失败（联动不设代理，宁可不写）: {e}");
-                        } else {
-                            match system_proxy::set_system_proxy(true, port) {
-                                Ok(r) => {
-                                    log_proxy_set_result("watchdog 重启联动", &r);
-                                    if !r.all_ok {
-                                        eprintln!("[watchdog] 重启后系统代理未全部达标，漂移巡检将接力提示");
-                                    }
+            // P2-1 双引擎停用仲裁（v0.4.1）：MCP stop_proxy/restore_network 落盘
+            // userStopped=true 后，看门狗绝不 30 秒内复活内核——否则从 AI 入口视角
+            // "我停了它又活了"= 失控（PID 34747→40591 实锤）。
+            if config::load().user_stopped {
+                eprintln!("[watchdog] userStopped=true（用户/MCP 已停止），不再自动重启；同步内存态");
+                {
+                    let g = watchdog_state.lock().unwrap_or_else(|e| e.into_inner());
+                    g.should_run.store(false, Ordering::Relaxed);
+                }
+                continue;
+            }
+            eprintln!("[watchdog] mihomo 已停止但 should_run=true，尝试自动重启（用户态）...");
+            let (cfg, apps_cache) = {
+                let g = watchdog_state.lock().unwrap_or_else(|e| e.into_inner());
+                let apps = g.apps_cache.lock().unwrap().clone();
+                (g.config.clone(), apps)
+            };
+            let app_rules = effective_app_rules_with(&cfg, Some(&apps_cache));
+            match mihomo.start(&cfg, &[], &app_rules) {
+                Ok(s) => {
+                    eprintln!("[watchdog] mihomo 自动重启成功（用户态）");
+                    *watchdog_state.lock().unwrap().mihomo.pid.lock().unwrap() = s.pid;
+                    // v0.3.2 修复（用户真机报障：内核在跑但实时连接全空）：
+                    // 旧逻辑重启成功就 continue，系统代理无人恢复 →
+                    // "内核活着但流量没进隧道"的半套秩序（内核统计 0 字节）。
+                    // P1-A 红线口径：接管生效中达标态恒为"入口开着指向本程序端口"，
+                    // 不看历史意图（should_run=true 本身即"接管生效中"）。
+                    // 且【先记账后动手】（CONTRACT 接管账本红线；begin 幂等——
+                    // 接管仍生效时绝不覆盖最初原值）。
+                    let port = {
+                        let g = watchdog_state.lock().unwrap_or_else(|e| e.into_inner());
+                        g.mihomo.port
+                    };
+                    if let Err(e) = ledger::LedgerFile::default()
+                        .begin_takeover("watchdog 恢复系统代理", system_proxy::snapshot_system_proxy())
+                    {
+                        eprintln!("[watchdog] WARN begin_takeover 失败（联动不设代理，宁可不写）: {e}");
+                    } else {
+                        match system_proxy::set_system_proxy(true, port) {
+                            Ok(r) => {
+                                log_proxy_set_result("watchdog 重启联动", &r);
+                                if !r.all_ok {
+                                    eprintln!("[watchdog] 重启后系统代理未全部达标，漂移巡检将接力提示");
                                 }
-                                Err(e) => eprintln!("[watchdog] WARN 重启后系统代理联动失败: {e}"),
                             }
+                            Err(e) => eprintln!("[watchdog] WARN 重启后系统代理联动失败: {e}"),
                         }
-                        continue;
                     }
                 }
-            }
-            // 重启失败：关掉系统代理，避免死代理端口导致全机断网。
-            // P0-1：这里若没关成是真实危险（用户即将断网），必须点名；
-            // 即便本次失败，下次 App 重启时 startup_self_check（P0-4）仍会兜底。
-            eprintln!("[watchdog] mihomo 自动重启失败，关闭系统代理以恢复直连");
-            let port = watchdog_state.lock().unwrap().mihomo.port;
-            match system_proxy::set_system_proxy(false, port) {
-                Ok(r) => log_proxy_set_result("watchdog", &r),
-                Err(e) => eprintln!("[watchdog] WARN 关闭系统代理失败（用户可能断网，重启 App 可自愈）: {e}"),
+                Err(e) => {
+                    // 重启失败：关掉系统代理，避免死代理端口导致全机断网。
+                    // P0-1：这里若没关成是真实危险（用户即将断网），必须点名；
+                    // 即便本次失败，下次 App 重启时 startup_self_check（P0-4）仍会兜底。
+                    eprintln!("[watchdog] mihomo 自动重启失败: {e}，关闭系统代理以恢复直连");
+                    let port = watchdog_state.lock().unwrap().mihomo.port;
+                    match system_proxy::set_system_proxy(false, port) {
+                        Ok(r) => log_proxy_set_result("watchdog", &r),
+                        Err(le) => eprintln!("[watchdog] WARN 关闭系统代理失败（用户可能断网，重启 App 可自愈）: {le}"),
+                    }
+                }
             }
             continue;
         }

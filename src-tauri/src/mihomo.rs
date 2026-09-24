@@ -26,17 +26,27 @@ pub const PROXY_PORT: u16 = 7893;
 /// 智能体自己决定走国内直连时送进这个口。
 pub const DIRECT_PORT: u16 = 7892;
 
-/// 保命直连名单（域名后缀）：这些目标永远走系统原生路由，绝不进 TUN、绝不进代理端口。
+/// 保命直连名单（域名后缀/IP）：这些目标永远走系统原生路由，绝不进 TUN、绝不进代理端口。
 /// 尤其 AI 助手本体访问的中转站——模型请求是超长流式 JSON，一旦被 TUN/应用层代理"拆-组"
 /// 就会损坏请求体（表现为 400 Invalid JSON body）。必须让它从网卡直接出网。
+///
+/// P2-9 说明（v0.4.1）：`203.0.113.74` 属 RFC 5737 TEST-NET-3 文档保留段（203.0.113.0/24），
+/// 在真实互联网不可路由。它是**保命直连哨兵**：保证第 0 层直连名单在任何情况下非空、
+/// 规则引擎能正常解析 IP-CIDR,DIRECT 条目（回归测试 `rules_follow_three_layer_funnel_order`
+/// 也用它做顺序断言）。若未来接入真实 AI 中转站，把真实出口 IP 替换/追加在此即可，
+/// 切勿删除最后一项——名单清空后保命层静默失效。
+/// （用户真实搬瓦工服务器 <REDACTED_SERVER_IP> 不在本名单：它是 SSH/节点服务器，走的是
+/// 第 1 层"节点服务器自身流量直连"规则，与保命名单语义不同；且其信息只存在于
+/// 本地 config 与 `.workbuddy/memory`，代码中无硬编码。）
 const PROTECTED_DIRECT_DOMAINS: &[&str] = &[
-    // WorkBuddy 接的中转站（ai-relay），模型请求必须原样透传
+    // 保命直连哨兵（RFC 5737 文档保留段，不可路由；保名单非空 + 回归锚点）
     "203.0.113.74",
 ];
 
 #[derive(Clone)]
 pub struct MihomoManager {
-    /// mihomo 以 root 权限启动（TUN 需要），无法作为普通子进程管理，记录 PID 即可。
+    /// mihomo 以普通用户态运行（v0.4.1 安全整改：旧 root 架构已废弃），
+    /// 由 App 直接 spawn 并记录 PID。
     /// 用 Arc<Mutex<..>> 包裹 + derive(Clone)：clone 出来的是「同一份共享 PID 状态」，
     /// 这样 get_status 可把实例 move 进阻塞线程池做端口探测，主线程持有的实例仍能读到 pid。
     pub pid: Arc<Mutex<Option<u32>>>,
@@ -123,8 +133,12 @@ impl MihomoManager {
         }
     }
 
-    /// 启动 mihomo。
-    /// TUN 模式需要 root 权限，通过 osascript 弹管理员授权后以 root 启动。
+    /// 启动 mihomo（v0.4.1：普通用户态直接运行，不再需要任何 root 权限）。
+    /// 旧架构（sudoers 免密特权控制器 + osascript root 启动）已废弃：
+    ///   - sudoers 免密白名单 = 系统后门级风险（脚本可被替换即免密 root 任意命令）
+    ///   - mihomo 解析全机 HTTP/SOCKS 流量，root 化放大任何内核漏洞
+    ///   - 本程序全部端口（7891/7892/7893/19091）都是普通端口，DNS 走 127.0.0.1:1054，
+    ///     TUN 已关闭（auto-route=false 冻结，系统代理是唯一流量入口）→ 内核零特权需求。
     /// app_rules: (路径前缀列表, 目标) 列表，目标为 "DIRECT" 或 "NODE-<节点名>" / "PROXY"。
     pub fn start(
         &self,
@@ -139,32 +153,6 @@ impl MihomoManager {
         let conf = self.build_conf(cfg, rules, app_rules);
         self.write_conf(&conf)?;
 
-        // 首选：特权控制器零弹窗启动（已安装 sudoers 白名单时）
-        if let Some(pid_str) = Self::ctl("start") {
-            if let Ok(pid) = pid_str.parse::<u32>() {
-                *self.pid.lock().unwrap() = Some(pid);
-                if self.wait_api() {
-                    return Ok(MihomoStatus {
-                        running: true,
-                        pid: Some(pid),
-                        port: self.port,
-                        node: cfg.selected_node.clone(),
-                    });
-                }
-                return Err(format!("内核已启动（PID {pid}）但控制 API 未就绪"));
-            }
-            if pid_str == "already-running" && self.wait_api() {
-                // 已有实例在跑（如 runtime 常驻副本），接管它
-                return Ok(MihomoStatus {
-                    running: true,
-                    pid: None,
-                    port: self.port,
-                    node: cfg.selected_node.clone(),
-                });
-            }
-            // ctl 启动失败则继续走 osascript 弹窗路径
-        }
-
         let bin = self.bin_path();
         if !bin.exists() {
             return Err(format!("代理内核不存在: {}", bin.display()));
@@ -173,47 +161,39 @@ impl MihomoManager {
         let log_path = self.runtime_dir.join("mihomo.log");
         let err_path = self.runtime_dir.join("mihomo.err.log");
         let conf_path = self.runtime_dir.join("mihomo.yaml");
-        // 日志轮转：超 10MB 改名为 .old。
-        // 注意：mihomo 以 root 运行，日志文件属 root，普通用户无法 rename/remove。
-        // 因此轮转逻辑必须放在 osascript 的 shell 命令里，由 root 执行。
-        // 直接 & 后台启动并输出 $!（后台进程 PID），由 osascript 以管理员权限执行。
-        // 注意：do shell script 会等待前台命令结束，但 & 让 mihomo 立即后台化，$! 被 echo 返回。
-        // 不能用 nohup：osascript 的 shell 没有 TTY，nohup 会报 "can't detach from console"。
-        // 日志权限：root 默认 umask 020，日志会落成 0644 世界可读——日志里是用户
-        // 全量连接记录（进程名 --> 域名），同机其他账号能直接读走。
-        // umask 077 管新建，chmod 600 管已存在的旧文件，轮转出的 .old 同样收权。
-        let shell_cmd = format!(
-            "umask 077; for f in '{}' '{}'; do if [ -f \"$f\" ]; then if [ $(stat -f%z \"$f\") -gt 10485760 ]; then mv -f \"$f\" \"$f.old\"; chmod 600 \"$f.old\"; else chmod 600 \"$f\"; fi; fi; done; '{}' -f '{}' -d '{}' > '{}' 2> '{}' & echo $!",
-            log_path.display(),
-            err_path.display(),
-            bin.display(),
-            conf_path.display(),
-            self.runtime_dir.display(),
-            log_path.display(),
-            err_path.display()
-        );
-        let escaped = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
-        let apple_script = format!(
-            "do shell script \"{}\" with administrator privileges",
-            escaped
-        );
-
-        let out = Command::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(&apple_script)
-            .output()
-            .map_err(|e| format!("调用 osascript 请求管理员权限失败: {e}"))?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            if err.to_lowercase().contains("canceled") || err.to_lowercase().contains("cancel") {
-                return Err("用户取消了管理员授权，代理内核未启动".to_string());
+        // 日志轮转：超 10MB 改名为 .old（用户态直接文件操作，无需提权）
+        for p in [&log_path, &err_path] {
+            if std::fs::metadata(p)
+                .map(|m| m.len() > 10 * 1024 * 1024)
+                .unwrap_or(false)
+            {
+                let _ = std::fs::rename(p, p.with_extension("log.old"));
             }
-            return Err(format!("以管理员权限启动 mihomo 失败: {}", err));
         }
-        let pid_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let pid: u32 = pid_str
-            .parse()
-            .map_err(|e| format!("解析 mihomo PID 失败（返回: {:?}）: {e}", pid_str))?;
+        // 日志权限：用户态文件受用户 umask 控制（默认 0644），无 root 世界可读问题
+        let stdout_f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|e| format!("打开 mihomo 日志失败: {e}"))?;
+        let stderr_f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&err_path)
+            .map_err(|e| format!("打开 mihomo 错误日志失败: {e}"))?;
+
+        // 直接 spawn 用户态 mihomo（7891/7892/7893/19091/1054 全部为普通端口）
+        let child = Command::new(&bin)
+            .arg("-f")
+            .arg(&conf_path)
+            .arg("-d")
+            .arg(&self.runtime_dir)
+            .stdout(std::process::Stdio::from(stdout_f))
+            .stderr(std::process::Stdio::from(stderr_f))
+            .spawn()
+            .map_err(|e| format!("启动 mihomo 失败: {e}"))?;
+        let pid = child.id();
+        eprintln!("[mihomo] start(): 用户态启动成功，PID = {pid}");
         *self.pid.lock().unwrap() = Some(pid);
 
         let mut ok = false;
@@ -255,7 +235,7 @@ impl MihomoManager {
         })
     }
 
-    /// 热更新配置：写完整 YAML 到 mihomo.yaml，然后提权发送 SIGHUP 让 mihomo 重载。
+    /// 热更新配置：写完整 YAML 到 mihomo.yaml，然后向 mihomo 发 SIGHUP 重载（用户态，无需提权）。
     /// 不用 PATCH /configs——实测 mihomo 的 PATCH 对多条 PROCESS-PATH-REGEX 只保留第一条。
     pub fn reload_rules(
         &self,
@@ -266,33 +246,20 @@ impl MihomoManager {
         let conf = self.build_conf(cfg, &[], app_rules);
         self.write_conf(&conf)?;
 
-        // 首选：特权控制器零弹窗重载（与 start/stop 一致，装了 sudoers 白名单时无弹窗）
-        if let Some(out) = Self::ctl("reload") {
-            // ctl reload 通过 pkill -HUP 发送，成功后无需再走 osascript 提权
-            if !out.trim().is_empty() || Self::ctl("status").is_some() {
-                return Ok(());
-            }
-        }
-
         // 2. 找 mihomo PID（pgrep -f 完整命令行匹配，不依赖会被截断的 ps 输出）
         let Some(pid) = self.find_running_pid() else {
             return Err("未找到运行中的 mihomo 进程".to_string());
         };
-        let pid = pid.to_string();
 
-        // 3. 提权发送 SIGHUP 重载配置
-        let script = format!(
-            "do shell script \"/bin/kill -HUP {}\" with administrator privileges",
-            pid
-        );
-        let out = Command::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(&script)
+        // 3. 用户态直接发 SIGHUP 重载配置（v0.4.1：无需提权，mihomo 是普通用户进程）
+        let out = Command::new("/bin/kill")
+            .arg("-HUP")
+            .arg(pid.to_string())
             .output()
-            .map_err(|e| format!("调用 osascript 失败: {e}"))?;
+            .map_err(|e| format!("发送 SIGHUP 失败: {e}"))?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            return Err(format!("SIGHUP 重载失败（用户可能取消了授权）: {}", err));
+            return Err(format!("SIGHUP 重载失败: {}", err));
         }
         Ok(())
     }
@@ -420,13 +387,8 @@ impl MihomoManager {
     }
 
     pub fn stop(&self) {
-        // 首选：特权控制器零弹窗（已安装 sudoers 白名单时；沙箱/未安装则回退）
-        eprintln!("[mihomo] stop(): 开始（优先特权控制器）");
-        if Self::ctl("stop").is_some() {
-            eprintln!("[mihomo] stop(): 特权控制器已执行 stop");
-            *self.pid.lock().unwrap() = None;
-            return;
-        }
+        // v0.4.1：用户态直接结束内核进程（普通 kill 即可，无需特权控制器/osascript）
+        eprintln!("[mihomo] stop(): 开始（用户态直接结束）");
         // 内存 PID 优先；App 重启后 PID 丢失，退回按配置路径查找
         let pid_opt = self
             .pid
@@ -445,39 +407,11 @@ impl MihomoManager {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            // 普通 kill 杀不掉 = root 内核（TUN 需要 root 启动）。
-            // 最后防线：提权 kill。绝不允许 stop() 静默失败留下孤儿内核继续
-            // 接管全机流量——这正是 2026-09-03「关了 App 代理还在跑」事故的根因之一。
-            eprintln!("[mihomo] stop(): PID {pid} 普通杀失败（root），提权 kill");
-            if process_alive(pid) {
-                let script = format!(
-                    "do shell script \"/bin/kill {}\" with administrator privileges",
-                    pid
-                );
-                let _ = Command::new("/usr/bin/osascript")
-                    .arg("-e")
-                    .arg(&script)
-                    .output();
-            }
-        }
-    }
-
-    /// 调用特权控制器（sudo -n，免弹窗）。返回 Some(stdout)=成功。
-    pub fn ctl(action: &str) -> Option<String> {
-        const CTL: &str = "/usr/local/lib/magic-agent/mihomo-ctl.sh";
-        if !std::path::Path::new(CTL).exists() {
-            return None;
-        }
-        let out = Command::new("sudo")
-            .arg("-n")
-            .arg(CTL)
-            .arg(action)
-            .output()
-            .ok()?;
-        if out.status.success() {
-            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-        } else {
-            None
+            // 10 秒仍未退出：SIGKILL（用户态进程，无需提权）
+            eprintln!("[mihomo] stop(): PID {pid} 10 秒未退出，SIGKILL");
+            let _ = Command::new("/bin/kill")
+                .args(["-9", &pid.to_string()])
+                .output();
         }
     }
 
@@ -603,11 +537,11 @@ impl MihomoManager {
         // 钉死出网接口（治 DIRECT dial i/o timeout 根因，见 detect_default_interface 注释）。
         // 顶层 interface-name 管所有出站（节点+DIRECT）；TUN 段的 auto-detect 只管 TUN 路由。
         out.push_str(&format!("interface-name: {}\n", detect_default_interface()));
-        // TUN 只接管「该走代理」的流量，绝不碰直连流量：
-        //   - auto-route: false —— 不再改系统默认路由，避免把所有流量（含 AI 助手的直连请求）
-        //     兜进虚拟网卡再"进-出"一圈导致请求体被污染。
-        //   - strict-route: true —— 只按规则把明确要代理的流量拉进 TUN，其余走系统原生直连。
-        out.push_str("tun:\n  enable: true\n  stack: system\n  auto-route: false\n  strict-route: true\n  auto-detect-interface: true\n  dns-hijack:\n    - any:53\n");
+        // TUN 已关闭（v0.4.1 安全整改）：TUN 创建需要 root，而本项目红线冻结
+        // auto-route=false（TUN 不承载日常流量，系统代理是唯一入口），
+        // 留着 enable:true 只会制造 root 依赖与 dns-hijack any:53 的特权绑定。
+        // 彻底关闭后内核零特权需求，普通用户态即可运行。
+        out.push_str("tun:\n  enable: false\n");
         // ── 两条物理上分开的「路」，决策权在智能体，不在 mihomo ──
         // 用户明确要求：不要 mihomo 自动判断国内外分流，而是给智能体两条明确的路，
         // 智能体当场实测后自己拍板——节点代理还是本机直连，
@@ -644,23 +578,56 @@ impl MihomoManager {
 
         out.push_str("proxies:\n");
         for node in &cfg.nodes {
-            out.push_str(&format!(
-                "  - name: \"{}\"\n    type: vless\n    server: \"{}\"\n    port: {}\n    uuid: \"{}\"\n    network: {}\n    tls: {}\n    udp: {}\n    flow: \"{}\"\n    client-fingerprint: \"{}\"\n",
-                yaml_quote(&node.name), yaml_quote(&node.server), node.port, yaml_quote(&node.uuid),
-                yaml_quote(&node.network), node.tls, node.udp, yaml_quote(&node.flow), yaml_quote(&node.fingerprint)
-            ));
-            if !node.sni.is_empty() {
-                out.push_str(&format!("    servername: \"{}\"\n", yaml_quote(&node.sni)));
-            }
-            if !node.public_key.is_empty() {
-                out.push_str(&format!(
-                    "    reality-opts:\n      public-key: \"{}\"\n      short-id: \"{}\"\n",
-                    yaml_quote(&node.public_key),
-                    yaml_quote(&node.short_id)
-                ));
+            // P2-11（v0.4.1）：按协议分支生成 mihomo 节点配置。
+            // 手动添加默认 vless；订阅拉取可能带 vmess/trojan。
+            match node.proto.as_str() {
+                "vmess" => {
+                    out.push_str(&format!(
+                        "  - name: \"{}\"\n    type: vmess\n    server: \"{}\"\n    port: {}\n    uuid: \"{}\"\n    alterId: 0\n    cipher: auto\n    network: {}\n    tls: {}\n    udp: {}\n    client-fingerprint: \"{}\"\n",
+                        yaml_quote(&node.name), yaml_quote(&node.server), node.port, yaml_quote(&node.uuid),
+                        yaml_quote(&node.network), node.tls, node.udp, yaml_quote(&node.fingerprint)
+                    ));
+                    if !node.sni.is_empty() {
+                        out.push_str(&format!("    servername: \"{}\"\n", yaml_quote(&node.sni)));
+                    }
+                    if node.network == "ws" && !node.ws_path.is_empty() {
+                        out.push_str(&format!(
+                            "    ws-opts:\n      path: \"{}\"\n      headers:\n        Host: \"{}\"\n",
+                            yaml_quote(&node.ws_path),
+                            yaml_quote(&node.server)
+                        ));
+                    }
+                }
+                "trojan" => {
+                    out.push_str(&format!(
+                        "  - name: \"{}\"\n    type: trojan\n    server: \"{}\"\n    port: {}\n    password: \"{}\"\n    udp: {}\n    network: {}\n",
+                        yaml_quote(&node.name), yaml_quote(&node.server), node.port, yaml_quote(&node.password),
+                        node.udp, yaml_quote(&node.network)
+                    ));
+                    if node.tls || !node.sni.is_empty() {
+                        out.push_str(&format!("    tls: {}\n    sni: \"{}\"\n", node.tls, yaml_quote(&node.sni)));
+                    }
+                }
+                _ => {
+                    // vless（默认）
+                    out.push_str(&format!(
+                        "  - name: \"{}\"\n    type: vless\n    server: \"{}\"\n    port: {}\n    uuid: \"{}\"\n    network: {}\n    tls: {}\n    udp: {}\n    flow: \"{}\"\n    client-fingerprint: \"{}\"\n",
+                        yaml_quote(&node.name), yaml_quote(&node.server), node.port, yaml_quote(&node.uuid),
+                        yaml_quote(&node.network), node.tls, node.udp, yaml_quote(&node.flow), yaml_quote(&node.fingerprint)
+                    ));
+                    if !node.sni.is_empty() {
+                        out.push_str(&format!("    servername: \"{}\"\n", yaml_quote(&node.sni)));
+                    }
+                    if !node.public_key.is_empty() {
+                        out.push_str(&format!(
+                            "    reality-opts:\n      public-key: \"{}\"\n      short-id: \"{}\"\n",
+                            yaml_quote(&node.public_key),
+                            yaml_quote(&node.short_id)
+                        ));
+                    }
+                }
             }
         }
-
         out.push_str("\nproxy-groups:\n");
         // PROXY 组：fallback 类型——选中节点排第一优先，探测失败自动落到下一个可用节点（自动故障转移）
         // switch_node 依然生效：重排顺序后 PUT /configs 重载，选中节点回到第一位
@@ -782,6 +749,9 @@ mod tests {
             sni: String::new(),
             source: "manual".to_string(),
             region: String::new(),
+            proto: "vless".to_string(),
+            password: String::new(),
+            ws_path: String::new(),
         };
         let cfg = AppConfig {
             nodes: vec![node],
@@ -834,6 +804,80 @@ mod tests {
     }
 
     #[test]
+    fn multi_proto_proxies_generate_valid_mihomo_yaml() {
+        // P2-11（v0.4.1）：vmess + trojan 节点必须生成合法 mihomo 配置，
+        // 且 vmess/trojan 字段齐全（真实 mihomo -t 校验）。
+        let m = MihomoManager::new();
+        let nodes = vec![
+            ProxyNode {
+                name: "vmess-ws-node".to_string(),
+                server: "198.51.100.7".to_string(),
+                port: 443,
+                uuid: "vmess-uuid".to_string(),
+                flow: String::new(),
+                network: "ws".to_string(),
+                tls: true,
+                udp: true,
+                fingerprint: "chrome".to_string(),
+                public_key: String::new(),
+                short_id: String::new(),
+                sni: "cdn.example.com".to_string(),
+                source: "subscription".to_string(),
+                region: String::new(),
+                proto: "vmess".to_string(),
+                password: String::new(),
+                ws_path: "/path-ws".to_string(),
+            },
+            ProxyNode {
+                name: "trojan-node".to_string(),
+                server: "198.51.100.8".to_string(),
+                port: 443,
+                uuid: String::new(),
+                flow: String::new(),
+                network: "tcp".to_string(),
+                tls: true,
+                udp: true,
+                fingerprint: String::new(),
+                public_key: String::new(),
+                short_id: String::new(),
+                sni: "trojan.example.com".to_string(),
+                source: "subscription".to_string(),
+                region: String::new(),
+                proto: "trojan".to_string(),
+                password: "trojan-secret".to_string(),
+                ws_path: String::new(),
+            },
+        ];
+        let cfg = AppConfig {
+            nodes,
+            selected_node: Some("vmess-ws-node".to_string()),
+            ..Default::default()
+        };
+        let conf = m.build_conf(&cfg, &[], &[]);
+        assert!(conf.contains("    type: vmess\n"), "缺 vmess 节点:\n{conf}");
+        assert!(conf.contains("    type: trojan\n"), "缺 trojan 节点:\n{conf}");
+        assert!(conf.contains("    alterId: 0\n    cipher: auto\n"), "vmess 缺 alterId/cipher:\n{conf}");
+        assert!(conf.contains("ws-opts:\n      path: \"/path-ws\"\n"), "vmess ws-opts 缺失:\n{conf}");
+        assert!(conf.contains("password: \"trojan-secret\"\n"), "trojan 缺 password:\n{conf}");
+        let tmp = std::env::temp_dir().join("magic-agent-test-multiproto.yaml");
+        std::fs::write(&tmp, &conf).unwrap();
+        let out = Command::new(m.bin_path())
+            .arg("-t")
+            .arg("-f")
+            .arg(&tmp)
+            .output()
+            .expect("run mihomo -t");
+        let _ = std::fs::remove_file(&tmp);
+        assert!(
+            out.status.success(),
+            "mihomo -t rejected multi-proto config:\nSTDOUT: {}\nSTDERR: {}\nCONF:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+            conf
+        );
+    }
+
+    #[test]
     fn generated_conf_is_valid_mihomo_yaml() {
         let m = MihomoManager::new();
         let node = ProxyNode {
@@ -851,6 +895,9 @@ mod tests {
             sni: String::new(),
             source: "manual".to_string(),
             region: String::new(),
+            proto: "vless".to_string(),
+            password: String::new(),
+            ws_path: String::new(),
         };
         let cfg = AppConfig {
             nodes: vec![node],
@@ -924,6 +971,9 @@ mod tests {
             sni: String::new(),
             source: "manual".to_string(),
             region: String::new(),
+            proto: "vless".to_string(),
+            password: String::new(),
+            ws_path: String::new(),
         };
         let cfg = AppConfig {
             nodes: vec![node],
@@ -968,6 +1018,9 @@ mod tests {
             sni: String::new(),
             source: "manual".to_string(),
             region: String::new(),
+            proto: "vless".to_string(),
+            password: String::new(),
+            ws_path: String::new(),
         };
         let cfg = AppConfig {
             nodes: vec![node],
@@ -1012,6 +1065,9 @@ mod tests {
             sni: "sni\"\n".to_string(),
             source: "subscription".to_string(),
             region: String::new(),
+            proto: "vless".to_string(),
+            password: String::new(),
+            ws_path: String::new(),
         };
         let cfg = AppConfig {
             nodes: vec![node],

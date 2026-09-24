@@ -88,6 +88,9 @@ export async function checkUpdate({ manual = false } = {}) {
 
     updaterState.latestVersion = res.version || '';
     updaterState.notes = res.notes || '';
+    // P2-12（v0.4.1）：先把状态置 available，让设置页有可见的「新版本」文案/徽标
+    // （此前从不置 available，设置页的状态文案永不显示；状态栏仍保持可点击）。
+    updaterState.state = 'available';
 
     if (!manual && localStorage.getItem(SKIP_KEY) === res.version) {
       // 该版本已被用户跳过：静默，不弹窗

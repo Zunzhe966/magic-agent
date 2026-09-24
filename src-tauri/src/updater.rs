@@ -54,6 +54,29 @@ pub fn endpoint_for(channel: &str) -> &'static str {
     }
 }
 
+/// P1-6 端点安全校验（v0.4.1）：`dangerousInsecureTransportProtocol` 编译期开关
+/// 只为 local 本机调试通道存在（github 通道全 https）。运行时按通道强校验：
+///   - local 端点必须是 loopback（127.0.0.1/localhost/::1）——防止该危险开关被
+///     误用于外部 http 端点（中间人可篡改更新包）；
+///   - github 端点必须是 https——明文传输更新包 = 可被替换。
+pub fn assert_endpoint_allowed(url: &tauri::Url, channel: &str) -> Result<(), String> {
+    let norm = normalize_channel(channel);
+    if norm == "local" {
+        match url.host_str() {
+            Some(h) if h == "127.0.0.1" || h == "localhost" || h == "::1" => Ok(()),
+            _ => Err(format!(
+                "local 通道端点必须是本机 loopback（127.0.0.1），收到: {url}"
+            )),
+        }
+    } else if url.scheme() == "https" {
+        Ok(())
+    } else {
+        Err(format!(
+            "github 通道端点必须是 https（危险开关只服务 local 本机通道），收到: {url}"
+        ))
+    }
+}
+
 /// 通道名 → 人类可读的展示名（UI 用）
 pub fn channel_label(channel: &str) -> &'static str {
     match normalize_channel(channel).as_str() {
@@ -143,6 +166,7 @@ pub async fn check_channel_update(app: AppHandle) -> Result<UpdateCheckResult, S
     let channel = read_channel(state.inner());
     let endpoint_str = endpoint_for(&channel);
     let url = tauri::Url::parse(endpoint_str).map_err(|e| format!("端点 URL 非法: {e}"))?;
+    assert_endpoint_allowed(&url, &channel)?;
 
     // 运行时覆盖端点，其余（pubkey、dangerous 开关、target）沿用编译期配置
     let updater = app
@@ -188,6 +212,7 @@ pub async fn install_channel_update(app: AppHandle) -> Result<(), String> {
     let channel = read_channel(state.inner());
     let endpoint_str = endpoint_for(&channel);
     let url = tauri::Url::parse(endpoint_str).map_err(|e| format!("端点 URL 非法: {e}"))?;
+    assert_endpoint_allowed(&url, &channel)?;
 
     let updater = app
         .updater_builder()
