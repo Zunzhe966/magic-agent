@@ -1,6 +1,6 @@
 [package]
 name = "magic-agent"
-version = "0.3.1"
+version = "0.3.2"
 description = "尊者魔法代理"
 edition = "2021"
 license = "MIT"
